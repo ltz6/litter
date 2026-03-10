@@ -123,3 +123,11 @@ struct SettingsView: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Settings") {
+    LitterPreviewScene(includeBackground: false) {
+        SettingsView()
+    }
+}
+#endif

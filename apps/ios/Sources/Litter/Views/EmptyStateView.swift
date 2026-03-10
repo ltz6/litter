@@ -59,3 +59,24 @@ struct EmptyStateView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+#if DEBUG
+#Preview("Empty State / Disconnected") {
+    LitterPreviewScene(
+        serverManager: LitterPreviewData.makeServerManager(
+            includeConnection: false,
+            includeActiveThread: false
+        )
+    ) {
+        EmptyStateView()
+    }
+}
+
+#Preview("Empty State / Connected") {
+    LitterPreviewScene(
+        serverManager: LitterPreviewData.makeServerManager(includeActiveThread: false)
+    ) {
+        EmptyStateView()
+    }
+}
+#endif

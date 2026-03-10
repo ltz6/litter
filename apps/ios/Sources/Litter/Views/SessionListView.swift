@@ -4,14 +4,33 @@ struct SessionListView: View {
     let server: DiscoveredServer
     let cwd: String
     var onSessionReady: ((DiscoveredServer, String) -> Void)?
+    private let autoLoadSessions: Bool
     @EnvironmentObject var serverManager: ServerManager
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
-    @State private var sessions: [ThreadSummary] = []
+    @State private var sessions: [ThreadSummary]
     @State private var nextCursor: String?
-    @State private var isLoading = true
+    @State private var isLoading: Bool
     @State private var errorMessage: String?
     @State private var resumingThreadId: String?
     @State private var navigateToConversation = false
+
+    init(
+        server: DiscoveredServer,
+        cwd: String,
+        onSessionReady: ((DiscoveredServer, String) -> Void)? = nil,
+        initialSessions: [ThreadSummary] = [],
+        autoLoadSessions: Bool = true
+    ) {
+        self.server = server
+        self.cwd = cwd
+        self.onSessionReady = onSessionReady
+        self.autoLoadSessions = autoLoadSessions
+        _sessions = State(initialValue: initialSessions)
+        _nextCursor = State(initialValue: nil)
+        _isLoading = State(initialValue: autoLoadSessions && initialSessions.isEmpty)
+        _errorMessage = State(initialValue: nil)
+        _resumingThreadId = State(initialValue: nil)
+    }
 
     private var conn: ServerConnection? {
         serverManager.connections[server.id]
@@ -50,7 +69,10 @@ struct SessionListView: View {
         .navigationDestination(isPresented: $navigateToConversation) {
             ConversationView()
         }
-        .task { await loadSessions() }
+        .task {
+            guard autoLoadSessions else { return }
+            await loadSessions()
+        }
     }
 
     private var cwdLabel: String {
@@ -191,3 +213,20 @@ struct SessionListView: View {
         resumingThreadId != nil
     }
 }
+
+#if DEBUG
+#Preview("Session List") {
+    LitterPreviewScene(
+        serverManager: LitterPreviewData.makeServerManager(includeActiveThread: false)
+    ) {
+        NavigationStack {
+            SessionListView(
+                server: LitterPreviewData.sampleServer,
+                cwd: LitterPreviewData.sampleCwd,
+                initialSessions: LitterPreviewData.sampleThreadSummaries,
+                autoLoadSessions: false
+            )
+        }
+    }
+}
+#endif

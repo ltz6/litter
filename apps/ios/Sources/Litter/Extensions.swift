@@ -152,10 +152,13 @@ struct GlassRectModifier: ViewModifier {
                 content.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
             }
         } else {
-            content.overlay(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .stroke((tint ?? LitterTheme.surfaceLight).opacity(0.4), lineWidth: 1)
-            )
+            content
+                .background(LitterTheme.surface.opacity(0.9))
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .stroke((tint ?? LitterTheme.surfaceLight).opacity(0.4), lineWidth: 1)
+                )
         }
     }
 }

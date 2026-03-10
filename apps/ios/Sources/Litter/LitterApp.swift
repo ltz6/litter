@@ -35,16 +35,16 @@ struct ContentView: View {
     }
 
     var body: some View {
+        GeometryReader { geometry in
         ZStack {
             LitterTheme.backgroundGradient.ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                HeaderView()
-                Divider().background(Color(hex: "#1E1E1E"))
-                mainContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            mainContent(bottomInset: geometry.safeAreaInsets.bottom)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea(.container, edges: [.top, .bottom])
+                .overlay(alignment: .top) {
+                    HeaderView(topInset: geometry.safeAreaInsets.top)
+                }
             .offset(x: sidebarRevealProgress * 284)
             .scaleEffect(1 - (0.04 * sidebarRevealProgress), anchor: .leading)
             .clipShape(RoundedRectangle(cornerRadius: 20 * sidebarRevealProgress, style: .continuous))
@@ -54,13 +54,15 @@ struct ContentView: View {
             .animation(sidebarAnimation, value: sidebarDragOffset)
             .simultaneousGesture(edgeOpenGesture)
 
-            SidebarOverlay(dragOffset: $sidebarDragOffset)
+            SidebarOverlay(dragOffset: $sidebarDragOffset, topInset: geometry.safeAreaInsets.top)
 
             if let approval = serverManager.activePendingApproval {
                 ApprovalPromptView(approval: approval) { decision in
                     serverManager.respondToPendingApproval(requestId: approval.requestId, decision: decision)
                 }
             }
+        }
+        .ignoresSafeArea()
         }
         .environmentObject(appState)
         .onAppear {
@@ -131,12 +133,13 @@ struct ContentView: View {
             }
     }
 
-    @ViewBuilder
-    private var mainContent: some View {
-        if serverManager.activeThreadKey != nil {
-            ConversationView()
-        } else {
-            EmptyStateView()
+    private func mainContent(bottomInset: CGFloat) -> some View {
+        Group {
+            if serverManager.activeThreadKey != nil {
+                ConversationView(bottomInset: bottomInset)
+            } else {
+                EmptyStateView()
+            }
         }
     }
 }

@@ -2,67 +2,97 @@ import SwiftUI
 import Inject
 
 struct HeaderView: View {
+    private static let contextBaselineTokens: Int64 = 12_000
+
     @ObserveInjection var inject
     @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
     @State private var showModelSelector = false
     @State private var isReloading = false
 
+    var topInset: CGFloat = 0
+
     private var activeConn: ServerConnection? {
         serverManager.activeConnection
     }
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(alignment: .center, spacing: 10) {
             Button {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     appState.sidebarOpen.toggle()
                 }
             } label: {
                 Image(systemName: "line.3.horizontal")
-                    .font(.system(.title3, weight: .medium))
+                    .font(.system(size: 16, weight: .medium))
                     .foregroundColor(Color(hex: "#999999"))
+                    .frame(width: 44, height: 44)
+                    .modifier(GlassCircleModifier())
             }
             .accessibilityIdentifier("header.sidebarButton")
 
-            Button { showModelSelector = true } label: {
-                HStack(spacing: 6) {
-                    if serverManager.activeThreadKey != nil, !selectedModelName.isEmpty {
-                        Text(selectedModelName)
-                            .font(.system(.title3, weight: .semibold))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                            .allowsTightening(true)
-                    } else {
-                        Text("litter")
-                            .font(.system(.title3, weight: .semibold))
-                            .foregroundColor(.white)
-                        if !selectedModelName.isEmpty {
-                            Text(selectedModelName)
-                                .font(.system(.title3))
-                                .foregroundColor(Color(hex: "#666666"))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.75)
-                                .allowsTightening(true)
-                        }
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.system(.caption, weight: .medium))
-                        .foregroundColor(Color(hex: "#666666"))
-                }
-            }
+            Spacer(minLength: 0)
 
-            Spacer()
+            VStack(spacing: 2) {
+                HStack(spacing: 6) {
+                    Button { showModelSelector = true } label: {
+                        HStack(spacing: 6) {
+                            Text(sessionModelLabel)
+                                .foregroundColor(.white)
+                            Text(sessionReasoningLabel)
+                                .foregroundColor(LitterTheme.textSecondary)
+                        }
+                        .font(LitterFont.monospaced(.subheadline, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("header.modelPickerButton")
+
+                    ContextRingView(percent: Int(sessionContextPercent ?? 100), tint: sessionContextTint)
+                }
+                Text(sessionDirectoryLabel)
+                    .font(LitterFont.monospaced(.caption2, weight: .semibold))
+                    .foregroundColor(LitterTheme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .modifier(GlassRectModifier(cornerRadius: 16))
+
+            Spacer(minLength: 0)
 
             reloadButton
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.top, topInset)
+        .padding(.bottom, 4)
+        .background(
+            LinearGradient(
+                colors: [.black.opacity(0.5), .black.opacity(0.2), .clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .padding(.bottom, -30)
+            .ignoresSafeArea(.container, edges: .top)
+            .allowsHitTesting(false)
+        )
         .onChange(of: serverManager.activeThreadKey) { _, _ in
+            syncSelectionFromActiveThread()
             Task { await loadModelsIfNeeded() }
         }
+        .onChange(of: serverManager.activeThread?.model) { _, _ in
+            syncSelectionFromActiveThread()
+        }
+        .onChange(of: serverManager.activeThread?.reasoningEffort) { _, _ in
+            syncSelectionFromActiveThread()
+        }
+        .onChange(of: serverManager.activeThread?.cwd) { _, _ in
+            syncSelectionFromActiveThread()
+        }
         .task {
+            syncSelectionFromActiveThread()
             await loadModelsIfNeeded()
         }
         .enableInjection()
@@ -75,11 +105,78 @@ struct HeaderView: View {
         }
     }
 
-    private var selectedModelName: String {
-        appState.selectedModel
+    private var sessionModelLabel: String {
+        let threadModel = serverManager.activeThread?.model.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !threadModel.isEmpty {
+            return threadModel
+        }
+
+        let selectedModel = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !selectedModel.isEmpty {
+            return selectedModel
+        }
+
+        return "litter"
+    }
+
+    private var sessionReasoningLabel: String {
+        let threadReasoning = serverManager.activeThread?.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !threadReasoning.isEmpty {
+            return threadReasoning
+        }
+
+        let selectedReasoning = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !selectedReasoning.isEmpty {
+            return selectedReasoning
+        }
+
+        return "default"
+    }
+
+    private var sessionContextTint: Color {
+        guard let percent = sessionContextPercent else {
+            return LitterTheme.textSecondary
+        }
+        switch percent {
+        case ...15:
+            return LitterTheme.danger
+        case ...35:
+            return LitterTheme.warning
+        default:
+            return LitterTheme.accentStrong
+        }
+    }
+
+    private var sessionDirectoryLabel: String {
+        let currentDirectory = serverManager.activeThread?.cwd.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !currentDirectory.isEmpty {
+            return abbreviateRemoteHomePath(currentDirectory)
+        }
+
+        let appDirectory = appState.currentCwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !appDirectory.isEmpty {
+            return abbreviateRemoteHomePath(appDirectory)
+        }
+
+        return "~"
+    }
+
+    private var sessionContextPercent: Int64? {
+        guard let thread = serverManager.activeThread,
+              let contextWindow = thread.modelContextWindow else {
+            return nil
+        }
+
+        let totalTokens = thread.contextTokensUsed ?? Self.contextBaselineTokens
+        return percentOfContextWindowRemaining(
+            totalTokens: totalTokens,
+            contextWindow: contextWindow
+        )
     }
 
     private func loadModelsIfNeeded() async {
+        syncSelectionFromActiveThread()
+
         guard let conn = activeConn, conn.isConnected, !conn.modelsLoaded else { return }
         do {
             let resp = try await conn.listModels()
@@ -97,12 +194,30 @@ struct HeaderView: View {
         } catch {}
     }
 
+    private func syncSelectionFromActiveThread() {
+        let threadModel = serverManager.activeThread?.model.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !threadModel.isEmpty && appState.selectedModel != threadModel {
+            appState.selectedModel = threadModel
+        }
+
+        let threadReasoning = serverManager.activeThread?.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !threadReasoning.isEmpty && appState.reasoningEffort != threadReasoning {
+            appState.reasoningEffort = threadReasoning
+        }
+
+        let threadCwd = serverManager.activeThread?.cwd.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !threadCwd.isEmpty && appState.currentCwd != threadCwd {
+            appState.currentCwd = threadCwd
+        }
+    }
+
     private var reloadButton: some View {
         Button {
             Task {
                 isReloading = true
                 await serverManager.refreshAllSessions()
                 await serverManager.syncActiveThreadFromServer()
+                syncSelectionFromActiveThread()
                 isReloading = false
             }
         } label: {
@@ -113,14 +228,53 @@ struct HeaderView: View {
                         .tint(LitterTheme.accent)
                 } else {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(.subheadline, weight: .semibold))
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundColor(serverManager.hasAnyConnection ? LitterTheme.accent : LitterTheme.textMuted)
                 }
             }
-            .frame(width: 18, height: 18)
+            .frame(width: 44, height: 44)
+            .modifier(GlassCircleModifier())
         }
         .accessibilityIdentifier("header.reloadButton")
         .disabled(isReloading || !serverManager.hasAnyConnection)
+    }
+
+    private func percentOfContextWindowRemaining(totalTokens: Int64, contextWindow: Int64) -> Int64 {
+        let baseline = Self.contextBaselineTokens
+        guard contextWindow > baseline else { return 0 }
+
+        let effectiveWindow = contextWindow - baseline
+        let usedTokens = max(0, totalTokens - baseline)
+        let remainingTokens = max(0, effectiveWindow - usedTokens)
+        let remainingFraction = Double(remainingTokens) / Double(effectiveWindow)
+        let percent = Int64((remainingFraction * 100).rounded())
+        return min(max(percent, 0), 100)
+    }
+
+    private func abbreviateRemoteHomePath(_ path: String) -> String {
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else { return "~" }
+
+        if let abbreviated = abbreviateUnixHomePrefix(trimmedPath, basePrefix: "/Users") {
+            return abbreviated
+        }
+        if let abbreviated = abbreviateUnixHomePrefix(trimmedPath, basePrefix: "/home") {
+            return abbreviated
+        }
+        return trimmedPath
+    }
+
+    private func abbreviateUnixHomePrefix(_ path: String, basePrefix: String) -> String? {
+        let prefix = basePrefix + "/"
+        guard path.hasPrefix(prefix) else { return nil }
+
+        let remainder = path.dropFirst(prefix.count)
+        guard let slashIndex = remainder.firstIndex(of: "/") else {
+            return "~"
+        }
+
+        let suffix = remainder[slashIndex...]
+        return "~" + suffix
     }
 }
 
@@ -268,3 +422,17 @@ struct ModelSelectorView: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Header") {
+    LitterPreviewScene {
+        HeaderView()
+    }
+}
+
+#Preview("Model Selector") {
+    LitterPreviewScene(includeBackground: false) {
+        ModelSelectorView()
+    }
+}
+#endif
