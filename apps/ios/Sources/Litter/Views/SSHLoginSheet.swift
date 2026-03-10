@@ -3,9 +3,10 @@ import SwiftUI
 struct SSHLoginSheet: View {
     let server: DiscoveredServer
     let onConnect: (ConnectionTarget, String?) -> Void
+    private let autoLoadSavedCredentials: Bool
 
     @Environment(\.dismiss) private var dismiss
-    @State private var username = ""
+    @State private var username: String
     @State private var password = ""
     @State private var useKey = false
     @State private var privateKey = ""
@@ -15,6 +16,18 @@ struct SSHLoginSheet: View {
     @State private var loadedSavedCredentials = false
     @State private var isConnecting = false
     @State private var errorMessage: String?
+
+    init(
+        server: DiscoveredServer,
+        autoLoadSavedCredentials: Bool = true,
+        initialUsername: String = "",
+        onConnect: @escaping (ConnectionTarget, String?) -> Void
+    ) {
+        self.server = server
+        self.onConnect = onConnect
+        self.autoLoadSavedCredentials = autoLoadSavedCredentials
+        _username = State(initialValue: initialUsername)
+    }
 
     private var sshPort: Int {
         Int(server.port ?? 22)
@@ -160,6 +173,7 @@ struct SSHLoginSheet: View {
         }
         .preferredColorScheme(.dark)
         .task {
+            guard autoLoadSavedCredentials else { return }
             loadSavedCredentialsIfNeeded()
         }
     }
@@ -289,3 +303,13 @@ struct SSHLoginSheet: View {
         passphrase = ""
     }
 }
+
+#if DEBUG
+#Preview("SSH Login") {
+    SSHLoginSheet(
+        server: LitterPreviewData.sampleSSHServer,
+        autoLoadSavedCredentials: false,
+        initialUsername: "builder"
+    ) { _, _ in }
+}
+#endif

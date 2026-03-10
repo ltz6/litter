@@ -23,3 +23,13 @@ struct BrandLogo: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Brand Logo") {
+    ZStack {
+        LitterTheme.backgroundGradient.ignoresSafeArea()
+        BrandLogo(size: 128)
+    }
+    .preferredColorScheme(.dark)
+}
+#endif

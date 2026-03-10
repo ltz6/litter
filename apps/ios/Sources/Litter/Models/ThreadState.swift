@@ -18,7 +18,12 @@ final class ThreadState: ObservableObject, Identifiable {
     @Published var status: ConversationStatus = .ready
     @Published var preview: String = ""
     @Published var cwd: String = ""
+    @Published var model: String = ""
     @Published var modelProvider: String = ""
+    @Published var reasoningEffort: String?
+    @Published var modelContextWindow: Int64?
+    @Published var contextTokensUsed: Int64?
+    @Published var rolloutPath: String?
     @Published var parentThreadId: String?
     @Published var rootThreadId: String?
     @Published var agentNickname: String?

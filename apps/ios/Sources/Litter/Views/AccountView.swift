@@ -218,3 +218,11 @@ struct AccountView: View {
         }
     }
 }
+
+#if DEBUG
+#Preview("Account") {
+    LitterPreviewScene(includeBackground: false) {
+        AccountView()
+    }
+}
+#endif

@@ -7,6 +7,7 @@ struct ConversationView: View {
     @ObserveInjection var inject
     @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
+    var bottomInset: CGFloat = 0
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
     @AppStorage("conversationTextSizeStep") private var conversationTextSizeStep = ConversationTextSize.medium.rawValue
     @FocusState private var composerFocused: Bool
@@ -21,22 +22,34 @@ struct ConversationView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ConversationMessageList(
-                messages: messages,
-                threadStatus: threadStatus,
-                activeThreadKey: serverManager.activeThreadKey,
-                agentDirectoryVersion: serverManager.agentDirectoryVersion,
-                textSizeStep: $conversationTextSizeStep,
-                inputFocused: $composerFocused,
-                onEditUserMessage: editMessage,
-                onForkFromUserMessage: forkFromMessage
-            )
+        ConversationMessageList(
+            messages: messages,
+            threadStatus: threadStatus,
+            activeThreadKey: serverManager.activeThreadKey,
+            agentDirectoryVersion: serverManager.agentDirectoryVersion,
+            textSizeStep: $conversationTextSizeStep,
+            inputFocused: $composerFocused,
+            onEditUserMessage: editMessage,
+            onForkFromUserMessage: forkFromMessage
+        )
+        .mask {
+            VStack(spacing: 0) {
+                LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 60)
+                Rectangle().fill(.black)
+                LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 60)
+            }
+            .ignoresSafeArea()
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             ConversationInputBar(
                 onSend: sendMessage,
                 onFileSearch: searchComposerFiles,
-                inputFocused: $composerFocused
+                inputFocused: $composerFocused,
+                bottomInset: bottomInset
             )
+            .background(.clear, ignoresSafeAreaEdges: .bottom)
         }
         .alert("Conversation Action Error", isPresented: Binding(
             get: { messageActionError != nil },
@@ -134,6 +147,26 @@ private enum ConversationTextSize: Int, CaseIterable {
     }
 }
 
+struct ContextRingView: View, Equatable {
+    let percent: Int
+    let tint: Color
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(tint.opacity(0.2), lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: Double(percent) / 100.0)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Text("\(percent)")
+                .font(.system(size: 7, weight: .bold, design: .monospaced))
+                .foregroundColor(tint)
+        }
+        .frame(width: 22, height: 22)
+    }
+}
+
 private struct BottomMarkerMaxYPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = .greatestFiniteMagnitude
 
@@ -176,39 +209,45 @@ private struct ConversationMessageList: View {
             GeometryReader { viewport in
                 ZStack(alignment: .bottomTrailing) {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(messages) { message in
-                                EquatableMessageBubble(
-                                    message: message,
-                                    serverId: activeThreadKey?.serverId,
-                                    textScale: textScale,
-                                    agentDirectoryVersion: agentDirectoryVersion,
-                                    messageActionsDisabled: messageActionsDisabled,
-                                    onEditUserMessage: onEditUserMessage,
-                                    onForkFromUserMessage: onForkFromUserMessage
-                                )
-                                    .id(message.id)
-                            }
-                            if case .thinking = threadStatus {
-                                TypingIndicator()
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 16)
-                        Color.clear
-                            .frame(height: 1)
-                            .background(
-                                GeometryReader { geo in
-                                    Color.clear.preference(
-                                        key: BottomMarkerMaxYPreferenceKey.self,
-                                        value: geo.frame(in: .named("conversationScrollArea")).maxY
+                        VStack(alignment: .leading, spacing: 0) {
+                            Spacer(minLength: 0)
+
+                            LazyVStack(alignment: .leading, spacing: 12) {
+                                ForEach(messages) { message in
+                                    EquatableMessageBubble(
+                                        message: message,
+                                        serverId: activeThreadKey?.serverId,
+                                        textScale: textScale,
+                                        agentDirectoryVersion: agentDirectoryVersion,
+                                        messageActionsDisabled: messageActionsDisabled,
+                                        onEditUserMessage: onEditUserMessage,
+                                        onForkFromUserMessage: onForkFromUserMessage
                                     )
+                                        .id(message.id)
                                 }
-                            )
-                            .id("bottom")
+                                if case .thinking = threadStatus {
+                                    TypingIndicator()
+                                }
+                            }
                             .padding(.horizontal, 16)
-                            .padding(.bottom, 16)
+                            .padding(.top, 16)
+
+                            Color.clear
+                                .frame(height: 1)
+                                .background(
+                                    GeometryReader { geo in
+                                        Color.clear.preference(
+                                            key: BottomMarkerMaxYPreferenceKey.self,
+                                            value: geo.frame(in: .named("conversationScrollArea")).maxY
+                                        )
+                                    }
+                                )
+                                .id("bottom")
+                                .padding(.horizontal, 16)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: viewport.size.height, alignment: .bottom)
                     }
+                    .defaultScrollAnchor(.bottom)
                     .coordinateSpace(name: "conversationScrollArea")
                     .scrollDismissesKeyboard(.interactively)
                     .simultaneousGesture(
@@ -231,10 +270,10 @@ private struct ConversationMessageList: View {
                         }
                     }
                     .onAppear {
-                        scheduleScrollToBottom(proxy, delay: 0, force: true, animated: false)
+                        scheduleScrollToBottom(proxy, delay: 0.12, force: true, animated: false)
                     }
                     .onChange(of: activeThreadKey) {
-                        scheduleScrollToBottom(proxy, delay: 0, force: true, animated: false)
+                        scheduleScrollToBottom(proxy, delay: 0.12, force: true, animated: false)
                     }
                     .onChange(of: messages.count) {
                         scheduleScrollToBottom(proxy)
@@ -380,12 +419,7 @@ private struct ScrollToBottomIndicator: View {
             .foregroundColor(.white)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(LitterTheme.surface.opacity(0.94))
-            .overlay(
-                Capsule().stroke(LitterTheme.border.opacity(0.9), lineWidth: 1)
-            )
-            .clipShape(Capsule())
-            .shadow(color: .black.opacity(0.24), radius: 8, x: 0, y: 4)
+            .modifier(GlassCapsuleModifier())
         }
         .buttonStyle(.plain)
         .onAppear {
@@ -507,6 +541,7 @@ private struct ConversationInputBar: View {
     let onSend: (String, [SkillMentionSelection]) -> Void
     let onFileSearch: (String) async throws -> [FuzzyFileSearchResult]
     let inputFocused: FocusState<Bool>.Binding
+    var bottomInset: CGFloat = 0
 
     @State private var inputText = ""
     @State private var showAttachMenu = false
@@ -620,10 +655,10 @@ private struct ConversationInputBar: View {
                 .ignoresSafeArea()
         }
         .sheet(isPresented: $showModelSelector) {
-            ModelSelectorView()
+            ModelSelectorSheet()
                 .environmentObject(serverManager)
                 .environmentObject(appState)
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showPermissionsSheet) {
@@ -862,7 +897,8 @@ private struct ConversationInputBar: View {
             .modifier(GlassCapsuleModifier())
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.top, 6)
+        .padding(.bottom, max(bottomInset, 8))
     }
 
     private var slashSuggestionPopup: some View {
@@ -1621,13 +1657,17 @@ private func fuzzyScore(candidate: String, query: String) -> Int? {
     return queryIndex == normalizedQuery.endIndex ? score : nil
 }
 
+private let kDollarSign: UInt8 = 0x24
+private let kUnderscore: UInt8 = 0x5F
+private let kHyphen: UInt8 = 0x2D
+
 private func isMentionNameByte(_ byte: UInt8) -> Bool {
     switch byte {
-    case UInt8(ascii: "a")...UInt8(ascii: "z"),
-        UInt8(ascii: "A")...UInt8(ascii: "Z"),
-        UInt8(ascii: "0")...UInt8(ascii: "9"),
-        UInt8(ascii: "_"),
-        UInt8(ascii: "-"):
+    case 0x61...0x7A, // a-z
+        0x41...0x5A,  // A-Z
+        0x30...0x39,  // 0-9
+        kUnderscore,
+        kHyphen:
         return true
     default:
         return false
@@ -1646,7 +1686,7 @@ private func extractMentionNames(_ text: String) -> [String] {
     var mentions: [String] = []
     var index = 0
     while index < bytes.count {
-        guard bytes[index] == UInt8(ascii: "$") else {
+        guard bytes[index] == kDollarSign else {
             index += 1
             continue
         }
@@ -1795,7 +1835,7 @@ struct TypingIndicator: View {
     @State private var phase = 0
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(0..<3) { i in
+            ForEach(Array(0..<3), id: \.self) { i in
                 Circle()
                     .fill(LitterTheme.accent)
                     .frame(width: 6, height: 6)
@@ -1845,3 +1885,11 @@ struct CameraView: UIViewControllerRepresentable {
         }
     }
 }
+
+#if DEBUG
+#Preview("Conversation") {
+    ContentView()
+        .environmentObject(LitterPreviewData.makeServerManager(messages: LitterPreviewData.longConversation))
+        .preferredColorScheme(.dark)
+}
+#endif

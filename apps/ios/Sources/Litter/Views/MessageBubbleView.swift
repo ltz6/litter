@@ -562,3 +562,21 @@ extension MarkdownUI.Theme {
             }
     }
 }
+
+#if DEBUG
+#Preview("Message Bubbles") {
+    LitterPreviewScene {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(LitterPreviewData.sampleMessages) { message in
+                    MessageBubbleView(
+                        message: message,
+                        serverId: LitterPreviewData.sampleServer.id
+                    )
+                }
+            }
+            .padding(16)
+        }
+    }
+}
+#endif

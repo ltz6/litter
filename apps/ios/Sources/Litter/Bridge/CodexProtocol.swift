@@ -96,9 +96,32 @@ struct ThreadStartResponse: Decodable {
     let model: String
     let modelProvider: String?
     let cwd: String
+    let reasoningEffort: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case thread
+        case model
+        case modelProvider
+        case modelProviderSnake = "model_provider"
+        case cwd
+        case reasoningEffort
+        case reasoningEffortSnake = "reasoning_effort"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try container.decode(ThreadInfo.self, forKey: .thread)
+        model = try container.decode(String.self, forKey: .model)
+        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
+        cwd = try container.decode(String.self, forKey: .cwd)
+        reasoningEffort = (try? container.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .reasoningEffortSnake))
+    }
 
     struct ThreadInfo: Decodable {
         let id: String
+        let path: String?
         let parentThreadId: String?
         let rootThreadId: String?
         let agentId: String?
@@ -107,6 +130,7 @@ struct ThreadStartResponse: Decodable {
 
         private enum CodingKeys: String, CodingKey {
             case id
+            case path
             case parentThreadId
             case parentThreadIdSnake = "parent_thread_id"
             case forkedFromId
@@ -176,6 +200,7 @@ struct ThreadStartResponse: Decodable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             id = try container.decode(String.self, forKey: .id)
+            path = try? container.decodeIfPresent(String.self, forKey: .path)
 
             let source = try? container.decodeIfPresent(SourcePayload.self, forKey: .source)
 
@@ -216,22 +241,6 @@ struct ThreadStartResponse: Decodable {
         }
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case thread
-        case model
-        case modelProvider
-        case modelProviderSnake = "model_provider"
-        case cwd
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        thread = try container.decode(ThreadInfo.self, forKey: .thread)
-        model = try container.decode(String.self, forKey: .model)
-        modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
-            ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
-        cwd = try container.decode(String.self, forKey: .cwd)
-    }
 }
 
 // MARK: - Turn
@@ -370,6 +379,7 @@ struct ThreadSummary: Decodable, Identifiable {
     let createdAt: Int64
     let updatedAt: Int64
     let cwd: String
+    let path: String?
     let cliVersion: String
     let parentThreadId: String?
     let rootThreadId: String?
@@ -388,6 +398,7 @@ struct ThreadSummary: Decodable, Identifiable {
         case updatedAt
         case updatedAtSnake = "updated_at"
         case cwd
+        case path
         case cliVersion
         case cliVersionSnake = "cli_version"
         case parentThreadId
@@ -423,6 +434,7 @@ struct ThreadSummary: Decodable, Identifiable {
             ?? (try? container.decodeIfPresent(Int64.self, forKey: .updatedAtSnake))
             ?? 0
         cwd = (try? container.decodeIfPresent(String.self, forKey: .cwd)) ?? ""
+        path = try? container.decodeIfPresent(String.self, forKey: .path)
         cliVersion = (try? container.decodeIfPresent(String.self, forKey: .cliVersion))
             ?? (try? container.decodeIfPresent(String.self, forKey: .cliVersionSnake))
             ?? ""
@@ -501,6 +513,7 @@ struct ThreadResumeResponse: Decodable {
     let model: String
     let modelProvider: String?
     let cwd: String
+    let reasoningEffort: String?
 
     private enum CodingKeys: String, CodingKey {
         case thread
@@ -508,6 +521,8 @@ struct ThreadResumeResponse: Decodable {
         case modelProvider
         case modelProviderSnake = "model_provider"
         case cwd
+        case reasoningEffort
+        case reasoningEffortSnake = "reasoning_effort"
     }
 
     init(from decoder: Decoder) throws {
@@ -517,6 +532,8 @@ struct ThreadResumeResponse: Decodable {
         modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
             ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
         cwd = try container.decode(String.self, forKey: .cwd)
+        reasoningEffort = (try? container.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .reasoningEffortSnake))
     }
 }
 
@@ -532,6 +549,7 @@ struct ThreadForkResponse: Decodable {
     let model: String
     let modelProvider: String?
     let cwd: String
+    let reasoningEffort: String?
 
     private enum CodingKeys: String, CodingKey {
         case thread
@@ -539,6 +557,8 @@ struct ThreadForkResponse: Decodable {
         case modelProvider
         case modelProviderSnake = "model_provider"
         case cwd
+        case reasoningEffort
+        case reasoningEffortSnake = "reasoning_effort"
     }
 
     init(from decoder: Decoder) throws {
@@ -548,6 +568,8 @@ struct ThreadForkResponse: Decodable {
         modelProvider = (try? container.decodeIfPresent(String.self, forKey: .modelProvider))
             ?? (try? container.decodeIfPresent(String.self, forKey: .modelProviderSnake))
         cwd = try container.decode(String.self, forKey: .cwd)
+        reasoningEffort = (try? container.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .reasoningEffortSnake))
     }
 }
 
@@ -575,6 +597,7 @@ struct ThreadArchiveResponse: Decodable {}
 
 struct ResumedThread: Decodable {
     let id: String
+    let path: String?
     let turns: [ResumedTurn]
     let parentThreadId: String?
     let rootThreadId: String?
@@ -584,6 +607,7 @@ struct ResumedThread: Decodable {
 
     private enum CodingKeys: String, CodingKey {
         case id
+        case path
         case turns
         case items
         case parentThreadId
@@ -606,6 +630,7 @@ struct ResumedThread: Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
+        path = try? container.decodeIfPresent(String.self, forKey: .path)
         let parentFromPrimary = try? container.decodeIfPresent(String.self, forKey: .parentThreadId)
         let parentFromSnake = try? container.decodeIfPresent(String.self, forKey: .parentThreadIdSnake)
         let parentFromForkCamel = try? container.decodeIfPresent(String.self, forKey: .forkedFromId)

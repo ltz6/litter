@@ -11,7 +11,7 @@ struct SessionSidebarView: View {
     @ObserveInjection var inject
     @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
-    @State private var isLoading = true
+    @State private var isLoading: Bool
     @State private var resumingKey: ThreadKey?
     @State private var showSettings = false
     @State private var directoryPickerSheet: DirectoryPickerSheetModel?
@@ -27,6 +27,7 @@ struct SessionSidebarView: View {
     @State private var collapsedSessionNodeKeys: Set<ThreadKey> = []
     @State private var pendingActiveSessionScroll = false
     @State private var sessionSearchDebounceTask: Task<Void, Never>?
+    private let autoLoadSessions: Bool
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
@@ -43,6 +44,11 @@ struct SessionSidebarView: View {
         var selectedServerId: String
     }
 
+    init(autoLoadSessions: Bool = true) {
+        self.autoLoadSessions = autoLoadSessions
+        _isLoading = State(initialValue: autoLoadSessions)
+    }
+
     var body: some View {
         let derived = makeDerivedData()
         return sidebarContent(derived: derived)
@@ -50,7 +56,8 @@ struct SessionSidebarView: View {
 
     private func sidebarContent(derived: SessionSidebarDerivedData) -> some View {
         let base = sidebarLayout(derived: derived)
-            .background(.ultraThinMaterial)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .modifier(GlassRectModifier(cornerRadius: 0))
             .enableInjection()
 
         let lifecycle = attachLifecycleHandlers(to: base, derived: derived)
@@ -93,12 +100,16 @@ struct SessionSidebarView: View {
     ) -> some View {
         let primaryLifecycle = AnyView(
             content
-                .task { await loadSessions() }
+                .task {
+                    guard autoLoadSessions else { return }
+                    await loadSessions()
+                }
                 .onAppear {
                     scheduleActiveSessionScrollIfNeeded()
                 }
                 .onChange(of: serverManager.hasAnyConnection) { _, connected in
-                    if connected { Task { await loadSessions() } }
+                    guard autoLoadSessions, connected else { return }
+                    Task { await loadSessions() }
                 }
                 .onChange(of: serverManager.activeThreadKey) { _, _ in
                     scheduleActiveSessionScrollIfNeeded()
@@ -239,6 +250,7 @@ struct SessionSidebarView: View {
                     Spacer()
                 } else {
                     sessionList(derived: derived)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
             }
 
@@ -331,9 +343,8 @@ struct SessionSidebarView: View {
                 Text("Settings")
                     .font(LitterFont.monospaced(.footnote))
                     .foregroundColor(LitterTheme.textSecondary)
-                Spacer()
             }
-            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
             .padding(.vertical, 14)
         }
     }
@@ -352,10 +363,11 @@ struct SessionSidebarView: View {
                 Text("New Session")
                     .font(LitterFont.monospaced(.subheadline))
             }
-            .foregroundColor(.white)
+            .foregroundColor(.black)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
-            .modifier(GlassRectModifier(cornerRadius: 8, tint: LitterTheme.accent))
+            .background(LitterTheme.accent)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .accessibilityIdentifier("sidebar.newSessionButton")
         .padding(16)
@@ -1375,3 +1387,16 @@ struct PulsingDot: View {
             .onAppear { pulse = true }
     }
 }
+
+#if DEBUG
+#Preview("Session Sidebar") {
+    LitterPreviewScene(
+        serverManager: LitterPreviewData.makeSidebarManager(),
+        appState: LitterPreviewData.makeAppState(sidebarOpen: true)
+    ) {
+        SessionSidebarView(autoLoadSessions: false)
+            .frame(width: SidebarOverlay.sidebarWidth, height: 760)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+#endif

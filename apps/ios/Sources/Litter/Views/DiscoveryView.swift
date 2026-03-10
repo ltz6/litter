@@ -4,7 +4,7 @@ import Network
 struct DiscoveryView: View {
     var onServerSelected: ((DiscoveredServer) -> Void)?
     @EnvironmentObject var serverManager: ServerManager
-    @StateObject private var discovery = NetworkDiscovery()
+    @StateObject private var discovery: NetworkDiscovery
     @State private var sshServer: DiscoveredServer?
     @State private var pendingSSHServer: DiscoveredServer?
     @State private var showManualEntry = false
@@ -18,6 +18,20 @@ struct DiscoveryView: View {
     @State private var connectingServer: DiscoveredServer?
     @State private var wakingServer: DiscoveredServer?
     @State private var connectError: String?
+    private let autoStartDiscovery: Bool
+    private let initialServers: [DiscoveredServer]
+
+    init(
+        onServerSelected: ((DiscoveredServer) -> Void)? = nil,
+        discovery: NetworkDiscovery? = nil,
+        autoStartDiscovery: Bool = true,
+        initialServers: [DiscoveredServer] = []
+    ) {
+        self.onServerSelected = onServerSelected
+        _discovery = StateObject(wrappedValue: discovery ?? NetworkDiscovery())
+        self.autoStartDiscovery = autoStartDiscovery
+        self.initialServers = initialServers
+    }
 
     private var localServers: [DiscoveredServer] {
         discovery.servers.filter { $0.source == .local }
@@ -91,6 +105,31 @@ struct DiscoveryView: View {
         }
     }
 
+    private func applyInitialServersIfNeeded() {
+        guard !initialServers.isEmpty, discovery.servers.isEmpty else { return }
+        discovery.servers = initialServers
+        discovery.isScanning = false
+    }
+
+    private func refreshDiscovery() {
+        guard autoStartDiscovery else {
+            applyInitialServersIfNeeded()
+            return
+        }
+        discovery.startScanning()
+    }
+
+    private func handleAppear() {
+        refreshDiscovery()
+        guard autoStartDiscovery else { return }
+        maybeStartSimulatorAutoSSH()
+    }
+
+    private func handleDisappear() {
+        guard autoStartDiscovery else { return }
+        discovery.stopScanning()
+    }
+
     var body: some View {
         ZStack {
             LitterTheme.backgroundGradient.ignoresSafeArea()
@@ -111,7 +150,7 @@ struct DiscoveryView: View {
                 manualSection
             }
             .scrollContentBackground(.hidden)
-            .refreshable { discovery.startScanning() }
+            .refreshable { refreshDiscovery() }
             .accessibilityIdentifier("discovery.list")
         }
         .navigationTitle("")
@@ -120,7 +159,7 @@ struct DiscoveryView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    discovery.startScanning()
+                    refreshDiscovery()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .foregroundColor(LitterTheme.accent)
@@ -129,11 +168,8 @@ struct DiscoveryView: View {
                 .disabled(discovery.isScanning)
             }
         }
-        .onAppear {
-            discovery.startScanning()
-            maybeStartSimulatorAutoSSH()
-        }
-        .onDisappear { discovery.stopScanning() }
+        .onAppear { handleAppear() }
+        .onDisappear { handleDisappear() }
         .sheet(item: $sshServer) { server in
             SSHLoginSheet(server: server) { target, detectedWakeMAC in
                 sshServer = nil
@@ -810,3 +846,19 @@ private enum ManualConnectionMode: String, CaseIterable, Identifiable {
         }
     }
 }
+
+#if DEBUG
+#Preview("Discovery") {
+    LitterPreviewScene(
+        serverManager: LitterPreviewData.makeServerManager(includeActiveThread: false),
+        includeBackground: false
+    ) {
+        NavigationStack {
+            DiscoveryView(
+                autoStartDiscovery: false,
+                initialServers: LitterPreviewData.sampleDiscoveryServers
+            )
+        }
+    }
+}
+#endif

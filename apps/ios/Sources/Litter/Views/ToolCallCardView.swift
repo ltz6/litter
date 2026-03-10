@@ -281,3 +281,14 @@ private struct IndexedValue<Value>: Identifiable {
     let index: Int
     let value: Value
 }
+
+#if DEBUG
+#Preview("Tool Call Card") {
+    ZStack {
+        LitterTheme.backgroundGradient.ignoresSafeArea()
+        ToolCallCardView(model: LitterPreviewData.sampleToolCallModel)
+            .padding(20)
+    }
+    .preferredColorScheme(.dark)
+}
+#endif
