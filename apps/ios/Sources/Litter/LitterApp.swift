@@ -11,7 +11,6 @@ struct LitterApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(serverManager)
-                .preferredColorScheme(.dark)
                 .task { await serverManager.reconnectAll() }
         }
     }
@@ -103,7 +102,6 @@ struct ContentView: View {
                 })
                 .environmentObject(serverManager)
             }
-            .preferredColorScheme(.dark)
         }
     }
 
@@ -172,7 +170,6 @@ private struct HomeNavigationView: View {
                 SessionSidebarView()
                     .navigationTitle("Sessions")
                     .navigationBarTitleDisplayMode(.inline)
-                    .toolbarColorScheme(.dark, for: .navigationBar)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(LitterTheme.backgroundGradient.ignoresSafeArea())
             }
@@ -215,29 +212,29 @@ private struct ApprovalPromptView: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 Text(title)
-                    .font(LitterFont.monospaced(.headline))
+                    .font(LitterFont.styled(.headline))
                     .foregroundColor(LitterTheme.textPrimary)
 
                 if let reason = approval.reason, !reason.isEmpty {
                     Text(reason)
-                        .font(LitterFont.monospaced(.footnote))
+                        .font(LitterFont.styled(.footnote))
                         .foregroundColor(LitterTheme.textSecondary)
                 }
 
                 if let requesterLabel {
                     Text("Requester: \(requesterLabel)")
-                        .font(LitterFont.monospaced(.caption))
+                        .font(LitterFont.styled(.caption))
                         .foregroundColor(LitterTheme.textMuted)
                 }
 
                 if let command = approval.command, !command.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Command")
-                            .font(LitterFont.monospaced(.caption))
+                            .font(LitterFont.styled(.caption))
                             .foregroundColor(LitterTheme.textMuted)
                         ScrollView(.horizontal, showsIndicators: false) {
                             Text(command)
-                                .font(LitterFont.monospaced(.footnote))
+                                .font(LitterFont.styled(.footnote))
                                 .foregroundColor(LitterTheme.textBody)
                                 .padding(10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -249,13 +246,13 @@ private struct ApprovalPromptView: View {
 
                 if let cwd = approval.cwd, !cwd.isEmpty {
                     Text("CWD: \(cwd)")
-                        .font(LitterFont.monospaced(.caption))
+                        .font(LitterFont.styled(.caption))
                         .foregroundColor(LitterTheme.textMuted)
                 }
 
                 if let grantRoot = approval.grantRoot, !grantRoot.isEmpty {
                     Text("Grant Root: \(grantRoot)")
-                        .font(LitterFont.monospaced(.caption))
+                        .font(LitterFont.styled(.caption))
                         .foregroundColor(LitterTheme.textMuted)
                 }
 
@@ -280,7 +277,7 @@ private struct ApprovalPromptView: View {
                             .frame(maxWidth: .infinity)
                     }
                 }
-                .font(LitterFont.monospaced(.callout))
+                .font(LitterFont.styled(.callout))
             }
             .padding(16)
             .modifier(GlassRectModifier(cornerRadius: 14))
@@ -301,7 +298,7 @@ struct LaunchView: View {
             VStack(spacing: 24) {
                 BrandLogo(size: 132)
                 Text("AI coding agent on iOS")
-                    .font(LitterFont.monospaced(.body))
+                    .font(LitterFont.styled(.body))
                     .foregroundColor(LitterTheme.textMuted)
             }
         }

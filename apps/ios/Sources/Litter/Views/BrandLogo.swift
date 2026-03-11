@@ -30,6 +30,5 @@ struct BrandLogo: View {
         LitterTheme.backgroundGradient.ignoresSafeArea()
         BrandLogo(size: 128)
     }
-    .preferredColorScheme(.dark)
 }
 #endif

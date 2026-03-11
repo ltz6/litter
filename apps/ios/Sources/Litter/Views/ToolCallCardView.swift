@@ -17,7 +17,7 @@ struct ToolCallCardView: View {
                     .foregroundColor(kindAccent)
 
                 Text(model.summary)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.textSystem)
                     .lineLimit(1)
 
@@ -27,7 +27,7 @@ struct ToolCallCardView: View {
 
                 if let duration = model.duration, !duration.isEmpty {
                     Text(duration)
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .foregroundColor(LitterTheme.textSecondary)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -74,7 +74,7 @@ struct ToolCallCardView: View {
 
     private var statusChip: some View {
         Text(model.status.label)
-            .font(LitterFont.monospaced(.caption2, weight: .semibold))
+            .font(LitterFont.styled(.caption2, weight: .semibold))
             .foregroundColor(statusChipText)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
@@ -85,32 +85,32 @@ struct ToolCallCardView: View {
     private var kindAccent: Color {
         switch model.kind {
         case .commandExecution, .commandOutput:
-            return Color(hex: "#C7B072")
+            return LitterTheme.adaptive(light: "#8B6914", dark: "#C7B072")
         case .fileChange:
-            return Color(hex: "#7CAFD9")
+            return LitterTheme.adaptive(light: "#2B6CB0", dark: "#7CAFD9")
         case .fileDiff:
-            return Color(hex: "#6FA9D8")
+            return LitterTheme.adaptive(light: "#2563AA", dark: "#6FA9D8")
         case .mcpToolCall:
-            return Color(hex: "#C797D8")
+            return LitterTheme.adaptive(light: "#8B3FAF", dark: "#C797D8")
         case .mcpToolProgress:
-            return Color(hex: "#D3A85E")
+            return LitterTheme.adaptive(light: "#9A6B20", dark: "#D3A85E")
         case .webSearch:
-            return Color(hex: "#88C6C7")
+            return LitterTheme.adaptive(light: "#3B8A8B", dark: "#88C6C7")
         case .collaboration:
-            return Color(hex: "#9BCF8E")
+            return LitterTheme.adaptive(light: "#3D7A30", dark: "#9BCF8E")
         case .imageView:
-            return Color(hex: "#E3A66F")
+            return LitterTheme.adaptive(light: "#B5712B", dark: "#E3A66F")
         }
     }
 
     private var statusChipBackground: Color {
         switch model.status {
         case .completed:
-            return Color(hex: "#6EA676").opacity(0.2)
+            return LitterTheme.success.opacity(0.2)
         case .inProgress:
-            return Color(hex: "#E2A644").opacity(0.2)
+            return LitterTheme.warning.opacity(0.2)
         case .failed:
-            return Color(hex: "#FF5555").opacity(0.2)
+            return LitterTheme.danger.opacity(0.2)
         case .unknown:
             return LitterTheme.surfaceLight.opacity(0.7)
         }
@@ -119,11 +119,11 @@ struct ToolCallCardView: View {
     private var statusChipText: Color {
         switch model.status {
         case .completed:
-            return Color(hex: "#6EA676")
+            return LitterTheme.success
         case .inProgress:
-            return Color(hex: "#E2A644")
+            return LitterTheme.warning
         case .failed:
-            return Color(hex: "#FF5555")
+            return LitterTheme.danger
         case .unknown:
             return LitterTheme.textSecondary
         }
@@ -140,10 +140,10 @@ struct ToolCallCardView: View {
                         ForEach(identifiedKeyValueEntries(entries)) { entry in
                             HStack(alignment: .top, spacing: 8) {
                                 Text(entry.value.key + ":")
-                                    .font(LitterFont.monospaced(.caption2, weight: .semibold))
+                                    .font(LitterFont.styled(.caption2, weight: .semibold))
                                     .foregroundColor(LitterTheme.textSecondary)
                                 Text(entry.value.value)
-                                    .font(LitterFont.monospaced(.caption2))
+                                    .font(LitterFont.styled(.caption2))
                                     .foregroundColor(LitterTheme.textSystem)
                                     .textSelection(.enabled)
                                 Spacer(minLength: 0)
@@ -171,10 +171,10 @@ struct ToolCallCardView: View {
                         ForEach(identifiedTextItems(items, prefix: "list")) { item in
                             HStack(alignment: .top, spacing: 6) {
                                 Text("•")
-                                    .font(LitterFont.monospaced(.caption))
+                                    .font(LitterFont.styled(.caption))
                                     .foregroundColor(LitterTheme.textSecondary)
                                 Text(item.value)
-                                    .font(LitterFont.monospaced(.caption))
+                                    .font(LitterFont.styled(.caption))
                                     .foregroundColor(LitterTheme.textSystem)
                                     .textSelection(.enabled)
                             }
@@ -198,7 +198,7 @@ struct ToolCallCardView: View {
                                     .frame(width: 6, height: 6)
                                     .padding(.top, 5)
                                 Text(item.value)
-                                    .font(LitterFont.monospaced(.caption))
+                                    .font(LitterFont.styled(.caption))
                                     .foregroundColor(LitterTheme.textSystem)
                                     .textSelection(.enabled)
                                 Spacer(minLength: 0)
@@ -215,7 +215,7 @@ struct ToolCallCardView: View {
 
     private func sectionLabel(_ label: String) -> some View {
         Text(label.uppercased())
-            .font(LitterFont.monospaced(.caption2, weight: .bold))
+            .font(LitterFont.styled(.caption2, weight: .bold))
             .foregroundColor(LitterTheme.textSecondary)
     }
 
@@ -289,6 +289,5 @@ private struct IndexedValue<Value>: Identifiable {
         ToolCallCardView(model: LitterPreviewData.sampleToolCallModel)
             .padding(20)
     }
-    .preferredColorScheme(.dark)
 }
 #endif

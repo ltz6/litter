@@ -89,7 +89,6 @@ struct SessionSidebarView: View {
                 )
                 .environmentObject(serverManager)
             }
-            .preferredColorScheme(.dark)
         }
     }
 
@@ -232,7 +231,7 @@ struct SessionSidebarView: View {
             } else if derived.allThreads.isEmpty {
                 Spacer()
                 Text("No sessions yet")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textMuted)
                     .frame(maxWidth: .infinity)
                 Spacer()
@@ -243,7 +242,7 @@ struct SessionSidebarView: View {
                 if derived.filteredThreads.isEmpty {
                     Spacer()
                     Text("No matches for \"\(trimmedSessionSearchQuery)\"")
-                        .font(LitterFont.monospaced(.footnote))
+                        .font(LitterFont.styled(.footnote))
                         .foregroundColor(LitterTheme.textMuted)
                         .frame(maxWidth: .infinity)
                     Spacer()
@@ -353,9 +352,9 @@ struct SessionSidebarView: View {
                     Image(systemName: "plus")
                         .font(.system(.subheadline, weight: .medium))
                     Text("New Session")
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                 }
-                .foregroundColor(.black)
+                .foregroundColor(LitterTheme.textOnAccent)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
                 .background(LitterTheme.accent)
@@ -375,7 +374,7 @@ struct SessionSidebarView: View {
                     .foregroundColor(LitterTheme.textMuted)
                     .frame(width: 20)
                 Text("Not connected")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textMuted)
                 Spacer()
                 Button("Connect") {
@@ -383,22 +382,22 @@ struct SessionSidebarView: View {
                     appState.showServerPicker = true
                 }
                 .accessibilityIdentifier("sidebar.connectButton")
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.accent)
             } else {
                 Image(systemName: "server.rack")
                     .foregroundColor(LitterTheme.accent)
                     .frame(width: 20)
                 Text("\(connected.count) server\(connected.count == 1 ? "" : "s")")
-                    .font(LitterFont.monospaced(.footnote))
-                    .foregroundColor(.white)
+                    .font(LitterFont.styled(.footnote))
+                    .foregroundColor(LitterTheme.textPrimary)
                 Spacer()
                 Button("Add") {
                     withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
                     appState.showServerPicker = true
                 }
                 .accessibilityIdentifier("sidebar.addServerButton")
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.accent)
                 if let activeThread {
                     Button {
@@ -413,7 +412,7 @@ struct SessionSidebarView: View {
                         }
                     }
                     .disabled(isForkingActiveThread || activeThread.hasTurnActive)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(activeThread.hasTurnActive ? LitterTheme.textMuted : LitterTheme.accent)
                 }
             }
@@ -426,11 +425,11 @@ struct SessionSidebarView: View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundColor(LitterTheme.textMuted)
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
 
             TextField("Search sessions", text: $sessionSearchQuery)
-                .font(LitterFont.monospaced(.footnote))
-                .foregroundColor(.white)
+                .font(LitterFont.styled(.footnote))
+                .foregroundColor(LitterTheme.textPrimary)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled(true)
 
@@ -502,7 +501,7 @@ struct SessionSidebarView: View {
                     selectedServerFilterId = nil
                     showOnlyForks = false
                 }
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.accent)
             }
             Spacer(minLength: 0)
@@ -523,8 +522,8 @@ struct SessionSidebarView: View {
             Text(title)
                 .lineLimit(1)
         }
-        .font(LitterFont.monospaced(.caption))
-        .foregroundColor(isActive ? .black : LitterTheme.textSecondary)
+        .font(LitterFont.styled(.caption))
+        .foregroundColor(isActive ? LitterTheme.textOnAccent : LitterTheme.textSecondary)
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(isActive ? LitterTheme.accent : LitterTheme.surface.opacity(0.65))
@@ -558,17 +557,17 @@ struct SessionSidebarView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(group.workspaceTitle)
-                        .font(LitterFont.monospaced(.caption))
-                        .foregroundColor(.white)
+                        .font(LitterFont.styled(.caption))
+                        .foregroundColor(LitterTheme.textPrimary)
                         .lineLimit(1)
 
                     Text(hostname)
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .foregroundColor(LitterTheme.textMuted)
                         .lineLimit(1)
 
                     Text(abbreviateHomePath(group.workspacePath))
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .foregroundColor(LitterTheme.textMuted)
                         .lineLimit(1)
                 }
@@ -593,7 +592,7 @@ struct SessionSidebarView: View {
                     ForEach(derived.workspaceSections) { section in
                         if let title = section.title {
                             Text(title)
-                                .font(LitterFont.monospaced(.caption2))
+                                .font(LitterFont.styled(.caption2))
                                 .foregroundColor(LitterTheme.textMuted)
                                 .padding(.horizontal, 2)
                         }
@@ -736,16 +735,16 @@ struct SessionSidebarView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
                             Text(sessionTitle(thread))
-                                .font(LitterFont.monospaced(.footnote))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.footnote))
+                                .foregroundColor(LitterTheme.textPrimary)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.leading)
                                 .accessibilityIdentifier("sidebar.sessionTitle")
 
                             if thread.isFork {
                                 Text("Fork")
-                                    .font(LitterFont.monospaced(.caption2))
-                                    .foregroundColor(.black)
+                                    .font(LitterFont.styled(.caption2))
+                                    .foregroundColor(LitterTheme.textOnAccent)
                                     .padding(.horizontal, 5)
                                     .padding(.vertical, 2)
                                     .background(LitterTheme.accent)
@@ -777,7 +776,7 @@ struct SessionSidebarView: View {
                                     .foregroundColor(LitterTheme.textMuted)
                             }
                         }
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .lineLimit(1)
                     }
                 }
@@ -857,7 +856,7 @@ struct SessionSidebarView: View {
 
     private func lineageChip(title: String, count: Int, isInteractive: Bool) -> some View {
         Text("\(title) \(count)")
-            .font(LitterFont.monospaced(.caption2))
+            .font(LitterFont.styled(.caption2))
             .foregroundColor(isInteractive ? LitterTheme.accent : LitterTheme.textMuted)
             .padding(.horizontal, 6)
             .padding(.vertical, 4)

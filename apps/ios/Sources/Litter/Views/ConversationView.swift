@@ -426,9 +426,9 @@ private struct ScrollToBottomIndicator: View {
                     .font(.system(.caption, weight: .bold))
                     .offset(y: bob ? 1.5 : -1.5)
                 Text("Latest")
-                    .font(LitterFont.monospaced(.caption, weight: .semibold))
+                    .font(LitterFont.styled(.caption, weight: .semibold))
             }
-            .foregroundColor(.white)
+            .foregroundColor(LitterTheme.textPrimary)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .modifier(GlassCapsuleModifier())
@@ -689,8 +689,8 @@ private struct ConversationInputBar: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack {
                                     Text(preset.title)
-                                        .foregroundColor(.white)
-                                        .font(LitterFont.monospaced(.subheadline))
+                                        .foregroundColor(LitterTheme.textPrimary)
+                                        .font(LitterFont.styled(.subheadline))
                                     Spacer()
                                     if preset.approvalPolicy == appState.approvalPolicy && preset.sandboxMode == appState.sandboxMode {
                                         Image(systemName: "checkmark")
@@ -699,7 +699,7 @@ private struct ConversationInputBar: View {
                                 }
                                 Text(preset.description)
                                     .foregroundColor(LitterTheme.textSecondary)
-                                    .font(LitterFont.monospaced(.caption))
+                                    .font(LitterFont.styled(.caption))
                             }
                         }
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
@@ -716,7 +716,6 @@ private struct ConversationInputBar: View {
                     }
                 }
             }
-            .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $showExperimentalSheet) {
             NavigationStack {
@@ -725,7 +724,7 @@ private struct ConversationInputBar: View {
                         ProgressView().tint(LitterTheme.accent)
                     } else if experimentalFeatures.isEmpty {
                         Text("No experimental features available")
-                            .font(LitterFont.monospaced(.footnote))
+                            .font(LitterFont.styled(.footnote))
                             .foregroundColor(LitterTheme.textMuted)
                     } else {
                         List {
@@ -733,10 +732,10 @@ private struct ConversationInputBar: View {
                                 HStack(alignment: .top, spacing: 10) {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(feature.displayName ?? feature.name)
-                                            .font(LitterFont.monospaced(.subheadline))
-                                            .foregroundColor(.white)
+                                            .font(LitterFont.styled(.subheadline))
+                                            .foregroundColor(LitterTheme.textPrimary)
                                         Text(feature.description ?? feature.stage)
-                                            .font(LitterFont.monospaced(.caption))
+                                            .font(LitterFont.styled(.caption))
                                             .foregroundColor(LitterTheme.textSecondary)
                                     }
                                     Spacer(minLength: 0)
@@ -773,7 +772,6 @@ private struct ConversationInputBar: View {
                     }
                 }
             }
-            .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $showSkillsSheet) {
             NavigationStack {
@@ -782,7 +780,7 @@ private struct ConversationInputBar: View {
                         ProgressView().tint(LitterTheme.accent)
                     } else if skills.isEmpty {
                         Text("No skills available for this workspace")
-                            .font(LitterFont.monospaced(.footnote))
+                            .font(LitterFont.styled(.footnote))
                             .foregroundColor(LitterTheme.textMuted)
                     } else {
                         List {
@@ -790,20 +788,20 @@ private struct ConversationInputBar: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack {
                                         Text(skill.name)
-                                            .font(LitterFont.monospaced(.subheadline))
-                                            .foregroundColor(.white)
+                                            .font(LitterFont.styled(.subheadline))
+                                            .foregroundColor(LitterTheme.textPrimary)
                                         Spacer()
                                         if skill.enabled {
                                             Text("enabled")
-                                                .font(LitterFont.monospaced(.caption2))
+                                                .font(LitterFont.styled(.caption2))
                                                 .foregroundColor(LitterTheme.accent)
                                         }
                                     }
                                     Text(skill.description)
-                                        .font(LitterFont.monospaced(.caption))
+                                        .font(LitterFont.styled(.caption))
                                         .foregroundColor(LitterTheme.textSecondary)
                                     Text(skill.path)
-                                        .font(LitterFont.monospaced(.caption2))
+                                        .font(LitterFont.styled(.caption2))
                                         .foregroundColor(LitterTheme.textMuted)
                                 }
                                 .listRowBackground(LitterTheme.surface.opacity(0.6))
@@ -827,7 +825,6 @@ private struct ConversationInputBar: View {
                     }
                 }
             }
-            .preferredColorScheme(.dark)
         }
         .alert("Rename Thread", isPresented: Binding(
             get: { showRenamePrompt },
@@ -866,7 +863,7 @@ private struct ConversationInputBar: View {
             Button { showAttachMenu = true } label: {
                 Image(systemName: "plus")
                     .font(.system(.subheadline, weight: .semibold))
-                    .foregroundColor(.white)
+                    .foregroundColor(LitterTheme.textPrimary)
                     .frame(width: 32, height: 32)
                     .modifier(GlassCircleModifier())
             }
@@ -874,7 +871,7 @@ private struct ConversationInputBar: View {
             HStack(spacing: 0) {
                 TextField("Message litter...", text: $inputText, axis: .vertical)
                     .font(.system(.body))
-                    .foregroundColor(.white)
+                    .foregroundColor(LitterTheme.textPrimary)
                     .lineLimit(1...5)
                     .focused(inputFocused)
                     .textInputAutocapitalization(.never)
@@ -935,10 +932,10 @@ private struct ConversationInputBar: View {
                     } label: {
                         HStack(spacing: 10) {
                             Text("/\(command.rawValue)")
-                                .font(LitterFont.monospaced(.body))
-                                .foregroundColor(Color(hex: "#6EA676"))
+                                .font(LitterFont.styled(.body))
+                                .foregroundColor(LitterTheme.success)
                             Text(command.description)
-                                .font(LitterFont.monospaced(.body))
+                                .font(LitterFont.styled(.body))
                                 .foregroundColor(LitterTheme.textSecondary)
                                 .lineLimit(1)
                             Spacer(minLength: 0)
@@ -960,21 +957,21 @@ private struct ConversationInputBar: View {
         suggestionPopup {
             if fileSearchLoading {
                 Text("Searching files...")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
             } else if let fileSearchError, !fileSearchError.isEmpty {
                 Text(fileSearchError)
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
             } else if fileSuggestions.isEmpty {
                 Text("No matches")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
@@ -990,8 +987,8 @@ private struct ConversationInputBar: View {
                                     .font(.system(.caption))
                                     .foregroundColor(LitterTheme.textSecondary)
                                 Text(suggestion.path)
-                                    .font(LitterFont.monospaced(.footnote))
-                                    .foregroundColor(.white)
+                                    .font(LitterFont.styled(.footnote))
+                                    .foregroundColor(LitterTheme.textPrimary)
                                     .lineLimit(1)
                                 Spacer(minLength: 0)
                             }
@@ -1013,14 +1010,14 @@ private struct ConversationInputBar: View {
         suggestionPopup {
             if skillsLoading && skillSuggestions.isEmpty {
                 Text("Loading skills...")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
             } else if skillSuggestions.isEmpty {
                 Text("No skills found")
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .foregroundColor(LitterTheme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
@@ -1033,10 +1030,10 @@ private struct ConversationInputBar: View {
                         } label: {
                             HStack(spacing: 8) {
                                 Text("$\(skill.name)")
-                                    .font(LitterFont.monospaced(.footnote))
-                                    .foregroundColor(Color(hex: "#6EA676"))
+                                    .font(LitterFont.styled(.footnote))
+                                    .foregroundColor(LitterTheme.success)
                                 Text(skill.description)
-                                    .font(LitterFont.monospaced(.footnote))
+                                    .font(LitterFont.styled(.footnote))
                                     .foregroundColor(LitterTheme.textSecondary)
                                     .lineLimit(1)
                                 Spacer(minLength: 0)
@@ -1915,6 +1912,5 @@ struct CameraView: UIViewControllerRepresentable {
 #Preview("Conversation") {
     ContentView()
         .environmentObject(LitterPreviewData.makeServerManager(messages: LitterPreviewData.longConversation))
-        .preferredColorScheme(.dark)
 }
 #endif

@@ -144,7 +144,6 @@ struct DiscoveryView: View {
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button { showSettings = true } label: {
@@ -244,13 +243,13 @@ struct DiscoveryView: View {
                     HStack {
                         ProgressView().tint(LitterTheme.textMuted).scaleEffect(0.7)
                         Text("Scanning...")
-                            .font(LitterFont.monospaced(.footnote))
+                            .font(LitterFont.styled(.footnote))
                             .foregroundColor(LitterTheme.textMuted)
                     }
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
                 } else {
                     Text("No servers found")
-                        .font(LitterFont.monospaced(.footnote))
+                        .font(LitterFont.styled(.footnote))
                         .foregroundColor(LitterTheme.textMuted)
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
                 }
@@ -284,7 +283,7 @@ struct DiscoveryView: View {
                     Image(systemName: "plus.circle")
                         .foregroundColor(LitterTheme.accent)
                     Text("Add Server")
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                         .foregroundColor(LitterTheme.accent)
                 }
             }
@@ -306,16 +305,16 @@ struct DiscoveryView: View {
                     .frame(width: 24)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(server.name)
-                        .font(LitterFont.monospaced(.subheadline))
-                        .foregroundColor(.white)
+                        .font(LitterFont.styled(.subheadline))
+                        .foregroundColor(LitterTheme.textPrimary)
                     Text(serverSubtitle(server))
-                        .font(LitterFont.monospaced(.caption))
+                        .font(LitterFont.styled(.caption))
                         .foregroundColor(LitterTheme.textSecondary)
                 }
                 Spacer()
                 if serverManager.connections[server.id]?.isConnected == true {
                     Text("connected")
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .foregroundColor(LitterTheme.accent)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -646,25 +645,25 @@ struct DiscoveryView: View {
 
                     Section {
                         TextField("hostname or IP", text: $manualHost)
-                            .font(LitterFont.monospaced(.footnote))
-                            .foregroundColor(.white)
+                            .font(LitterFont.styled(.footnote))
+                            .foregroundColor(LitterTheme.textPrimary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
                         TextField(manualConnectionMode.portPlaceholder, text: portBinding(for: manualConnectionMode))
-                            .font(LitterFont.monospaced(.footnote))
-                            .foregroundColor(.white)
+                            .font(LitterFont.styled(.footnote))
+                            .foregroundColor(LitterTheme.textPrimary)
                             .keyboardType(.numberPad)
                         if manualConnectionMode == .ssh {
                             Toggle(isOn: $manualUseSSHPortForward) {
                                 Text("Use SSH port forward")
-                                    .font(LitterFont.monospaced(.footnote))
-                                    .foregroundColor(.white)
+                                    .font(LitterFont.styled(.footnote))
+                                    .foregroundColor(LitterTheme.textPrimary)
                             }
                             .tint(LitterTheme.accent)
                         }
                         TextField("wake MAC (optional)", text: $manualWakeMAC)
-                            .font(LitterFont.monospaced(.footnote))
-                            .foregroundColor(.white)
+                            .font(LitterFont.styled(.footnote))
+                            .foregroundColor(LitterTheme.textPrimary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
                     } header: {
@@ -678,7 +677,7 @@ struct DiscoveryView: View {
                             submitManualEntry()
                         }
                         .foregroundColor(LitterTheme.accent)
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                     }
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
                 }
@@ -686,7 +685,6 @@ struct DiscoveryView: View {
             }
             .navigationTitle("Add Server")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Cancel") { showManualEntry = false }
@@ -694,7 +692,6 @@ struct DiscoveryView: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private func maybeStartSimulatorAutoSSH() {

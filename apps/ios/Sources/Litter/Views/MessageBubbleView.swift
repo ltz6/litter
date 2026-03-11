@@ -88,8 +88,8 @@ struct MessageBubbleView: View {
             }
             if !message.text.isEmpty {
                 Text(message.text)
-                    .font(LitterFont.monospaced(.callout, scale: textScale))
-                    .foregroundColor(.white)
+                    .font(LitterFont.styled(.callout, scale: textScale))
+                    .foregroundColor(LitterTheme.textPrimary)
                     .textSelection(.enabled)
             }
         }
@@ -116,7 +116,7 @@ struct MessageBubbleView: View {
         return VStack(alignment: .leading, spacing: 8) {
             if let assistantLabel = assistantAgentLabel {
                 Text(assistantLabel)
-                    .font(LitterFont.monospaced(.caption2, weight: .semibold, scale: textScale))
+                    .font(LitterFont.styled(.caption2, weight: .semibold, scale: textScale))
                     .foregroundColor(LitterTheme.textSecondary)
             }
             ForEach(parsed) { segment in
@@ -148,7 +148,7 @@ struct MessageBubbleView: View {
     private var reasoningContent: some View {
         let (_, body) = extractSystemTitleAndBody(message.text)
         return Text(normalizedReasoningText(body))
-            .font(LitterFont.monospaced(.footnote, scale: textScale))
+            .font(LitterFont.styled(.footnote, scale: textScale))
             .italic()
             .foregroundColor(LitterTheme.textSecondary)
             .textSelection(.enabled)
@@ -177,7 +177,7 @@ struct MessageBubbleView: View {
                     .font(.system(.caption2, weight: .semibold))
                     .foregroundColor(LitterTheme.accent)
                 Text(displayTitle.uppercased())
-                    .font(LitterFont.monospaced(.caption2, weight: .bold, scale: textScale))
+                    .font(LitterFont.styled(.caption2, weight: .bold, scale: textScale))
                     .foregroundColor(LitterTheme.accent)
                 Spacer()
             }
@@ -410,7 +410,7 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.bold)
                         FontSize(bodySize * 1.43)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 16, bottom: 8)
             }
@@ -419,7 +419,7 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.semibold)
                         FontSize(bodySize * 1.21)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 12, bottom: 6)
             }
@@ -428,13 +428,13 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.semibold)
                         FontSize(bodySize * 1.07)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 10, bottom: 4)
             }
             .strong {
                 FontWeight(.semibold)
-                ForegroundColor(.white)
+                ForegroundColor(LitterTheme.textPrimary)
             }
             .emphasis {
                 FontStyle(.italic)
@@ -451,7 +451,8 @@ extension MarkdownUI.Theme {
             .codeBlock { configuration in
                 CodeBlockView(
                     language: configuration.language ?? "",
-                    code: configuration.content
+                    code: configuration.content,
+                    fontSize: codeSize
                 )
                 .markdownMargin(top: 8, bottom: 8)
             }
@@ -492,7 +493,7 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.bold)
                         FontSize(bodySize * 1.31)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 12, bottom: 6)
             }
@@ -501,7 +502,7 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.semibold)
                         FontSize(bodySize * 1.15)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 10, bottom: 4)
             }
@@ -510,13 +511,13 @@ extension MarkdownUI.Theme {
                     .markdownTextStyle {
                         FontWeight(.semibold)
                         FontSize(bodySize * 1.08)
-                        ForegroundColor(.white)
+                        ForegroundColor(LitterTheme.textPrimary)
                     }
                     .markdownMargin(top: 8, bottom: 4)
             }
             .strong {
                 FontWeight(.semibold)
-                ForegroundColor(.white)
+                ForegroundColor(LitterTheme.textPrimary)
             }
             .emphasis {
                 FontStyle(.italic)
@@ -533,7 +534,8 @@ extension MarkdownUI.Theme {
             .codeBlock { configuration in
                 CodeBlockView(
                     language: configuration.language ?? "",
-                    code: configuration.content
+                    code: configuration.content,
+                    fontSize: codeSize
                 )
                 .markdownMargin(top: 6, bottom: 6)
             }

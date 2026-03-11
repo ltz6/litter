@@ -35,7 +35,6 @@ struct AccountView: View {
             }
             .navigationTitle("Account")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
@@ -43,7 +42,6 @@ struct AccountView: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
         .sheet(isPresented: $showOAuth) {
             oauthSheet
         }
@@ -61,7 +59,7 @@ struct AccountView: View {
     private var currentAccountSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("CURRENT ACCOUNT")
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.textMuted)
                 .padding(.horizontal, 20)
 
@@ -71,11 +69,11 @@ struct AccountView: View {
                     .frame(width: 10, height: 10)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(authTitle)
-                        .font(LitterFont.monospaced(.subheadline))
-                        .foregroundColor(.white)
+                        .font(LitterFont.styled(.subheadline))
+                        .foregroundColor(LitterTheme.textPrimary)
                     if let sub = authSubtitle {
                         Text(sub)
-                            .font(LitterFont.monospaced(.caption))
+                            .font(LitterFont.styled(.caption))
                             .foregroundColor(LitterTheme.textSecondary)
                     }
                 }
@@ -84,8 +82,8 @@ struct AccountView: View {
                     Button("Logout") {
                         Task { await conn?.logout() }
                     }
-                    .font(LitterFont.monospaced(.footnote))
-                    .foregroundColor(Color(hex: "#FF5555"))
+                    .font(LitterFont.styled(.footnote))
+                    .foregroundColor(LitterTheme.danger)
                 }
             }
             .padding(.horizontal, 20)
@@ -99,7 +97,7 @@ struct AccountView: View {
     private var loginSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("LOGIN")
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.textMuted)
                 .padding(.horizontal, 20)
 
@@ -113,13 +111,13 @@ struct AccountView: View {
             } label: {
                 HStack {
                     if isWorking {
-                        ProgressView().tint(Color(hex: "#0D0D0D")).scaleEffect(0.8)
+                        ProgressView().tint(LitterTheme.textOnAccent).scaleEffect(0.8)
                     }
                     Image(systemName: "person.crop.circle.badge.checkmark")
                     Text("Login with ChatGPT")
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                 }
-                .foregroundColor(Color(hex: "#0D0D0D"))
+                .foregroundColor(LitterTheme.textOnAccent)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .background(LitterTheme.accent)
@@ -129,14 +127,14 @@ struct AccountView: View {
             .disabled(isWorking)
 
             Text("— or use an API key —")
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.textMuted)
                 .frame(maxWidth: .infinity)
 
             VStack(alignment: .leading, spacing: 8) {
                 SecureField("sk-...", text: $apiKey)
-                    .font(LitterFont.monospaced(.subheadline))
-                    .foregroundColor(.white)
+                    .font(LitterFont.styled(.subheadline))
+                    .foregroundColor(LitterTheme.textPrimary)
                     .padding(12)
                     .background(LitterTheme.surface)
                     .cornerRadius(8)
@@ -154,7 +152,7 @@ struct AccountView: View {
                     }
                 } label: {
                     Text("Save API Key")
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                         .foregroundColor(LitterTheme.accent)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
@@ -181,14 +179,13 @@ struct AccountView: View {
                 .ignoresSafeArea()
                 .navigationTitle("Login with ChatGPT")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbarColorScheme(.dark, for: .navigationBar)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button("Cancel") {
                             Task { await conn?.cancelLogin() }
                             showOAuth = false
                         }
-                        .foregroundColor(Color(hex: "#FF5555"))
+                        .foregroundColor(LitterTheme.danger)
                     }
                 }
             }

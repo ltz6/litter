@@ -409,7 +409,6 @@ struct LitterPreviewScene<Content: View>: View {
         }
         .environmentObject(serverManager)
         .environmentObject(appState)
-        .preferredColorScheme(.dark)
     }
 }
 #endif

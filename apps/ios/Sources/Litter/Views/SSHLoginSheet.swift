@@ -51,10 +51,10 @@ struct SSHLoginSheet: View {
                                 .foregroundColor(LitterTheme.accent)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(server.name)
-                                    .font(LitterFont.monospaced(.subheadline))
-                                    .foregroundColor(.white)
+                                    .font(LitterFont.styled(.subheadline))
+                                    .foregroundColor(LitterTheme.textPrimary)
                                 Text(hostDisplay)
-                                    .font(LitterFont.monospaced(.caption))
+                                    .font(LitterFont.styled(.caption))
                                     .foregroundColor(LitterTheme.textSecondary)
                             }
                         }
@@ -63,8 +63,8 @@ struct SSHLoginSheet: View {
 
                     Section {
                         TextField("username", text: $username)
-                            .font(LitterFont.monospaced(.footnote))
-                            .foregroundColor(.white)
+                            .font(LitterFont.styled(.footnote))
+                            .foregroundColor(LitterTheme.textPrimary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
                     } header: {
@@ -83,14 +83,14 @@ struct SSHLoginSheet: View {
 
                         if useKey {
                             TextEditor(text: $privateKey)
-                                .font(LitterFont.monospaced(.caption))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.caption))
+                                .foregroundColor(LitterTheme.textPrimary)
                                 .scrollContentBackground(.hidden)
                                 .frame(minHeight: 100)
                                 .overlay(alignment: .topLeading) {
                                     if privateKey.isEmpty {
                                         Text("Paste private key here...")
-                                            .font(LitterFont.monospaced(.caption))
+                                            .font(LitterFont.styled(.caption))
                                             .foregroundColor(LitterTheme.textMuted)
                                             .padding(.top, 8)
                                             .padding(.leading, 4)
@@ -98,12 +98,12 @@ struct SSHLoginSheet: View {
                                     }
                                 }
                             SecureField("passphrase (optional)", text: $passphrase)
-                                .font(LitterFont.monospaced(.footnote))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.footnote))
+                                .foregroundColor(LitterTheme.textPrimary)
                         } else {
                             SecureField("password", text: $password)
-                                .font(LitterFont.monospaced(.footnote))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.footnote))
+                                .foregroundColor(LitterTheme.textPrimary)
                         }
                     } header: {
                         Text("Authentication")
@@ -114,8 +114,8 @@ struct SSHLoginSheet: View {
                     Section {
                         Toggle(isOn: $rememberCredentials) {
                             Text("Remember credentials on this device")
-                                .font(LitterFont.monospaced(.footnote))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.footnote))
+                                .foregroundColor(LitterTheme.textPrimary)
                         }
                         .tint(LitterTheme.accent)
 
@@ -124,7 +124,7 @@ struct SSHLoginSheet: View {
                                 forgetSavedCredentials()
                             } label: {
                                 Text("Forget saved credentials")
-                                    .font(LitterFont.monospaced(.footnote))
+                                    .font(LitterFont.styled(.footnote))
                             }
                         }
                     } header: {
@@ -143,7 +143,7 @@ struct SSHLoginSheet: View {
                                 }
                                 Text("Connect")
                                     .foregroundColor(LitterTheme.accent)
-                                    .font(LitterFont.monospaced(.subheadline))
+                                    .font(LitterFont.styled(.subheadline))
                             }
                         }
                         .disabled(isConnecting || username.isEmpty || (!useKey && password.isEmpty) || (useKey && privateKey.isEmpty))
@@ -154,7 +154,7 @@ struct SSHLoginSheet: View {
                         Section {
                             Text(err)
                                 .foregroundColor(.red)
-                                .font(LitterFont.monospaced(.caption))
+                                .font(LitterFont.styled(.caption))
                         }
                         .listRowBackground(LitterTheme.surface.opacity(0.6))
                     }
@@ -163,7 +163,6 @@ struct SSHLoginSheet: View {
             }
             .navigationTitle("SSH Login")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }
@@ -171,7 +170,6 @@ struct SSHLoginSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
         .task {
             guard autoLoadSavedCredentials else { return }
             loadSavedCredentialsIfNeeded()

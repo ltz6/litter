@@ -45,7 +45,7 @@ struct SessionListView: View {
             } else if let err = errorMessage, sessions.isEmpty {
                 VStack(spacing: 12) {
                     Text(err)
-                        .font(LitterFont.monospaced(.caption))
+                        .font(LitterFont.styled(.caption))
                         .foregroundColor(.red)
                     Button("Retry") { Task { await loadSessions() } }
                         .foregroundColor(LitterTheme.accent)
@@ -56,14 +56,13 @@ struct SessionListView: View {
         }
         .navigationTitle(cwdLabel)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("New Session") {
                     Task { await startNew() }
                 }
                 .foregroundColor(LitterTheme.accent)
-                .font(LitterFont.monospaced(.footnote))
+                .font(LitterFont.styled(.footnote))
             }
         }
         .navigationDestination(isPresented: $navigateToConversation) {
@@ -83,7 +82,7 @@ struct SessionListView: View {
         List {
             if let err = errorMessage {
                 Text(err)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(.red)
                     .padding(.vertical, 6)
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
@@ -92,11 +91,11 @@ struct SessionListView: View {
             if sessions.isEmpty {
                 VStack(spacing: 12) {
                     Text("No previous sessions")
-                        .font(LitterFont.monospaced(.subheadline))
+                        .font(LitterFont.styled(.subheadline))
                         .foregroundColor(LitterTheme.textMuted)
                     Text("Start a new session to begin")
-                        .font(LitterFont.monospaced(.caption))
-                        .foregroundColor(Color(hex: "#444444"))
+                        .font(LitterFont.styled(.caption))
+                        .foregroundColor(LitterTheme.textMuted)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 40)
@@ -116,7 +115,7 @@ struct SessionListView: View {
             if nextCursor != nil {
                 Button("Load more") { Task { await loadMore() } }
                     .foregroundColor(LitterTheme.accent)
-                    .font(LitterFont.monospaced(.footnote))
+                    .font(LitterFont.styled(.footnote))
                     .frame(maxWidth: .infinity)
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
             }
@@ -128,8 +127,8 @@ struct SessionListView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Text(session.preview.isEmpty ? "Untitled session" : session.preview)
-                    .font(LitterFont.monospaced(.footnote))
-                    .foregroundColor(.white)
+                    .font(LitterFont.styled(.footnote))
+                    .foregroundColor(LitterTheme.textPrimary)
                     .lineLimit(2)
                 Spacer(minLength: 0)
                 if resumingThreadId == session.id {
@@ -140,10 +139,10 @@ struct SessionListView: View {
             }
             HStack(spacing: 8) {
                 Text(relativeDate(session.updatedAt))
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.textSecondary)
                 Text(session.modelProvider)
-                    .font(LitterFont.monospaced(.caption2))
+                    .font(LitterFont.styled(.caption2))
                     .foregroundColor(LitterTheme.accent)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)

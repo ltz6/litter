@@ -383,7 +383,6 @@ struct DirectoryPickerView: View {
         }
         .navigationTitle(DirectoryPickerStrings.title)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarColorScheme(.dark, for: .navigationBar)
         .interactiveDismissDisabled(model.canNavigateUp)
         .task(id: selectedServerId) {
             onServerChanged?(selectedServerId)
@@ -421,7 +420,7 @@ struct DirectoryPickerView: View {
                             DirectoryPickerStrings.noServerSelected
                     )
                 )
-                .font(LitterFont.monospaced(.caption))
+                .font(LitterFont.styled(.caption))
                 .foregroundColor(selectedServerOption == nil ? LitterTheme.textMuted : LitterTheme.textSecondary)
                 .lineLimit(1)
 
@@ -435,7 +434,7 @@ struct DirectoryPickerView: View {
                             }
                         }
                     }
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.accent)
                 }
 
@@ -459,8 +458,8 @@ struct DirectoryPickerView: View {
                     DirectoryPickerStrings.searchFolders,
                     text: $model.searchQuery
                 )
-                .font(LitterFont.monospaced(.caption))
-                .foregroundColor(.white)
+                .font(LitterFont.styled(.caption))
+                .foregroundColor(LitterTheme.textPrimary)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled(true)
 
@@ -494,7 +493,7 @@ struct DirectoryPickerView: View {
                         }
                     } label: {
                         Label(DirectoryPickerStrings.upOneLevel, systemImage: "arrow.up.backward")
-                            .font(LitterFont.monospaced(.caption))
+                            .font(LitterFont.styled(.caption))
                     }
                     .disabled(!model.canNavigateUp)
 
@@ -509,8 +508,8 @@ struct DirectoryPickerView: View {
                             }
                         } label: {
                             Text(segment.label)
-                                .font(LitterFont.monospaced(.caption))
-                                .foregroundColor(segment.path == model.currentPath ? .black : LitterTheme.textSecondary)
+                                .font(LitterFont.styled(.caption))
+                                .foregroundColor(segment.path == model.currentPath ? LitterTheme.textOnAccent : LitterTheme.textSecondary)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(
@@ -535,10 +534,10 @@ struct DirectoryPickerView: View {
         } else if let err = model.errorMessage {
             VStack(spacing: 12) {
                 Text(DirectoryPickerStrings.loadError)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.danger)
                 Text(err)
-                    .font(LitterFont.monospaced(.caption2))
+                    .font(LitterFont.styled(.caption2))
                     .foregroundColor(LitterTheme.textSecondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
@@ -582,11 +581,11 @@ struct DirectoryPickerView: View {
                                 .frame(width: 20)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(DirectoryPickerStrings.continueIn((recent.path as NSString).lastPathComponent))
-                                    .font(LitterFont.monospaced(.subheadline))
-                                    .foregroundColor(.white)
+                                    .font(LitterFont.styled(.subheadline))
+                                    .foregroundColor(LitterTheme.textPrimary)
                                     .lineLimit(1)
                                 Text(recent.path)
-                                    .font(LitterFont.monospaced(.caption2))
+                                    .font(LitterFont.styled(.caption2))
                                     .foregroundColor(LitterTheme.textMuted)
                                     .lineLimit(1)
                             }
@@ -612,17 +611,17 @@ struct DirectoryPickerView: View {
                                     .frame(width: 20)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text((recent.path as NSString).lastPathComponent)
-                                        .font(LitterFont.monospaced(.subheadline))
-                                        .foregroundColor(.white)
+                                        .font(LitterFont.styled(.subheadline))
+                                        .foregroundColor(LitterTheme.textPrimary)
                                         .lineLimit(1)
                                     Text(recent.path)
-                                        .font(LitterFont.monospaced(.caption2))
+                                        .font(LitterFont.styled(.caption2))
                                         .foregroundColor(LitterTheme.textMuted)
                                         .lineLimit(1)
                                 }
                                 Spacer()
                                 Text(model.relativeDate(for: recent.lastUsedAt))
-                                    .font(LitterFont.monospaced(.caption2))
+                                    .font(LitterFont.styled(.caption2))
                                     .foregroundColor(LitterTheme.textSecondary)
                                     .lineLimit(1)
                             }
@@ -639,7 +638,7 @@ struct DirectoryPickerView: View {
                 } header: {
                     HStack {
                         Text(DirectoryPickerStrings.recentDirectories)
-                            .font(LitterFont.monospaced(.caption))
+                            .font(LitterFont.styled(.caption))
                             .foregroundColor(LitterTheme.textSecondary)
                         Spacer()
                         Menu {
@@ -653,7 +652,7 @@ struct DirectoryPickerView: View {
                     }
                 } footer: {
                     Text(DirectoryPickerStrings.recentFooter)
-                        .font(LitterFont.monospaced(.caption2))
+                        .font(LitterFont.styled(.caption2))
                         .foregroundColor(LitterTheme.textMuted)
                 }
             }
@@ -661,7 +660,7 @@ struct DirectoryPickerView: View {
             let visibleEntries = model.visibleEntries()
             if visibleEntries.isEmpty {
                 Text(model.emptyMessage())
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.textMuted)
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
             } else {
@@ -681,8 +680,8 @@ struct DirectoryPickerView: View {
                                 .foregroundColor(LitterTheme.accent)
                                 .frame(width: 20)
                             Text(entry)
-                                .font(LitterFont.monospaced(.subheadline))
-                                .foregroundColor(.white)
+                                .font(LitterFont.styled(.subheadline))
+                                .foregroundColor(LitterTheme.textPrimary)
                             Spacer()
                             Image(systemName: "chevron.right")
                                 .foregroundColor(LitterTheme.textMuted)
@@ -702,14 +701,14 @@ struct DirectoryPickerView: View {
         VStack(alignment: .leading, spacing: 8) {
             if !model.currentPath.isEmpty {
                 Text(model.currentPath)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.textMuted)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if !canSelectPath {
                 Text(DirectoryPickerStrings.chooseFolderHelper)
-                    .font(LitterFont.monospaced(.caption))
+                    .font(LitterFont.styled(.caption))
                     .foregroundColor(LitterTheme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -718,7 +717,7 @@ struct DirectoryPickerView: View {
                     onDismissRequested?()
                 }
                 .buttonStyle(.plain)
-                .font(LitterFont.monospaced(.subheadline))
+                .font(LitterFont.styled(.subheadline))
                 .foregroundColor(LitterTheme.textSecondary)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
@@ -738,8 +737,8 @@ struct DirectoryPickerView: View {
                 .accessibilityIdentifier("directoryPicker.selectFolderButton")
                 .disabled(!canSelectPath)
                 .buttonStyle(.plain)
-                .font(LitterFont.monospaced(.subheadline))
-                .foregroundColor(canSelectPath ? .black : LitterTheme.textMuted)
+                .font(LitterFont.styled(.subheadline))
+                .foregroundColor(canSelectPath ? LitterTheme.textOnAccent : LitterTheme.textMuted)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
                 .background(canSelectPath ? LitterTheme.accent : LitterTheme.surface.opacity(0.65))
@@ -784,5 +783,4 @@ struct DirectoryPickerView: View {
         )
         .environmentObject(ServerManager())
     }
-    .preferredColorScheme(.dark)
 }

@@ -27,7 +27,12 @@ struct SidebarOverlay: View {
                     maxHeight: .infinity,
                     alignment: .topLeading
                 )
-                .background(.ultraThinMaterial)
+                .background {
+                    ZStack {
+                        LitterTheme.surface
+                        Rectangle().fill(.ultraThinMaterial)
+                    }
+                }
                 .ignoresSafeArea()
                 .offset(x: panelOffset)
                 .shadow(color: .black.opacity(0.35), radius: 20, x: 6, y: 0)
