@@ -7,7 +7,9 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
 import android.net.Uri
+import com.google.firebase.messaging.FirebaseMessaging
 import com.litter.android.core.bridge.CodexRpcClient
+import com.litter.android.push.PushProxyClient
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
@@ -70,6 +72,8 @@ class ServerManager(
         appContext?.getSharedPreferences("litter_saved_servers", Context.MODE_PRIVATE)
     }
     private val savedServersKey = "servers"
+    private val pushRegistrationsByThreadKey = LinkedHashMap<ThreadKey, String>()
+    private val pushProxyClient = PushProxyClient()
 
     @Volatile
     private var state: AppState = AppState(savedServers = loadSavedServersInternal())
@@ -563,6 +567,44 @@ class ServerManager(
         submit {
             val result = runCatching { listSkillsInternal(cwds, forceReload) }
             deliver(onComplete, result)
+        }
+    }
+
+    fun onAppBackground() {
+        submit {
+            val client = pushProxyClient
+            val activeThreads = threadsByKey.filter { (_, thread) -> thread.hasTurnActive }
+            if (activeThreads.isEmpty()) return@submit
+            val fcmToken = runCatching {
+                com.google.android.gms.tasks.Tasks.await(FirebaseMessaging.getInstance().token)
+            }.getOrNull() ?: return@submit
+            for ((key, thread) in activeThreads) {
+                if (pushRegistrationsByThreadKey.containsKey(key)) continue
+                val contentState = mapOf<String, Any>(
+                    "phase" to "thinking",
+                    "turn_id" to (thread.activeTurnId ?: ""),
+                    "thread_id" to key.threadId,
+                )
+                val regId = runCatching {
+                    client.register(
+                        platform = "fcm",
+                        pushToken = fcmToken,
+                        contentState = contentState,
+                        startTimestamp = System.currentTimeMillis() / 1000,
+                    )
+                }.getOrNull() ?: continue
+                pushRegistrationsByThreadKey[key] = regId
+            }
+        }
+    }
+
+    fun onAppForeground() {
+        submit {
+            val client = pushProxyClient
+            for ((_, regId) in pushRegistrationsByThreadKey) {
+                runCatching { client.deregister(regId) }
+            }
+            pushRegistrationsByThreadKey.clear()
         }
     }
 

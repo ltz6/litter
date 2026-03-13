@@ -30,6 +30,7 @@ struct SettingsView: View {
             ZStack {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
+                    appearanceSection
                     fontSection
                     accountSection
                     serversSection
@@ -56,6 +57,29 @@ struct SettingsView: View {
                 showOAuth = false
                 conn?.loginCompleted = false
             }
+        }
+    }
+
+    // MARK: - Appearance Section
+
+    private var appearanceSection: some View {
+        Section {
+            NavigationLink {
+                AppearanceSettingsView()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "paintbrush")
+                        .foregroundColor(LitterTheme.accent)
+                        .frame(width: 20)
+                    Text("Appearance")
+                        .font(LitterFont.styled(.subheadline))
+                        .foregroundColor(LitterTheme.textPrimary)
+                }
+            }
+            .listRowBackground(LitterTheme.surface.opacity(0.6))
+        } header: {
+            Text("Theme")
+                .foregroundColor(LitterTheme.textSecondary)
         }
     }
 

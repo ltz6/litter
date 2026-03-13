@@ -131,6 +131,9 @@ dependencies {
     implementation("com.github.mwiede:jsch:0.2.22")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    implementation(platform("com.google.firebase:firebase-bom:33.0.0"))
+    implementation("com.google.firebase:firebase-messaging")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
 }

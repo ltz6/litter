@@ -16,6 +16,7 @@ settings:
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Litter/Bridge/codex_bridge_objc.h
     OTHER_LDFLAGS: "$(inherited) -lc++ -lz"
     IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    DEVELOPMENT_TEAM: UH66Q8ZAYG
 
 packages:
   Citadel:
@@ -44,6 +45,7 @@ targets:
       - path: Sources/Litter/Resources/ios_system/commandDictionary.plist
       - path: Sources/Litter/Resources/ios_system/extraCommandsDictionary.plist
       - path: Sources/Litter/Resources/Fonts
+      - path: Sources/Litter/Resources/Themes
     dependencies:
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
@@ -74,14 +76,26 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
+    entitlements:
+      path: Sources/Litter/Litter.entitlements
+      properties:
+        aps-environment: production
+        com.apple.security.application-groups:
+          - group.com.sigkitten.litter
+    attributes:
+      SystemCapabilities:
+        com.apple.BackgroundModes:
+          enabled: true
     sources:
       - path: Sources/Litter
         excludes:
           - "**/*.h"
+      - path: Sources/LitterLiveActivity/CodexTurnLiveActivity.swift
     resources:
       - path: Sources/Litter/Resources/ios_system/commandDictionary.plist
       - path: Sources/Litter/Resources/ios_system/extraCommandsDictionary.plist
       - path: Sources/Litter/Resources/Fonts
+      - path: Sources/Litter/Resources/Themes
     dependencies:
       - framework: Frameworks/codex_bridge.xcframework
         embed: false
@@ -100,15 +114,37 @@ targets:
         embed: true
       - framework: Frameworks/ios_system/files.xcframework
         embed: true
+      - target: LitterLiveActivity
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.litter
         INFOPLIST_FILE: Sources/Litter/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Litter/Bridge/codex_bridge_objc.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UIBackgroundModes: "fetch remote-notification"
       configs:
         Debug:
           OTHER_LDFLAGS: "$(inherited) -lc++ -lz"
+  LitterLiveActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    entitlements:
+      path: Sources/LitterLiveActivity/LitterLiveActivity.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.sigkitten.litter
+    sources:
+      - path: Sources/LitterLiveActivity
+      - path: Sources/Litter/Models/CodexTurnAttributes.swift
+      - path: Sources/Litter/Models/LitterPalette.swift
+    resources:
+      - path: Sources/LitterLiveActivity/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sigkitten.litter.liveactivity
+        INFOPLIST_FILE: Sources/LitterLiveActivity/Info.plist
   CodexIOSTests:
     type: bundle.unit-test
     platform: iOS

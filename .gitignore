@@ -47,3 +47,4 @@ apps/android/feature/*/build/
 docs/codex-schema/
 apps/android/app/src/main/assets/bundled_env/
 apps/android/kls_database.db
+node_modules/

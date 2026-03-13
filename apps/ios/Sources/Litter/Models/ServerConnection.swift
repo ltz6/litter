@@ -197,6 +197,14 @@ final class ServerConnection: ObservableObject, Identifiable {
         )
     }
 
+    func readThread(threadId: String) async throws -> ThreadReadResponse {
+        try await client.sendRequest(
+            method: "thread/read",
+            params: ThreadReadParams(threadId: threadId),
+            responseType: ThreadReadResponse.self
+        )
+    }
+
     private func resumeThread(
         threadId: String,
         cwd: String,
@@ -592,13 +600,20 @@ final class ServerConnection: ObservableObject, Identifiable {
     private func setupDisconnectHandler() async {
         await client.setDisconnectHandler { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self, self.isConnected else { return }
+                guard let self, self.isConnected else {
+                    NSLog("[ws] disconnect handler: already disconnected id=%@", self?.id ?? "?")
+                    return
+                }
+                NSLog("[ws] socket died, auto-reconnecting id=%@", self.id)
                 self.isConnected = false
                 self.onDisconnect?()
                 do {
                     try await self.connectAndInitialize()
                     self.isConnected = true
-                } catch {}
+                    NSLog("[ws] auto-reconnect SUCCESS id=%@", self.id)
+                } catch {
+                    NSLog("[ws] auto-reconnect FAILED id=%@ err=%@", self.id, error.localizedDescription)
+                }
             }
         }
     }
