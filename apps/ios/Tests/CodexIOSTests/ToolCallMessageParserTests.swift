@@ -45,7 +45,7 @@ final class ToolCallMessageParserTests: XCTestCase {
             """
             let item = try JSONDecoder().decode(ResumedThreadItem.self, from: Data(json.utf8))
 
-            guard case .webSearch(let query, let action) = item else {
+            guard case .webSearch(let query, let action, _) = item else {
                 XCTFail("Expected .webSearch for alias \(alias)")
                 continue
             }
@@ -73,7 +73,7 @@ final class ToolCallMessageParserTests: XCTestCase {
         """
 
         let item = try JSONDecoder().decode(ResumedThreadItem.self, from: Data(json.utf8))
-        guard case .agentMessage(_, _, let agentId, let nickname, let role) = item else {
+        guard case .agentMessage(_, _, let agentId, let nickname, let role, _) = item else {
             XCTFail("Expected .agentMessage")
             return
         }
@@ -340,6 +340,35 @@ final class ToolCallMessageParserTests: XCTestCase {
         }.first
 
         XCTAssertEqual(targets, ["Harvey [explorer]", "Sartre [explorer]"])
+    }
+
+    func testUsesResolvedTargetsOnlyWhenToolCardContainsTargets() {
+        let targetCard = ChatMessage(
+            role: .system,
+            text: """
+            ### Collaboration
+            Status: completed
+            Tool: spawnAgent
+            Targets: thread-alpha, agent-beta
+            """
+        )
+        XCTAssertTrue(ToolCallMessageParser.usesResolvedTargets(targetCard))
+
+        let noTargetCard = ChatMessage(
+            role: .system,
+            text: """
+            ### Command Execution
+            Status: completed
+            Command:
+            ```bash
+            pwd
+            ```
+            """
+        )
+        XCTAssertFalse(ToolCallMessageParser.usesResolvedTargets(noTargetCard))
+
+        let userMessage = ChatMessage(role: .user, text: "Targets: thread-alpha")
+        XCTAssertFalse(ToolCallMessageParser.usesResolvedTargets(userMessage))
     }
 
     private func unwrap(

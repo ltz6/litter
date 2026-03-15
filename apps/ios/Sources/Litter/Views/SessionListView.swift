@@ -36,6 +36,15 @@ struct SessionListView: View {
         serverManager.connections[server.id]
     }
 
+    private var activeConversationContext: (thread: ThreadState, connection: ServerConnection, key: ThreadKey)? {
+        guard let key = serverManager.activeThreadKey,
+              let thread = serverManager.threads[key],
+              let connection = serverManager.connections[key.serverId] else {
+            return nil
+        }
+        return (thread, connection, key)
+    }
+
     var body: some View {
         ZStack {
             LitterTheme.backgroundGradient.ignoresSafeArea()
@@ -66,7 +75,21 @@ struct SessionListView: View {
             }
         }
         .navigationDestination(isPresented: $navigateToConversation) {
-            ConversationView()
+            if let activeConversationContext {
+                ConversationView(
+                    thread: activeConversationContext.thread,
+                    connection: activeConversationContext.connection,
+                    activeThreadKey: activeConversationContext.key,
+                    serverManager: serverManager,
+                    composerPrefillRequest: serverManager.composerPrefillRequest,
+                    agentDirectoryVersion: serverManager.agentDirectoryVersion
+                )
+            } else {
+                ProgressView()
+                    .tint(LitterTheme.accent)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+            }
         }
         .task {
             guard autoLoadSessions else { return }
@@ -200,12 +223,16 @@ struct SessionListView: View {
     private func startNew() async {
         guard !isResuming else { return }
         workDir = cwd
-        let model = (serverManager.activeConnection?.models.first(where: { $0.isDefault })?.id)
+        let model = conn?.models.first(where: { $0.isDefault })?.id
         let startedKey = try? await serverManager.startThread(serverId: server.id, cwd: cwd, model: model)
         if startedKey != nil {
             _ = RecentDirectoryStore.shared.record(path: cwd, for: server.id)
+            if let onSessionReady {
+                onSessionReady(server, cwd)
+            } else {
+                navigateToConversation = true
+            }
         }
-        if let onSessionReady { onSessionReady(server, cwd) } else { navigateToConversation = true }
     }
 
     private var isResuming: Bool {

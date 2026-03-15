@@ -48,7 +48,8 @@ struct UserBubble: View {
 }
 
 struct AssistantBubble: View, Equatable {
-    let text: String
+    let markdownContent: MarkdownContent
+    let markdownIdentity: Int
     var label: String? = nil
     var textScale: CGFloat = 1.0
     var compact: Bool = false
@@ -58,8 +59,35 @@ struct AssistantBubble: View, Equatable {
     private var bodySize: CGFloat { (compact ? 12 : mdBodySize) * textScale }
     private var codeSize: CGFloat { (compact ? 11 : mdCodeSize) * textScale }
 
+    init(
+        text: String,
+        label: String? = nil,
+        textScale: CGFloat = 1.0,
+        compact: Bool = false
+    ) {
+        self.markdownContent = MarkdownContent(text)
+        self.markdownIdentity = text.hashValue
+        self.label = label
+        self.textScale = textScale
+        self.compact = compact
+    }
+
+    init(
+        markdownContent: MarkdownContent,
+        markdownIdentity: Int,
+        label: String? = nil,
+        textScale: CGFloat = 1.0,
+        compact: Bool = false
+    ) {
+        self.markdownContent = markdownContent
+        self.markdownIdentity = markdownIdentity
+        self.label = label
+        self.textScale = textScale
+        self.compact = compact
+    }
+
     static func == (lhs: AssistantBubble, rhs: AssistantBubble) -> Bool {
-        lhs.text == rhs.text &&
+        lhs.markdownIdentity == rhs.markdownIdentity &&
         lhs.label == rhs.label &&
         lhs.textScale == rhs.textScale &&
         lhs.compact == rhs.compact
@@ -73,7 +101,7 @@ struct AssistantBubble: View, Equatable {
                         .font(LitterFont.styled(.caption2, weight: .semibold, scale: textScale))
                         .foregroundColor(LitterTheme.textSecondary)
                 }
-                Markdown(text)
+                Markdown(markdownContent)
                     .markdownTheme(.litter(bodySize: bodySize, codeSize: codeSize))
                     .markdownCodeSyntaxHighlighter(.plain)
                     .textSelection(.enabled)
@@ -97,8 +125,17 @@ struct StreamingAssistantBubble: View {
 
     private let flushInterval: TimeInterval = 0.06
 
+    private var renderedContent: MarkdownContent {
+        MarkdownContent(renderedText)
+    }
+
     var body: some View {
-        AssistantBubble(text: renderedText, label: label, textScale: textScale)
+        AssistantBubble(
+            markdownContent: renderedContent,
+            markdownIdentity: renderedText.hashValue,
+            label: label,
+            textScale: textScale
+        )
             .equatable()
             .opacity(snapshotOpacity)
             .onAppear {
@@ -154,6 +191,7 @@ struct StreamingAssistantBubble: View {
 
 struct MessageBubbleView: View {
     @ObserveInjection var inject
+    private let renderCache = MessageRenderCache.shared
     let message: ChatMessage
     let serverId: String?
     let agentDirectoryVersion: Int
@@ -169,10 +207,6 @@ struct MessageBubbleView: View {
     @ScaledMetric(relativeTo: .footnote) private var mdCodeSize: CGFloat = 13
     @ScaledMetric(relativeTo: .footnote) private var mdSystemBodySize: CGFloat = 13
     @ScaledMetric(relativeTo: .caption2) private var mdSystemCodeSize: CGFloat = 12
-    @State private var parsedAssistantSegments: [ContentSegment] = []
-    @State private var didPrepareAssistantSegments = false
-    @State private var parsedSystemResult: ToolCallParseResult = .unrecognized
-    @State private var didPrepareSystemResult = false
 
     init(
         message: ChatMessage,
@@ -218,15 +252,16 @@ struct MessageBubbleView: View {
                 }
             }
         }
-        .task(id: parseRefreshToken) {
-            prepareDerivedContent()
-        }
         .enableInjection()
     }
 
-    private var parseRefreshToken: String {
-        let contentToken = isStreamingMessage ? "streaming" : String(message.text.hashValue)
-        return "\(message.id.uuidString)-\(message.role)-\(contentToken)-\(message.images.count)-\(serverId ?? "<nil>")-\(agentDirectoryVersion)"
+    private var renderRevisionKey: MessageRenderCache.RevisionKey {
+        MessageRenderCache.makeRevisionKey(
+            for: message,
+            serverId: serverId,
+            agentDirectoryVersion: agentDirectoryVersion,
+            isStreaming: isStreamingMessage
+        )
     }
 
     private var isReasoning: Bool {
@@ -273,8 +308,17 @@ struct MessageBubbleView: View {
             let hasImages = parsed.contains { if case .image = $0.kind { return true } else { return false } }
 
             if !hasImages {
-                // Simple text-only path — use the reusable AssistantBubble
-                AssistantBubble(text: message.text, label: assistantAgentLabel, textScale: textScale)
+                if let first = parsed.first,
+                   case let .markdown(content, identity) = first.kind {
+                    AssistantBubble(
+                        markdownContent: content,
+                        markdownIdentity: identity,
+                        label: assistantAgentLabel,
+                        textScale: textScale
+                    )
+                } else {
+                    AssistantBubble(text: message.text, label: assistantAgentLabel, textScale: textScale)
+                }
             } else {
                 // Inline images — need segment-based rendering
                 HStack(alignment: .top, spacing: 0) {
@@ -286,8 +330,8 @@ struct MessageBubbleView: View {
                         }
                         ForEach(parsed) { segment in
                             switch segment.kind {
-                            case .text(let md):
-                                Markdown(md)
+                            case .markdown(let content, _):
+                                Markdown(content)
                                     .markdownTheme(.litter(bodySize: mdBodySize * textScale, codeSize: mdCodeSize * textScale))
                                     .markdownCodeSyntaxHighlighter(.plain)
                                     .textSelection(.enabled)
@@ -329,13 +373,14 @@ struct MessageBubbleView: View {
         if let widget = message.widgetState {
             WidgetContainerView(
                 widget: widget,
-                onMessage: handleWidgetMessage
+                onMessage: handleWidgetMessage,
+                textScale: textScale
             )
         } else {
             let parsed = systemParseResultForRendering
             switch parsed {
             case .recognized(let model):
-                ToolCallCardView(model: model)
+                ToolCallCardView(model: model, textScale: textScale)
             case .unrecognized:
                 genericSystemBubble
             }
@@ -363,11 +408,16 @@ struct MessageBubbleView: View {
         let (title, body) = extractSystemTitleAndBody(message.text)
         let markdown = title == nil ? message.text : body
         let displayTitle = title ?? "System"
+        let content = renderCache.markdownContent(
+            for: markdown,
+            key: renderRevisionKey,
+            fragmentId: "system-generic"
+        )
 
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "info.circle.fill")
-                    .font(.system(.caption2, weight: .semibold))
+                    .font(.system(size: 11 * textScale, weight: .semibold))
                     .foregroundColor(LitterTheme.accent)
                 Text(displayTitle.uppercased())
                     .font(LitterFont.styled(.caption2, weight: .bold, scale: textScale))
@@ -376,7 +426,7 @@ struct MessageBubbleView: View {
             }
 
             if !markdown.isEmpty {
-                Markdown(markdown)
+                Markdown(content)
                     .markdownTheme(.litterSystem(bodySize: mdSystemBodySize * textScale, codeSize: mdSystemCodeSize * textScale))
                     .markdownCodeSyntaxHighlighter(.plain)
                     .textSelection(.enabled)
@@ -418,162 +468,19 @@ struct MessageBubbleView: View {
             .joined(separator: "\n")
     }
 
-    // MARK: - Inline image extraction
-
-    private struct ContentSegment: Identifiable {
-        enum Kind {
-            case text(String)
-            case image(UIImage)
-        }
-
-        let id: String
-        let kind: Kind
-    }
-
-    private var assistantSegmentsForRendering: [ContentSegment] {
-        if didPrepareAssistantSegments {
-            return parsedAssistantSegments
-        }
-        return Self.extractInlineSegments(
-            from: message.text,
-            messageId: message.id,
-            decodeImage: decodedImage(from:cacheKey:)
+    private var assistantSegmentsForRendering: [MessageRenderCache.AssistantSegment] {
+        renderCache.assistantSegments(
+            for: message,
+            key: renderRevisionKey
         )
     }
 
     private var systemParseResultForRendering: ToolCallParseResult {
-        if didPrepareSystemResult {
-            return parsedSystemResult
-        }
-        return ToolCallMessageParser.parse(
-            message: message,
+        renderCache.systemParseResult(
+            for: message,
+            key: renderRevisionKey,
             resolveTargetLabel: resolveTargetLabel
         )
-    }
-
-    private func prepareDerivedContent() {
-        switch message.role {
-        case .assistant:
-            guard !isStreamingMessage else {
-                didPrepareAssistantSegments = false
-                didPrepareSystemResult = false
-                return
-            }
-            parsedAssistantSegments = Self.extractInlineSegments(
-                from: message.text,
-                messageId: message.id,
-                decodeImage: decodedImage(from:cacheKey:)
-            )
-            didPrepareAssistantSegments = true
-            didPrepareSystemResult = false
-        case .system:
-            parsedSystemResult = ToolCallMessageParser.parse(
-                message: message,
-                resolveTargetLabel: resolveTargetLabel
-            )
-            didPrepareSystemResult = true
-            didPrepareAssistantSegments = false
-        case .user:
-            didPrepareAssistantSegments = false
-            didPrepareSystemResult = false
-        }
-    }
-
-    private static let decodedImageCache = NSCache<NSString, UIImage>()
-
-    private func decodedImage(from data: Data, cacheKey: String) -> UIImage? {
-        let key = cacheKey as NSString
-        if let cached = Self.decodedImageCache.object(forKey: key) {
-            return cached
-        }
-        guard let image = UIImage(data: data) else {
-            return nil
-        }
-        Self.decodedImageCache.setObject(image, forKey: key)
-        return image
-    }
-
-    private static let inlineImagePattern = "!\\[[^\\]]*\\]\\(data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)\\)|(?<![\\(])data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)"
-    private static let inlineImageRegex = try? NSRegularExpression(pattern: inlineImagePattern, options: [])
-
-    private static func extractInlineSegments(
-        from text: String,
-        messageId: UUID,
-        decodeImage: (Data, String) -> UIImage?
-    ) -> [ContentSegment] {
-        // Fast path to avoid regex work on normal markdown text.
-        if !text.contains("data:image/") {
-            return [ContentSegment(
-                id: "text-0-\(text.count)",
-                kind: .text(text)
-            )]
-        }
-
-        // Match markdown images with data URIs: ![...](data:image/...;base64,...)
-        // Also match bare data URIs: data:image/...;base64,...
-        guard let regex = inlineImageRegex else {
-            return [ContentSegment(
-                id: "text-0-\(text.count)",
-                kind: .text(text)
-            )]
-        }
-
-        var segments: [ContentSegment] = []
-        var lastEnd = text.startIndex
-        let nsRange = NSRange(text.startIndex..., in: text)
-
-        for match in regex.matches(in: text, range: nsRange) {
-            guard let matchRange = Range(match.range, in: text) else { continue }
-            let matchLower = text.distance(from: text.startIndex, to: matchRange.lowerBound)
-            let matchUpper = text.distance(from: text.startIndex, to: matchRange.upperBound)
-
-            // Add preceding text
-            if lastEnd < matchRange.lowerBound {
-                let preceding = String(text[lastEnd..<matchRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !preceding.isEmpty {
-                    segments.append(ContentSegment(
-                        id: "text-\(text.distance(from: text.startIndex, to: lastEnd))-\(matchLower)",
-                        kind: .text(preceding)
-                    ))
-                }
-            }
-
-            // Try capture group 1 (markdown image) then group 2 (bare data URI)
-            let base64String: String?
-            if match.range(at: 1).location != NSNotFound, let r = Range(match.range(at: 1), in: text) {
-                base64String = String(text[r])
-            } else if match.range(at: 2).location != NSNotFound, let r = Range(match.range(at: 2), in: text) {
-                base64String = String(text[r])
-            } else {
-                base64String = nil
-            }
-
-            if let b64 = base64String,
-               let data = Data(base64Encoded: b64.filter { !$0.isWhitespace }, options: .ignoreUnknownCharacters),
-               let uiImage = decodeImage(data, "assistant-\(messageId.uuidString)-\(matchLower)-\(matchUpper)") {
-                segments.append(ContentSegment(
-                    id: "image-\(matchLower)-\(matchUpper)",
-                    kind: .image(uiImage)
-                ))
-            }
-
-            lastEnd = matchRange.upperBound
-        }
-
-        // Add remaining text
-        if lastEnd < text.endIndex {
-            let remaining = String(text[lastEnd...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !remaining.isEmpty {
-                segments.append(ContentSegment(
-                    id: "text-\(text.distance(from: text.startIndex, to: lastEnd))-\(text.count)",
-                    kind: .text(remaining)
-                ))
-            }
-        }
-
-        return segments.isEmpty
-            ? [ContentSegment(id: "text-0-\(text.count)", kind: .text(text))]
-            : segments
     }
 }
 

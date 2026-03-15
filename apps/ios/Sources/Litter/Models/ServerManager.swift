@@ -58,9 +58,7 @@ final class ServerManager: ObservableObject {
     @Published var composerPrefillRequest: ComposerPrefillRequest?
     @Published private(set) var agentDirectoryVersion: Int = 0
 
-    private var connectionSubscriptions: [String: AnyCancellable] = [:]
     private let savedServersKey = "codex_saved_servers"
-    private var threadSubscriptions: [ThreadKey: AnyCancellable] = [:]
     private var liveItemMessageIndices: [ThreadKey: [String: Int]] = [:]
     private var liveTurnDiffMessageIndices: [ThreadKey: [String: Int]] = [:]
     private var serversUsingItemNotifications: Set<String> = []
@@ -82,10 +80,15 @@ final class ServerManager: ObservableObject {
     private var liveActivityLastUpdateTimes: [ThreadKey: CFAbsoluteTime] = [:]
     private var liveActivityFileChangeCounts: [ThreadKey: Int] = [:]
     private var notificationPermissionRequested = false
+    private var deferredThreadMetadataRefreshTasks: [ThreadKey: Task<Void, Never>] = [:]
+    private var deferredThreadMetadataRefreshTokens: [ThreadKey: UUID] = [:]
+    private var deferredThreadMessageHydrationTasks: [ThreadKey: Task<Void, Never>] = [:]
     private let pushProxy = PushProxyClient()
     private var pushProxyRegistrationId: String?
     private var suppressNotifications = false
     var devicePushToken: Data?
+    private let initialHydratedMessageCount = 48
+    private let hydrationChunkSize = 96
 
     private struct PersistedContextUsageSnapshot: Decodable {
         let contextTokens: Int64?
@@ -152,21 +155,6 @@ final class ServerManager: ObservableObject {
     struct ComposerPrefillRequest: Identifiable, Equatable {
         let id = UUID()
         let text: String
-    }
-
-    /// Call after inserting a new ThreadState into `threads` to forward its changes.
-    private func observeThread(_ thread: ThreadState) {
-        threadSubscriptions[thread.key] = thread.objectWillChange
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-    }
-
-    /// Forward nested connection changes so views observing ServerManager refresh when
-    /// connection-owned published values (auth/models/oauth) change.
-    private func observeConnection(_ connection: ServerConnection, serverId: String) {
-        connectionSubscriptions[serverId] = connection.objectWillChange
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
     }
 
     var sortedThreads: [ThreadState] {
@@ -282,7 +270,6 @@ final class ServerManager: ObservableObject {
 
             existing.disconnect()
             connections.removeValue(forKey: server.id)
-            connectionSubscriptions.removeValue(forKey: server.id)
         }
 
         let conn = ServerConnection(server: server, target: target)
@@ -290,13 +277,13 @@ final class ServerManager: ObservableObject {
         connections[server.id] = conn
         saveServerList()
         await conn.connect()
+        objectWillChange.send()
         if conn.isConnected {
             await refreshSessions(for: server.id)
         }
     }
 
     private func configureConnectionCallbacks(_ conn: ServerConnection, serverId: String) {
-        observeConnection(conn, serverId: serverId)
         conn.onNotification = { [weak self] method, data in
             self?.handleNotification(serverId: serverId, method: method, data: data)
         }
@@ -325,10 +312,9 @@ final class ServerManager: ObservableObject {
         }
         connections[id]?.disconnect()
         connections.removeValue(forKey: id)
-        connectionSubscriptions.removeValue(forKey: id)
         removePendingApprovals(forServerId: id)
         for key in threads.keys where key.serverId == id {
-            threadSubscriptions.removeValue(forKey: key)
+            cancelThreadMetadataRefresh(for: key)
             liveItemMessageIndices.removeValue(forKey: key)
             liveTurnDiffMessageIndices.removeValue(forKey: key)
             threadTurnCounts.removeValue(forKey: key)
@@ -412,10 +398,8 @@ final class ServerManager: ObservableObject {
         threadTurnCounts[key] = 0
         liveItemMessageIndices[key] = nil
         liveTurnDiffMessageIndices[key] = nil
-        observeThread(state)
         activeThreadKey = key
-        await refreshThreadContextWindow(for: key, cwd: resp.cwd)
-        await refreshPersistedContextUsage(for: key)
+        scheduleThreadMetadataRefresh(for: key, cwd: resp.cwd)
         return key
     }
 
@@ -436,7 +420,7 @@ final class ServerManager: ObservableObject {
         )
         state.status = .connecting
         threads[key] = state
-        observeThread(state)
+        activeThreadKey = key
         do {
             let resp = try await conn.resumeThread(
                 threadId: threadId,
@@ -444,15 +428,6 @@ final class ServerManager: ObservableObject {
                 approvalPolicy: approvalPolicy,
                 sandboxMode: sandboxMode
             )
-            state.messages = restoredMessages(
-                from: resp.thread.turns,
-                serverId: serverId,
-                defaultAgentNickname: resp.thread.agentNickname,
-                defaultAgentRole: resp.thread.agentRole
-            )
-            threadTurnCounts[key] = resp.thread.turns.count
-            liveItemMessageIndices[key] = nil
-            liveTurnDiffMessageIndices[key] = nil
             state.cwd = resp.cwd
             state.model = resp.model
             state.modelProvider = resp.modelProvider ?? resp.model
@@ -469,11 +444,25 @@ final class ServerManager: ObservableObject {
                 nickname: state.agentNickname,
                 role: state.agentRole
             )
+            await Task.yield()
+            let restored = restoredMessages(
+                from: resp.thread.turns,
+                serverId: serverId,
+                defaultAgentNickname: resp.thread.agentNickname,
+                defaultAgentRole: resp.thread.agentRole
+            )
+            installRestoredMessages(
+                restored,
+                on: state,
+                key: key,
+                staged: true
+            )
+            threadTurnCounts[key] = resp.thread.turns.count
+            liveItemMessageIndices[key] = nil
+            liveTurnDiffMessageIndices[key] = nil
             state.status = .ready
             state.updatedAt = Date()
-            activeThreadKey = key
-            await refreshThreadContextWindow(for: key, cwd: resp.cwd)
-            await refreshPersistedContextUsage(for: key)
+            scheduleThreadMetadataRefresh(for: key, cwd: resp.cwd)
             return true
         } catch {
             state.status = .error(error.localizedDescription)
@@ -485,10 +474,10 @@ final class ServerManager: ObservableObject {
         _ key: ThreadKey,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
-    ) async {
+    ) async -> Bool {
         if threads[key]?.messages.isEmpty == true {
             let cwd = threads[key]?.cwd ?? "/tmp"
-            _ = await resumeThread(
+            return await resumeThread(
                 serverId: key.serverId,
                 threadId: key.threadId,
                 cwd: cwd,
@@ -496,10 +485,11 @@ final class ServerManager: ObservableObject {
                 sandboxMode: sandboxMode
             )
         } else {
+            guard threads[key] != nil else { return false }
             activeThreadKey = key
             let cwd = threads[key]?.cwd ?? "/tmp"
-            await refreshThreadContextWindow(for: key, cwd: cwd)
-            await refreshPersistedContextUsage(for: key)
+            scheduleThreadMetadataRefresh(for: key, cwd: cwd)
+            return true
         }
     }
 
@@ -534,11 +524,16 @@ final class ServerManager: ObservableObject {
             serverName: conn.server.name,
             serverSource: conn.server.source
         )
-        forkedState.messages = restoredMessages(
+        installRestoredMessages(
+            restoredMessages(
             from: response.thread.turns,
             serverId: sourceKey.serverId,
             defaultAgentNickname: response.thread.agentNickname,
             defaultAgentRole: response.thread.agentRole
+            ),
+            on: forkedState,
+            key: forkKey,
+            staged: false
         )
         threadTurnCounts[forkKey] = response.thread.turns.count
         liveItemMessageIndices[forkKey] = nil
@@ -566,10 +561,8 @@ final class ServerManager: ObservableObject {
         forkedState.status = .ready
         forkedState.updatedAt = Date()
         threads[forkKey] = forkedState
-        observeThread(forkedState)
         activeThreadKey = forkKey
-        await refreshThreadContextWindow(for: forkKey, cwd: response.cwd)
-        await refreshPersistedContextUsage(for: forkKey)
+        scheduleThreadMetadataRefresh(for: forkKey, cwd: response.cwd)
         return forkKey
     }
 
@@ -619,11 +612,16 @@ final class ServerManager: ObservableObject {
         }
 
         let rollbackResponse = try await forkConn.rollbackThread(threadId: forkKey.threadId, numTurns: rollbackDepth)
-        forkThreadState.messages = restoredMessages(
+        installRestoredMessages(
+            restoredMessages(
             from: rollbackResponse.thread.turns,
             serverId: forkKey.serverId,
             defaultAgentNickname: rollbackResponse.thread.agentNickname ?? forkThreadState.agentNickname,
             defaultAgentRole: rollbackResponse.thread.agentRole ?? forkThreadState.agentRole
+            ),
+            on: forkThreadState,
+            key: forkKey,
+            staged: false
         )
         threadTurnCounts[forkKey] = rollbackResponse.thread.turns.count
         forkThreadState.status = .ready
@@ -649,11 +647,16 @@ final class ServerManager: ObservableObject {
         let rollbackDepth = try rollbackDepthForMessage(message, in: key)
         if rollbackDepth > 0 {
             let response = try await conn.rollbackThread(threadId: key.threadId, numTurns: rollbackDepth)
-            thread.messages = restoredMessages(
+            installRestoredMessages(
+                restoredMessages(
                 from: response.thread.turns,
                 serverId: key.serverId,
                 defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
                 defaultAgentRole: response.thread.agentRole ?? thread.agentRole
+                ),
+                on: thread,
+                key: key,
+                staged: false
             )
             threadTurnCounts[key] = response.thread.turns.count
             thread.status = .ready
@@ -918,7 +921,6 @@ final class ServerManager: ObservableObject {
                 state.messages.append(ChatMessage(role: .system, text: error.localizedDescription))
                 state.status = .error(error.localizedDescription)
                 threads[errorKey] = state
-                observeThread(state)
                 activeThreadKey = errorKey
                 return
             }
@@ -997,8 +999,8 @@ final class ServerManager: ObservableObject {
             throw NSError(domain: "Litter", code: 1032, userInfo: [NSLocalizedDescriptionKey: "Server unavailable"])
         }
         try await conn.archiveThread(threadId: key.threadId)
+        cancelThreadMetadataRefresh(for: key)
         threads.removeValue(forKey: key)
-        threadSubscriptions.removeValue(forKey: key)
         threadTurnCounts.removeValue(forKey: key)
         liveItemMessageIndices.removeValue(forKey: key)
         liveTurnDiffMessageIndices.removeValue(forKey: key)
@@ -1034,14 +1036,35 @@ final class ServerManager: ObservableObject {
             for summary in resp.data {
                 let key = ThreadKey(serverId: serverId, threadId: summary.id)
                 if let existing = threads[key] {
-                    existing.preview = summary.preview
-                    existing.cwd = summary.cwd
-                    existing.rolloutPath = summary.path ?? existing.rolloutPath
-                    existing.modelProvider = summary.modelProvider
-                    existing.parentThreadId = sanitizedLineageId(summary.parentThreadId) ?? existing.parentThreadId
-                    existing.rootThreadId = sanitizedLineageId(summary.rootThreadId) ?? existing.rootThreadId
-                    existing.agentNickname = sanitizedLineageId(summary.agentNickname) ?? existing.agentNickname
-                    existing.agentRole = sanitizedLineageId(summary.agentRole) ?? existing.agentRole
+                    if existing.preview != summary.preview {
+                        existing.preview = summary.preview
+                    }
+                    if existing.cwd != summary.cwd {
+                        existing.cwd = summary.cwd
+                    }
+                    let nextRolloutPath = summary.path ?? existing.rolloutPath
+                    if existing.rolloutPath != nextRolloutPath {
+                        existing.rolloutPath = nextRolloutPath
+                    }
+                    if existing.modelProvider != summary.modelProvider {
+                        existing.modelProvider = summary.modelProvider
+                    }
+                    let nextParentThreadId = sanitizedLineageId(summary.parentThreadId) ?? existing.parentThreadId
+                    if existing.parentThreadId != nextParentThreadId {
+                        existing.parentThreadId = nextParentThreadId
+                    }
+                    let nextRootThreadId = sanitizedLineageId(summary.rootThreadId) ?? existing.rootThreadId
+                    if existing.rootThreadId != nextRootThreadId {
+                        existing.rootThreadId = nextRootThreadId
+                    }
+                    let nextAgentNickname = sanitizedLineageId(summary.agentNickname) ?? existing.agentNickname
+                    if existing.agentNickname != nextAgentNickname {
+                        existing.agentNickname = nextAgentNickname
+                    }
+                    let nextAgentRole = sanitizedLineageId(summary.agentRole) ?? existing.agentRole
+                    if existing.agentRole != nextAgentRole {
+                        existing.agentRole = nextAgentRole
+                    }
                     upsertAgentDirectory(
                         serverId: serverId,
                         threadId: summary.id,
@@ -1049,7 +1072,10 @@ final class ServerManager: ObservableObject {
                         nickname: existing.agentNickname,
                         role: existing.agentRole
                     )
-                    existing.updatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
+                    let nextUpdatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
+                    if existing.updatedAt != nextUpdatedAt {
+                        existing.updatedAt = nextUpdatedAt
+                    }
                 } else {
                     let state = ThreadState(
                         serverId: serverId,
@@ -1075,7 +1101,6 @@ final class ServerManager: ObservableObject {
                     state.updatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
                     threads[key] = state
                     threadTurnCounts[key] = threadTurnCounts[key] ?? 0
-                    observeThread(state)
                 }
             }
         } catch {}
@@ -1219,6 +1244,7 @@ final class ServerManager: ObservableObject {
             )
             if let last = thread.messages.last, last.role == .assistant {
                 thread.messages[thread.messages.count - 1].text += notif.params.delta
+                thread.messages[thread.messages.count - 1].timestamp = Date()
                 if thread.messages[thread.messages.count - 1].agentNickname == nil {
                     thread.messages[thread.messages.count - 1].agentNickname = agentNickname
                 }
@@ -1369,12 +1395,9 @@ final class ServerManager: ObservableObject {
         }
 
         threads[key] = thread
-        observeThread(thread)
         let currentCwd = thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         if !currentCwd.isEmpty {
-            Task { @MainActor in
-                await refreshThreadContextWindow(for: key, cwd: currentCwd)
-            }
+            scheduleThreadMetadataRefresh(for: key, cwd: currentCwd)
         }
     }
 
@@ -2407,9 +2430,6 @@ final class ServerManager: ObservableObject {
             defaultAgentRole: response.thread.agentRole ?? thread.agentRole
         )
 
-        // Suspend forwarding during batch update to avoid N separate objectWillChange publishes
-        threadSubscriptions[key]?.cancel()
-
         thread.cwd = response.cwd
         thread.model = response.model
         thread.modelProvider = response.modelProvider ?? response.model
@@ -2419,8 +2439,7 @@ final class ServerManager: ObservableObject {
         thread.rootThreadId = sanitizedLineageId(response.thread.rootThreadId) ?? thread.rootThreadId
         thread.agentNickname = sanitizedLineageId(response.thread.agentNickname) ?? thread.agentNickname
         thread.agentRole = sanitizedLineageId(response.thread.agentRole) ?? thread.agentRole
-        await refreshThreadContextWindow(for: key, cwd: response.cwd)
-        await refreshPersistedContextUsage(for: key)
+        scheduleThreadMetadataRefresh(for: key, cwd: response.cwd)
 
         let needsMessageUpdate: Bool
         if messagesEquivalent(thread.messages, restored) {
@@ -2428,29 +2447,15 @@ final class ServerManager: ObservableObject {
         } else if shouldPreferLocalMessages(current: thread.messages, restored: restored) {
             needsMessageUpdate = false
         } else {
-            // Preserve IDs from matching existing messages so SwiftUI doesn't destroy/recreate cells
-            let existing = thread.messages
-            for i in restored.indices {
-                if i < existing.count,
-                   existing[i].role == restored[i].role,
-                   existing[i].text == restored[i].text {
-                    restored[i].id = existing[i].id
-                    if restored[i].widgetState == nil, existing[i].widgetState != nil {
-                        restored[i].widgetState = existing[i].widgetState
-                    }
-                }
-            }
-            thread.messages = restored
+            let prepared = preparedRestoredMessages(
+                restored,
+                preservingIdentityFrom: thread.messages
+            )
+            thread.messages = prepared
+            threadTurnCounts[key] = response.thread.turns.count
             needsMessageUpdate = true
         }
 
-        if needsMessageUpdate {
-            threadTurnCounts[key] = response.thread.turns.count
-        }
-
-        // Reconnect forwarding and send a single publish
-        observeThread(thread)
-        objectWillChange.send()
         upsertAgentDirectory(
             serverId: key.serverId,
             threadId: response.thread.id,
@@ -2525,6 +2530,43 @@ final class ServerManager: ObservableObject {
         }
     }
 
+    private func scheduleThreadMetadataRefresh(
+        for key: ThreadKey,
+        cwd: String,
+        delayNanoseconds: UInt64 = 250_000_000
+    ) {
+        let normalizedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedCwd.isEmpty else {
+            cancelThreadMetadataRefresh(for: key)
+            return
+        }
+
+        cancelThreadMetadataRefresh(for: key)
+        let token = UUID()
+        deferredThreadMetadataRefreshTokens[key] = token
+        deferredThreadMetadataRefreshTasks[key] = Task { [weak self] in
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            guard let self, !Task.isCancelled else { return }
+
+            await self.refreshThreadContextWindow(for: key, cwd: normalizedCwd)
+            guard !Task.isCancelled else { return }
+
+            await self.refreshPersistedContextUsage(for: key)
+            guard self.deferredThreadMetadataRefreshTokens[key] == token else { return }
+
+            self.deferredThreadMetadataRefreshTasks[key] = nil
+            self.deferredThreadMetadataRefreshTokens[key] = nil
+        }
+    }
+
+    private func cancelThreadMetadataRefresh(for key: ThreadKey) {
+        deferredThreadMetadataRefreshTasks[key]?.cancel()
+        deferredThreadMetadataRefreshTasks[key] = nil
+        deferredThreadMetadataRefreshTokens[key] = nil
+    }
+
     private func rollbackDepthForMessage(_ message: ChatMessage, in key: ThreadKey) throws -> Int {
         guard let selectedTurnIndex = message.sourceTurnIndex else {
             throw NSError(domain: "Litter", code: 1021, userInfo: [NSLocalizedDescriptionKey: "Message is missing turn metadata"])
@@ -2583,18 +2625,84 @@ final class ServerManager: ObservableObject {
     private func messagesEquivalent(_ lhs: [ChatMessage], _ rhs: [ChatMessage]) -> Bool {
         guard lhs.count == rhs.count else { return false }
         for (left, right) in zip(lhs, rhs) {
-            guard left.role == right.role, left.text == right.text else { return false }
-            guard left.sourceTurnId == right.sourceTurnId else { return false }
-            guard left.sourceTurnIndex == right.sourceTurnIndex else { return false }
-            guard left.isFromUserTurnBoundary == right.isFromUserTurnBoundary else { return false }
-            guard left.agentNickname == right.agentNickname else { return false }
-            guard left.agentRole == right.agentRole else { return false }
-            guard left.images.count == right.images.count else { return false }
-            for (leftImage, rightImage) in zip(left.images, right.images) {
-                guard leftImage.data == rightImage.data else { return false }
-            }
+            guard sameRenderableMessage(left, right) else { return false }
         }
         return true
+    }
+
+    private func sameRenderableMessage(_ lhs: ChatMessage, _ rhs: ChatMessage) -> Bool {
+        lhs.role == rhs.role && lhs.renderDigest == rhs.renderDigest
+    }
+
+    private func preparedRestoredMessages(
+        _ restored: [ChatMessage],
+        preservingIdentityFrom existing: [ChatMessage]
+    ) -> [ChatMessage] {
+        var prepared = restored
+        for index in prepared.indices {
+            guard index < existing.count,
+                  sameRenderableMessage(existing[index], prepared[index]) else { continue }
+            prepared[index].id = existing[index].id
+            if prepared[index].widgetState == nil, existing[index].widgetState != nil {
+                prepared[index].widgetState = existing[index].widgetState
+            }
+        }
+        return prepared
+    }
+
+    private func cancelDeferredMessageHydration(for key: ThreadKey) {
+        deferredThreadMessageHydrationTasks[key]?.cancel()
+        deferredThreadMessageHydrationTasks[key] = nil
+    }
+
+    private func installRestoredMessages(
+        _ restored: [ChatMessage],
+        on thread: ThreadState,
+        key: ThreadKey,
+        staged: Bool
+    ) {
+        cancelDeferredMessageHydration(for: key)
+
+        let prepared = preparedRestoredMessages(
+            restored,
+            preservingIdentityFrom: thread.messages
+        )
+
+        guard staged, prepared.count > initialHydratedMessageCount else {
+            thread.messages = prepared
+            return
+        }
+
+        let splitIndex = max(0, prepared.count - initialHydratedMessageCount)
+        let olderMessages = Array(prepared[..<splitIndex])
+        thread.messages = Array(prepared[splitIndex...])
+
+        guard !olderMessages.isEmpty else { return }
+
+        deferredThreadMessageHydrationTasks[key] = Task { @MainActor [weak self, weak thread] in
+            guard let self, let thread else { return }
+
+            var nextEnd = olderMessages.count
+            while nextEnd > 0 {
+                if Task.isCancelled || self.threads[key] !== thread {
+                    break
+                }
+
+                let nextStart = max(0, nextEnd - hydrationChunkSize)
+                let chunk = Array(olderMessages[nextStart..<nextEnd])
+                thread.messages.insert(contentsOf: chunk, at: 0)
+                nextEnd = nextStart
+
+                if nextEnd > 0 {
+                    await Task.yield()
+                    try? await Task.sleep(for: .milliseconds(16))
+                }
+            }
+
+            if self.deferredThreadMessageHydrationTasks[key]?.isCancelled == false {
+                self.deferredThreadMessageHydrationTasks[key] = nil
+            }
+        }
     }
 
     private func resolveThreadKey(serverId: String, threadId: String?) -> ThreadKey {
@@ -2689,7 +2797,12 @@ final class ServerManager: ObservableObject {
                         defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
                         defaultAgentRole: response.thread.agentRole ?? thread.agentRole
                     )
-                    thread.messages = restored
+                    installRestoredMessages(
+                        restored,
+                        on: thread,
+                        key: key,
+                        staged: false
+                    )
                     if let model = response.model { thread.model = model }
                     if let cwd = response.cwd { thread.cwd = cwd }
                     let turnDone = response.thread.turns.last?.status == "completed"
@@ -2750,7 +2863,12 @@ final class ServerManager: ObservableObject {
                     defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
                     defaultAgentRole: response.thread.agentRole ?? thread.agentRole
                 )
-                thread.messages = restored
+                installRestoredMessages(
+                    restored,
+                    on: thread,
+                    key: key,
+                    staged: false
+                )
                 if let model = response.model { thread.model = model }
                 if let cwd = response.cwd { thread.cwd = cwd }
                 let lastTurn = response.thread.turns.last
@@ -2986,7 +3104,7 @@ final class ServerManager: ObservableObject {
         defaultAgentRole: String? = nil
     ) -> ChatMessage? {
         switch item {
-        case .userMessage(let content):
+        case .userMessage(let content, _):
             let (text, images) = renderUserInput(content)
             if text.isEmpty && images.isEmpty { return nil }
             return ChatMessage(
@@ -2995,9 +3113,10 @@ final class ServerManager: ObservableObject {
                 images: images,
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex,
-                isFromUserTurnBoundary: true
+                isFromUserTurnBoundary: true,
+                timestamp: item.timestamp ?? Date()
             )
-        case .agentMessage(let text, _, let itemAgentId, let itemAgentNickname, let itemAgentRole):
+        case .agentMessage(let text, _, let itemAgentId, let itemAgentNickname, let itemAgentRole, _):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return nil }
             let normalizedNickname = sanitizedLineageId(itemAgentNickname) ?? sanitizedLineageId(defaultAgentNickname)
@@ -3015,15 +3134,16 @@ final class ServerManager: ObservableObject {
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex,
                 agentNickname: normalizedNickname,
-                agentRole: normalizedRole
+                agentRole: normalizedRole,
+                timestamp: item.timestamp ?? Date()
             )
-        case .plan(let text):
+        case .plan(let text, _):
             return withTurnMetadata(
-                systemMessage(title: "Plan", body: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+                systemMessage(title: "Plan", body: text.trimmingCharacters(in: .whitespacesAndNewlines), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .reasoning(let summary, let content):
+        case .reasoning(let summary, let content, _):
             let summaryText = summary
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
@@ -3036,11 +3156,11 @@ final class ServerManager: ObservableObject {
             if !summaryText.isEmpty { sections.append(summaryText) }
             if !detailText.isEmpty { sections.append(detailText) }
             return withTurnMetadata(
-                systemMessage(title: "Reasoning", body: sections.joined(separator: "\n\n")),
+                systemMessage(title: "Reasoning", body: sections.joined(separator: "\n\n"), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .commandExecution(let command, let cwd, let status, let output, let exitCode, let durationMs):
+        case .commandExecution(let command, let cwd, let status, let output, let exitCode, let durationMs, _):
             var lines: [String] = ["Status: \(status)"]
             if !cwd.isEmpty { lines.append("Directory: \(cwd)") }
             if let exitCode { lines.append("Exit code: \(exitCode)") }
@@ -3052,14 +3172,14 @@ final class ServerManager: ObservableObject {
                 if !trimmed.isEmpty { body += "\n\nOutput:\n```text\n\(trimmed)\n```" }
             }
             return withTurnMetadata(
-                systemMessage(title: "Command Execution", body: body),
+                systemMessage(title: "Command Execution", body: body, timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .fileChange(let changes, let status):
+        case .fileChange(let changes, let status, _):
             if changes.isEmpty {
                 return withTurnMetadata(
-                    systemMessage(title: "File Change", body: "Status: \(status)"),
+                    systemMessage(title: "File Change", body: "Status: \(status)", timestamp: item.timestamp),
                     sourceTurnId: sourceTurnId,
                     sourceTurnIndex: sourceTurnIndex
                 )
@@ -3072,11 +3192,11 @@ final class ServerManager: ObservableObject {
                 parts.append(body)
             }
             return withTurnMetadata(
-                systemMessage(title: "File Change", body: "Status: \(status)\n\n" + parts.joined(separator: "\n\n---\n\n")),
+                systemMessage(title: "File Change", body: "Status: \(status)\n\n" + parts.joined(separator: "\n\n---\n\n"), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .mcpToolCall(let server, let tool, let status, let result, let error, let durationMs):
+        case .mcpToolCall(let server, let tool, let status, let result, let error, let durationMs, _):
             var lines: [String] = ["Status: \(status)"]
             if !server.isEmpty || !tool.isEmpty {
                 lines.append("Tool: \(server.isEmpty ? tool : "\(server)/\(tool)")")
@@ -3096,11 +3216,11 @@ final class ServerManager: ObservableObject {
                 }
             }
             return withTurnMetadata(
-                systemMessage(title: "MCP Tool Call", body: body),
+                systemMessage(title: "MCP Tool Call", body: body, timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .collabAgentToolCall(let tool, let status, let receiverThreadIds, let receiverAgents, let prompt):
+        case .collabAgentToolCall(let tool, let status, let receiverThreadIds, let receiverAgents, let prompt, _):
             var lines: [String] = ["Status: \(status)", "Tool: \(tool)"]
             if !receiverThreadIds.isEmpty || !receiverAgents.isEmpty {
                 var labels: [String] = []
@@ -3294,11 +3414,11 @@ final class ServerManager: ObservableObject {
                 }
             }
             return withTurnMetadata(
-                systemMessage(title: "Collaboration", body: lines.joined(separator: "\n")),
+                systemMessage(title: "Collaboration", body: lines.joined(separator: "\n"), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .webSearch(let query, let action):
+        case .webSearch(let query, let action, _):
             var lines: [String] = ["Status: completed"]
             if !query.isEmpty { lines.append("Query: \(query)") }
             if let action, let pretty = prettyJSON(action.value) {
@@ -3307,29 +3427,29 @@ final class ServerManager: ObservableObject {
                 lines.append("```json\n\(pretty)\n```")
             }
             return withTurnMetadata(
-                systemMessage(title: "Web Search", body: lines.joined(separator: "\n")),
+                systemMessage(title: "Web Search", body: lines.joined(separator: "\n"), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .imageView(let path):
+        case .imageView(let path, _):
             return withTurnMetadata(
-                systemMessage(title: "Image View", body: "Path: \(path)"),
+                systemMessage(title: "Image View", body: "Path: \(path)", timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .enteredReviewMode(let review):
+        case .enteredReviewMode(let review, _):
             return withTurnMetadata(
-                systemMessage(title: "Review Mode", body: "Entered review: \(review)"),
+                systemMessage(title: "Review Mode", body: "Entered review: \(review)", timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .exitedReviewMode(let review):
+        case .exitedReviewMode(let review, _):
             return withTurnMetadata(
-                systemMessage(title: "Review Mode", body: "Exited review: \(review)"),
+                systemMessage(title: "Review Mode", body: "Exited review: \(review)", timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .dynamicToolCall(let tool, let arguments, let status, _, let durationMs):
+        case .dynamicToolCall(let tool, let arguments, let status, _, let durationMs, _):
             if tool == GenerativeUITools.readMeToolName {
                 return nil
             }
@@ -3340,7 +3460,8 @@ final class ServerManager: ObservableObject {
                 var msg = ChatMessage(
                     role: .system,
                     text: "### Widget\nstatus: completed\n\nWidget: \(widget.title)",
-                    widgetState: widget
+                    widgetState: widget,
+                    timestamp: item.timestamp ?? Date()
                 )
                 msg.sourceTurnId = sourceTurnId
                 msg.sourceTurnIndex = sourceTurnIndex
@@ -3349,19 +3470,19 @@ final class ServerManager: ObservableObject {
             var lines: [String] = ["Status: \(status)", "Tool: \(tool)"]
             if let durationMs { lines.append("Duration: \(durationMs) ms") }
             return withTurnMetadata(
-                systemMessage(title: "Dynamic Tool Call", body: lines.joined(separator: "\n")),
+                systemMessage(title: "Dynamic Tool Call", body: lines.joined(separator: "\n"), timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
         case .contextCompaction:
             return withTurnMetadata(
-                systemMessage(title: "Context", body: "Context compaction occurred."),
+                systemMessage(title: "Context", body: "Context compaction occurred.", timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
-        case .unknown(let type):
+        case .unknown(let type, _):
             return withTurnMetadata(
-                systemMessage(title: "Event", body: "Unhandled item type: \(type)"),
+                systemMessage(title: "Event", body: "Unhandled item type: \(type)", timestamp: item.timestamp),
                 sourceTurnId: sourceTurnId,
                 sourceTurnIndex: sourceTurnIndex
             )
@@ -3384,14 +3505,15 @@ final class ServerManager: ObservableObject {
             sourceTurnIndex: sourceTurnIndex,
             isFromUserTurnBoundary: message.isFromUserTurnBoundary,
             agentNickname: message.agentNickname,
-            agentRole: message.agentRole
+            agentRole: message.agentRole,
+            timestamp: message.timestamp
         )
     }
 
-    private func systemMessage(title: String, body: String) -> ChatMessage? {
+    private func systemMessage(title: String, body: String, timestamp: Date? = nil) -> ChatMessage? {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        return ChatMessage(role: .system, text: "### \(title)\n\(trimmed)")
+        return ChatMessage(role: .system, text: "### \(title)\n\(trimmed)", timestamp: timestamp ?? Date())
     }
 
     private func renderUserInput(_ content: [ResumedUserInput]) -> (String, [ChatImage]) {

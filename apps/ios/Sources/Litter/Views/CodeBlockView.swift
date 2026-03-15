@@ -8,12 +8,16 @@ struct CodeBlockView: View {
     var fontSize: CGFloat = 13
     @State private var copied = false
 
+    private var headerScale: CGFloat {
+        max(0.8, fontSize / 13.0)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 if !language.isEmpty {
                     Text(language)
-                        .font(.system(.caption2, weight: .medium))
+                        .font(LitterFont.styled(.caption2, weight: .medium, scale: headerScale))
                         .foregroundColor(LitterTheme.textSecondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -29,7 +33,7 @@ struct CodeBlockView: View {
                     }
                 } label: {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.system(.caption2))
+                        .font(LitterFont.styled(.caption2, scale: headerScale))
                         .foregroundColor(copied ? LitterTheme.accent : LitterTheme.textSecondary)
                 }
             }

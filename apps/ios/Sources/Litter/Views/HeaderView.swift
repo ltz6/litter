@@ -3,16 +3,14 @@ import Inject
 
 struct HeaderView: View {
     @ObserveInjection var inject
-    @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
+    @ObservedObject var thread: ThreadState
+    @ObservedObject var connection: ServerConnection
+    let serverManager: ServerManager
     @State private var isReloading = false
     @State private var showOAuth = false
 
     var topInset: CGFloat = 0
-
-    private var activeConn: ServerConnection? {
-        serverManager.activeConnection
-    }
 
     var body: some View {
         VStack(spacing: 4) {
@@ -77,11 +75,16 @@ struct HeaderView: View {
             .padding(.bottom, 4)
 
             if appState.showModelSelector {
-                InlineModelSelectorView(onDismiss: {
+                InlineModelSelectorView(
+                    models: connection.models,
+                    selectedModel: selectedModelBinding,
+                    reasoningEffort: reasoningEffortBinding,
+                    onDismiss: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
                         appState.showModelSelector = false
                     }
-                })
+                }
+                )
                 .padding(.horizontal, 16)
                 .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .top)))
             }
@@ -96,44 +99,29 @@ struct HeaderView: View {
             .ignoresSafeArea(.container, edges: .top)
             .allowsHitTesting(false)
         )
-        .onChange(of: serverManager.activeThreadKey) { _, _ in
-            syncSelectionFromActiveThread()
-            Task { await loadModelsIfNeeded() }
-        }
-        .onChange(of: serverManager.activeThread?.model) { _, _ in
-            syncSelectionFromActiveThread()
-        }
-        .onChange(of: serverManager.activeThread?.reasoningEffort) { _, _ in
-            syncSelectionFromActiveThread()
-        }
-        .onChange(of: serverManager.activeThread?.cwd) { _, _ in
-            syncSelectionFromActiveThread()
-        }
-        .task {
-            syncSelectionFromActiveThread()
+        .task(id: thread.key) {
             await loadModelsIfNeeded()
         }
-        .onChange(of: activeConn?.oauthURL) { _, url in
+        .onChange(of: connection.oauthURL) { _, url in
             showOAuth = url != nil
         }
-        .onChange(of: activeConn?.loginCompleted) { _, completed in
+        .onChange(of: connection.loginCompleted) { _, completed in
             if completed == true {
                 showOAuth = false
-                activeConn?.loginCompleted = false
+                connection.loginCompleted = false
                 Task {
                     await serverManager.refreshAllSessions()
                     await serverManager.syncActiveThreadFromServer()
-                    syncSelectionFromActiveThread()
                 }
             }
         }
         .sheet(isPresented: $showOAuth) {
-            if let conn = activeConn, let url = conn.oauthURL {
+            if let url = connection.oauthURL {
                 NavigationStack {
                     OAuthWebView(url: url, onCallbackIntercepted: { callbackURL in
-                        conn.forwardOAuthCallback(callbackURL)
+                        connection.forwardOAuthCallback(callbackURL)
                     }) {
-                        Task { await conn.cancelLogin() }
+                        Task { await connection.cancelLogin() }
                     }
                     .ignoresSafeArea()
                     .navigationTitle("Login with ChatGPT")
@@ -141,7 +129,7 @@ struct HeaderView: View {
                     .toolbar {
                         ToolbarItem(placement: .topBarLeading) {
                             Button("Cancel") {
-                                Task { await conn.cancelLogin() }
+                                Task { await connection.cancelLogin() }
                                 showOAuth = false
                             }
                             .foregroundColor(LitterTheme.danger)
@@ -154,97 +142,87 @@ struct HeaderView: View {
     }
 
     private var authDotColor: Color {
-        let conn = activeConn ?? serverManager.connections.values.first(where: { $0.isConnected })
-        switch conn?.authStatus {
+        switch connection.authStatus {
         case .chatgpt, .apiKey: return LitterTheme.success
         case .notLoggedIn: return LitterTheme.danger
-        case .unknown, .none: return LitterTheme.textMuted
+        case .unknown: return LitterTheme.textMuted
         }
     }
 
     private var sessionModelLabel: String {
-        let selected = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !selected.isEmpty { return selected }
-
-        let threadModel = serverManager.activeThread?.model.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let threadModel = thread.model.trimmingCharacters(in: .whitespacesAndNewlines)
         if !threadModel.isEmpty { return threadModel }
+
+        let pendingModel = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pendingModel.isEmpty { return pendingModel }
 
         return "litter"
     }
 
     private var sessionReasoningLabel: String {
-        let selected = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !selected.isEmpty { return selected }
-
-        let threadReasoning = serverManager.activeThread?.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let threadReasoning = thread.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !threadReasoning.isEmpty { return threadReasoning }
+
+        let pendingReasoning = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pendingReasoning.isEmpty { return pendingReasoning }
 
         return "default"
     }
 
     private var sessionDirectoryLabel: String {
-        let currentDirectory = serverManager.activeThread?.cwd.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentDirectory = thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         if !currentDirectory.isEmpty {
             return abbreviateHomePath(currentDirectory)
-        }
-
-        let appDirectory = appState.currentCwd.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !appDirectory.isEmpty {
-            return abbreviateHomePath(appDirectory)
         }
 
         return "~"
     }
 
-    private func loadModelsIfNeeded() async {
-        syncSelectionFromActiveThread()
-
-        guard let conn = activeConn, conn.isConnected, !conn.modelsLoaded else { return }
-        do {
-            let resp = try await conn.listModels()
-            conn.models = resp.data
-            conn.modelsLoaded = true
-            if appState.selectedModel.isEmpty {
-                if let defaultModel = resp.data.first(where: { $0.isDefault }) {
-                    appState.selectedModel = defaultModel.id
-                    appState.reasoningEffort = defaultModel.defaultReasoningEffort
-                } else if let first = resp.data.first {
-                    appState.selectedModel = first.id
-                    appState.reasoningEffort = first.defaultReasoningEffort
+    private var selectedModelBinding: Binding<String> {
+        Binding(
+            get: {
+                let pending = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    return pending
                 }
-            }
-        } catch {}
+                return thread.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            },
+            set: { appState.selectedModel = $0 }
+        )
     }
 
-    private func syncSelectionFromActiveThread() {
-        let threadModel = serverManager.activeThread?.model.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !threadModel.isEmpty && appState.selectedModel != threadModel {
-            appState.selectedModel = threadModel
-        }
+    private var reasoningEffortBinding: Binding<String> {
+        Binding(
+            get: {
+                let pending = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    return pending
+                }
+                return thread.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            },
+            set: { appState.reasoningEffort = $0 }
+        )
+    }
 
-        let threadReasoning = serverManager.activeThread?.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !threadReasoning.isEmpty && appState.reasoningEffort != threadReasoning {
-            appState.reasoningEffort = threadReasoning
-        }
-
-        let threadCwd = serverManager.activeThread?.cwd.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !threadCwd.isEmpty && appState.currentCwd != threadCwd {
-            appState.currentCwd = threadCwd
-        }
+    private func loadModelsIfNeeded() async {
+        guard connection.isConnected, !connection.modelsLoaded else { return }
+        do {
+            let resp = try await connection.listModels()
+            connection.models = resp.data
+            connection.modelsLoaded = true
+        } catch {}
     }
 
     private var reloadButton: some View {
         Button {
             Task {
                 isReloading = true
-                let conn = activeConn ?? serverManager.connections.values.first(where: { $0.isConnected })
-                if conn?.authStatus == .notLoggedIn {
-                    await conn?.logout()
-                    await conn?.loginWithChatGPT()
+                if connection.authStatus == .notLoggedIn {
+                    await connection.logout()
+                    await connection.loginWithChatGPT()
                 } else {
                     await serverManager.refreshAllSessions()
                     await serverManager.syncActiveThreadFromServer()
-                    syncSelectionFromActiveThread()
                 }
                 isReloading = false
             }
@@ -257,29 +235,26 @@ struct HeaderView: View {
                 } else {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(serverManager.hasAnyConnection ? LitterTheme.accent : LitterTheme.textMuted)
+                        .foregroundColor(connection.isConnected ? LitterTheme.accent : LitterTheme.textMuted)
                 }
             }
             .frame(width: 44, height: 44)
             .modifier(GlassCircleModifier())
         }
         .accessibilityIdentifier("header.reloadButton")
-        .disabled(isReloading || !serverManager.hasAnyConnection)
+        .disabled(isReloading || !connection.isConnected)
     }
 
 }
 
 struct InlineModelSelectorView: View {
-    @EnvironmentObject var serverManager: ServerManager
-    @EnvironmentObject var appState: AppState
+    let models: [CodexModel]
+    @Binding var selectedModel: String
+    @Binding var reasoningEffort: String
     var onDismiss: () -> Void
 
-    private var models: [CodexModel] {
-        serverManager.activeConnection?.models ?? []
-    }
-
     private var currentModel: CodexModel? {
-        models.first { $0.id == appState.selectedModel }
+        models.first { $0.id == selectedModel }
     }
 
     var body: some View {
@@ -288,8 +263,9 @@ struct InlineModelSelectorView: View {
                 VStack(spacing: 0) {
                     ForEach(models) { model in
                         Button {
-                            appState.selectedModel = model.id
-                            appState.reasoningEffort = model.defaultReasoningEffort
+                            selectedModel = model.id
+                            reasoningEffort = model.defaultReasoningEffort
+                            onDismiss()
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -312,7 +288,7 @@ struct InlineModelSelectorView: View {
                                         .foregroundColor(LitterTheme.textSecondary)
                                 }
                                 Spacer()
-                                if model.id == appState.selectedModel {
+                                if model.id == selectedModel {
                                     Image(systemName: "checkmark")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundColor(LitterTheme.accent)
@@ -336,14 +312,15 @@ struct InlineModelSelectorView: View {
                     HStack(spacing: 6) {
                         ForEach(info.supportedReasoningEfforts) { effort in
                             Button {
-                                appState.reasoningEffort = effort.reasoningEffort
+                                reasoningEffort = effort.reasoningEffort
+                                onDismiss()
                             } label: {
                                 Text(effort.reasoningEffort)
                                     .font(LitterFont.styled(.caption2, weight: .medium))
-                                    .foregroundColor(effort.reasoningEffort == appState.reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                                    .foregroundColor(effort.reasoningEffort == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(effort.reasoningEffort == appState.reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
+                                    .background(effort.reasoningEffort == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
                                     .clipShape(Capsule())
                             }
                         }
@@ -360,23 +337,20 @@ struct InlineModelSelectorView: View {
 }
 
 struct ModelSelectorSheet: View {
-    @EnvironmentObject var serverManager: ServerManager
-    @EnvironmentObject var appState: AppState
-
-    private var models: [CodexModel] {
-        serverManager.activeConnection?.models ?? []
-    }
+    let models: [CodexModel]
+    @Binding var selectedModel: String
+    @Binding var reasoningEffort: String
 
     private var currentModel: CodexModel? {
-        models.first { $0.id == appState.selectedModel }
+        models.first { $0.id == selectedModel }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             ForEach(models) { model in
                 Button {
-                    appState.selectedModel = model.id
-                    appState.reasoningEffort = model.defaultReasoningEffort
+                    selectedModel = model.id
+                    reasoningEffort = model.defaultReasoningEffort
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -399,7 +373,7 @@ struct ModelSelectorSheet: View {
                                 .foregroundColor(LitterTheme.textSecondary)
                         }
                         Spacer()
-                        if model.id == appState.selectedModel {
+                        if model.id == selectedModel {
                             Image(systemName: "checkmark")
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundColor(LitterTheme.accent)
@@ -416,14 +390,14 @@ struct ModelSelectorSheet: View {
                     HStack(spacing: 6) {
                         ForEach(info.supportedReasoningEfforts) { effort in
                             Button {
-                                appState.reasoningEffort = effort.reasoningEffort
+                                reasoningEffort = effort.reasoningEffort
                             } label: {
                                 Text(effort.reasoningEffort)
                                     .font(LitterFont.styled(.caption2, weight: .medium))
-                                    .foregroundColor(effort.reasoningEffort == appState.reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                                    .foregroundColor(effort.reasoningEffort == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(effort.reasoningEffort == appState.reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
+                                    .background(effort.reasoningEffort == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
                                     .clipShape(Capsule())
                             }
                         }
@@ -442,8 +416,13 @@ struct ModelSelectorSheet: View {
 
 #if DEBUG
 #Preview("Header") {
-    LitterPreviewScene {
-        HeaderView()
+    let manager = LitterPreviewData.makeServerManager()
+    return LitterPreviewScene(serverManager: manager) {
+        HeaderView(
+            thread: manager.activeThread!,
+            connection: manager.activeConnection!,
+            serverManager: manager
+        )
     }
 }
 #endif

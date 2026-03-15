@@ -5,8 +5,13 @@ import Inject
 
 struct ConversationView: View {
     @ObserveInjection var inject
-    @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
+    @ObservedObject var thread: ThreadState
+    @ObservedObject var connection: ServerConnection
+    let activeThreadKey: ThreadKey
+    let serverManager: ServerManager
+    let composerPrefillRequest: ServerManager.ComposerPrefillRequest?
+    let agentDirectoryVersion: Int
     var topInset: CGFloat = 0
     var bottomInset: CGFloat = 0
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
@@ -15,15 +20,25 @@ struct ConversationView: View {
     @State private var messageActionError: String?
 
     private var messages: [ChatMessage] {
-        serverManager.activeThread?.messages ?? []
+        thread.messages
     }
 
     private var threadStatus: ConversationStatus {
-        serverManager.activeThread?.status ?? .idle
+        thread.status
     }
 
     private var threadUpdatedAt: Date {
-        serverManager.activeThread?.updatedAt ?? .distantPast
+        thread.updatedAt
+    }
+
+    private var pendingModelOverride: String? {
+        let trimmed = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var pendingReasoningOverride: String? {
+        let trimmed = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     var body: some View {
@@ -31,8 +46,8 @@ struct ConversationView: View {
             messages: messages,
             threadStatus: threadStatus,
             threadUpdatedAt: threadUpdatedAt,
-            activeThreadKey: serverManager.activeThreadKey,
-            agentDirectoryVersion: serverManager.agentDirectoryVersion,
+            activeThreadKey: activeThreadKey,
+            agentDirectoryVersion: agentDirectoryVersion,
             topInset: topInset,
             textSizeStep: $conversationTextSizeStep,
             inputFocused: $composerFocused,
@@ -53,6 +68,10 @@ struct ConversationView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ConversationInputBar(
+                thread: thread,
+                connection: connection,
+                serverManager: serverManager,
+                composerPrefillRequest: composerPrefillRequest,
                 onSend: sendMessage,
                 onFileSearch: searchComposerFiles,
                 inputFocused: $composerFocused,
@@ -72,15 +91,13 @@ struct ConversationView: View {
     }
 
     private func sendMessage(_ text: String, skillMentions: [SkillMentionSelection]) {
-        let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
-        let effort = appState.reasoningEffort
         Task {
             await serverManager.send(
                 text,
                 skillMentions: skillMentions,
                 cwd: workDir,
-                model: model,
-                effort: effort,
+                model: pendingModelOverride,
+                effort: pendingReasoningOverride,
                 approvalPolicy: appState.approvalPolicy,
                 sandboxMode: appState.sandboxMode
             )
@@ -89,14 +106,12 @@ struct ConversationView: View {
 
     private func sendWidgetPrompt(_ text: String) {
         guard !text.isEmpty else { return }
-        let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
-        let effort = appState.reasoningEffort
         Task {
             await serverManager.send(
                 text,
                 cwd: workDir,
-                model: model,
-                effort: effort,
+                model: pendingModelOverride,
+                effort: pendingReasoningOverride,
                 approvalPolicy: appState.approvalPolicy,
                 sandboxMode: appState.sandboxMode
             )
@@ -104,7 +119,7 @@ struct ConversationView: View {
     }
 
     private func resolveTargetLabel(_ target: String) -> String? {
-        serverManager.resolvedAgentTargetLabel(for: target, serverId: serverManager.activeThreadKey?.serverId)
+        serverManager.resolvedAgentTargetLabel(for: target, serverId: activeThreadKey.serverId)
     }
 
     private func editMessage(_ message: ChatMessage) {
@@ -136,7 +151,7 @@ struct ConversationView: View {
     }
 
     private func searchComposerFiles(_ query: String) async throws -> [FuzzyFileSearchResult] {
-        guard let conn = serverManager.activeConnection, conn.isConnected else {
+        guard connection.isConnected else {
             throw NSError(
                 domain: "Litter",
                 code: 2001,
@@ -144,7 +159,7 @@ struct ConversationView: View {
             )
         }
         let searchRoot = workDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "/" : workDir
-        let resp = try await conn.fuzzyFileSearch(
+        let resp = try await connection.fuzzyFileSearch(
             query: query,
             roots: [searchRoot],
             cancellationToken: "ios-composer-file-search"
@@ -201,7 +216,7 @@ private struct ConversationMessageList: View {
     let messages: [ChatMessage]
     let threadStatus: ConversationStatus
     let threadUpdatedAt: Date
-    let activeThreadKey: ThreadKey?
+    let activeThreadKey: ThreadKey
     let agentDirectoryVersion: Int
     var topInset: CGFloat = 0
     @Binding var textSizeStep: Int
@@ -215,8 +230,15 @@ private struct ConversationMessageList: View {
     @State private var autoFollowStreaming = true
     @State private var userIsDraggingScroll = false
     @State private var streamingRenderTick = 0
+    @State private var transcriptLayoutTick = 0
     @State private var pinchBaseStep: Int?
     @State private var pinchAppliedDelta = 0
+    @State private var renderedTextScale: CGFloat?
+    @State private var transcriptTurns: [TranscriptTurn] = []
+    @State private var expandedTurnIDs: Set<String> = []
+    @State private var pendingAnimatedTurns: [TranscriptTurn]?
+    @State private var turnInsertionAnimationInFlight = false
+    private let expandedRecentTurnCount = 1
 
     private var messageActionsDisabled: Bool {
         if case .thinking = threadStatus {
@@ -225,8 +247,12 @@ private struct ConversationMessageList: View {
         return false
     }
 
-    private var textScale: CGFloat {
+    private var targetTextScale: CGFloat {
         ConversationTextSize.clamped(rawValue: textSizeStep).scale
+    }
+
+    private var textScale: CGFloat {
+        renderedTextScale ?? targetTextScale
     }
 
     private var shouldShowScrollToBottom: Bool {
@@ -248,6 +274,17 @@ private struct ConversationMessageList: View {
         return isNearBottom
     }
 
+    private var displayedTurns: [TranscriptTurn] {
+        if transcriptTurns.isEmpty {
+            return TranscriptTurn.build(
+                from: messages,
+                threadStatus: threadStatus,
+                expandedRecentTurnCount: expandedRecentTurnCount
+            )
+        }
+        return transcriptTurns
+    }
+
     var body: some View {
 
         ScrollViewReader { proxy in
@@ -255,10 +292,30 @@ private struct ConversationMessageList: View {
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
-                        // Use a regular stack for the transcript. Lazy placement has been
-                        // implicated in both widget resizing and large streaming markdown churn.
-                        VStack(alignment: .leading, spacing: 12) {
-                            messageRows
+                        VStack(alignment: .leading, spacing: 14) {
+                            ForEach(displayedTurns) { turn in
+                                ConversationTurnRow(
+                                    turn: turn,
+                                    isExpanded: isTurnExpanded(turn),
+                                    canCollapse: turn.isCollapsedByDefault,
+                                    serverId: activeThreadKey.serverId,
+                                    agentDirectoryVersion: agentDirectoryVersion,
+                                    textScale: textScale,
+                                    messageActionsDisabled: messageActionsDisabled,
+                                    onToggleExpansion: {
+                                        toggleTurnExpansion(turn)
+                                    },
+                                    onStreamingSnapshotRendered: turn.isLive ? handleStreamingSnapshotRendered : nil,
+                                    resolveTargetLabel: resolveTargetLabel,
+                                    onWidgetPrompt: onWidgetPrompt,
+                                    onEditUserMessage: onEditUserMessage,
+                                    onForkFromUserMessage: onForkFromUserMessage
+                                )
+                            }
+
+                            if case .thinking = threadStatus {
+                                TypingIndicator()
+                            }
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, topInset + 56)
@@ -271,12 +328,11 @@ private struct ConversationMessageList: View {
                     .frame(maxWidth: .infinity, minHeight: viewport.size.height, alignment: .top)
                 }
                 .defaultScrollAnchor(.bottom)
+                .onAppear {
+                    renderedTextScale = targetTextScale
+                    syncTranscriptTurns()
+                }
                 .scrollDismissesKeyboard(.interactively)
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        inputFocused.wrappedValue = false
-                    }
-                )
                 .background(
                     ScrollPinchCapture { scale, state in
                         handlePinch(scale: scale, state: state)
@@ -319,12 +375,20 @@ private struct ConversationMessageList: View {
                     }
                     .onChange(of: activeThreadKey) {
                         autoFollowStreaming = true
+                        syncTranscriptTurns(resetExpansion: true)
                         scheduleScrollToBottom(proxy, delay: 0.06, force: true, animation: nil)
+                    }
+                    .onChange(of: messages) { _, _ in
+                        syncTranscriptTurns()
+                    }
+                    .onChange(of: textSizeStep) { _, _ in
+                        animateTextScaleChange()
                     }
                     .onChange(of: messages.count) {
                         scheduleScrollToBottom(proxy)
                     }
                     .onChange(of: threadStatus) {
+                        syncTranscriptTurns()
                         if isStreaming {
                             autoFollowStreaming = isNearBottom
                             scheduleScrollToBottom(
@@ -353,6 +417,14 @@ private struct ConversationMessageList: View {
                             animation: .linear(duration: 0.09)
                         )
                     }
+                    .onChange(of: transcriptLayoutTick) {
+                        scheduleScrollToBottom(
+                            proxy,
+                            delay: 0.01,
+                            replacePending: true,
+                            animation: nil
+                        )
+                    }
                     .onDisappear {
                         pendingScrollWorkItem?.cancel()
                         pendingScrollWorkItem = nil
@@ -375,29 +447,49 @@ private struct ConversationMessageList: View {
         }
     }
 
-    @ViewBuilder
-    private var messageRows: some View {
-        let streamingAssistantMessageId = isStreaming ? messages.last(where: { $0.role == .assistant })?.id : nil
-        ForEach(messages) { message in
-            EquatableMessageBubble(
-                message: message,
-                serverId: activeThreadKey?.serverId,
-                agentDirectoryVersion: agentDirectoryVersion,
-                textScale: textScale,
-                isStreamingMessage: message.id == streamingAssistantMessageId,
-                messageActionsDisabled: messageActionsDisabled,
-                onStreamingSnapshotRendered: message.id == streamingAssistantMessageId ? handleStreamingSnapshotRendered : nil,
-                resolveTargetLabel: resolveTargetLabel,
-                onWidgetPrompt: onWidgetPrompt,
-                onEditUserMessage: onEditUserMessage,
-                onForkFromUserMessage: onForkFromUserMessage
-            )
-            .equatable()
-            .id(message.id)
+    private func isTurnExpanded(_ turn: TranscriptTurn) -> Bool {
+        !turn.isCollapsedByDefault || expandedTurnIDs.contains(turn.id)
+    }
+
+    private func toggleTurnExpansion(_ turn: TranscriptTurn) {
+        guard turn.isCollapsedByDefault else { return }
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+            if expandedTurnIDs.contains(turn.id) {
+                expandedTurnIDs.remove(turn.id)
+            } else {
+                expandedTurnIDs.insert(turn.id)
+            }
         }
-        if case .thinking = threadStatus {
-            TypingIndicator()
+    }
+
+    private func syncTranscriptTurns(resetExpansion: Bool = false) {
+        let nextTurns = TranscriptTurn.build(
+            from: messages,
+            threadStatus: threadStatus,
+            expandedRecentTurnCount: expandedRecentTurnCount
+        )
+        if shouldAnimateNewTurnInsertion(from: transcriptTurns, to: nextTurns, resetExpansion: resetExpansion) {
+            pendingAnimatedTurns = nextTurns
+            guard !turnInsertionAnimationInFlight else { return }
+            startNewTurnInsertionAnimation(from: transcriptTurns)
+            return
         }
+
+        if turnInsertionAnimationInFlight {
+            pendingAnimatedTurns = nextTurns
+            return
+        }
+
+        applyTranscriptTurns(nextTurns, resetExpansion: resetExpansion)
+    }
+
+    private func layoutSignature(for turn: TranscriptTurn) -> Int {
+        var hasher = Hasher()
+        hasher.combine(turn.id)
+        hasher.combine(turn.renderDigest)
+        hasher.combine(turn.isLive)
+        hasher.combine(turn.isCollapsedByDefault)
+        return hasher.finalize()
     }
 
     private func handlePinch(scale: CGFloat, state: UIGestureRecognizer.State) {
@@ -437,9 +529,7 @@ private struct ConversationMessageList: View {
             let baseline = pinchBaseStep ?? textSizeStep
             let next = ConversationTextSize.clamped(rawValue: baseline + pinchAppliedDelta).rawValue
             if next != textSizeStep {
-                withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.88)) {
-                    textSizeStep = next
-                }
+                textSizeStep = next
             }
             pinchBaseStep = nil
             pinchAppliedDelta = 0
@@ -448,8 +538,97 @@ private struct ConversationMessageList: View {
         }
     }
 
+    private func animateTextScaleChange() {
+        let nextScale = targetTextScale
+        if renderedTextScale == nil {
+            renderedTextScale = nextScale
+            return
+        }
+        guard renderedTextScale != nextScale else { return }
+        withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.88)) {
+            renderedTextScale = nextScale
+        }
+    }
+
     private func handleStreamingSnapshotRendered() {
         streamingRenderTick &+= 1
+    }
+
+    private func shouldAnimateNewTurnInsertion(
+        from currentTurns: [TranscriptTurn],
+        to nextTurns: [TranscriptTurn],
+        resetExpansion: Bool
+    ) -> Bool {
+        guard !resetExpansion,
+              !currentTurns.isEmpty,
+              nextTurns.count == currentTurns.count + 1,
+              currentTurns.last?.id != nextTurns.last?.id,
+              nextTurns.last?.messages.first?.role == .user,
+              nextTurns.last?.messages.first?.isFromUserTurnBoundary == true else {
+            return false
+        }
+
+        for (currentTurn, nextTurn) in zip(currentTurns, nextTurns) {
+            guard currentTurn.id == nextTurn.id else { return false }
+        }
+
+        return true
+    }
+
+    private func startNewTurnInsertionAnimation(from currentTurns: [TranscriptTurn]) {
+        guard let previousLastTurnID = currentTurns.last?.id else {
+            if let pendingAnimatedTurns {
+                applyTranscriptTurns(pendingAnimatedTurns)
+                self.pendingAnimatedTurns = nil
+            }
+            return
+        }
+
+        turnInsertionAnimationInFlight = true
+        let collapsedTurns = currentTurns.map { turn in
+            turn.id == previousLastTurnID ? turn.withCollapsedByDefault(true) : turn
+        }
+
+        withAnimation(.snappy(duration: 0.16, extraBounce: 0)) {
+            applyTranscriptTurns(
+                collapsedTurns,
+                removeExpandedTurnID: previousLastTurnID
+            )
+        } completion: {
+            let turnsToInsert = pendingAnimatedTurns ?? collapsedTurns
+            withAnimation(.smooth(duration: 0.2)) {
+                applyTranscriptTurns(turnsToInsert)
+            } completion: {
+                turnInsertionAnimationInFlight = false
+                let latestTurns = pendingAnimatedTurns ?? turnsToInsert
+                pendingAnimatedTurns = nil
+                if latestTurns.map(layoutSignature(for:)) != transcriptTurns.map(layoutSignature(for:)) {
+                    applyTranscriptTurns(latestTurns)
+                }
+            }
+        }
+    }
+
+    private func applyTranscriptTurns(
+        _ nextTurns: [TranscriptTurn],
+        resetExpansion: Bool = false,
+        removeExpandedTurnID: String? = nil
+    ) {
+        let previousLayoutSignature = transcriptTurns.map(layoutSignature(for:))
+        let nextLayoutSignature = nextTurns.map(layoutSignature(for:))
+        let nextTurnIDs = Set(nextTurns.map(\.id))
+        transcriptTurns = nextTurns
+        if resetExpansion {
+            expandedTurnIDs.removeAll()
+        } else {
+            expandedTurnIDs.formIntersection(nextTurnIDs)
+        }
+        if let removeExpandedTurnID {
+            expandedTurnIDs.remove(removeExpandedTurnID)
+        }
+        if previousLayoutSignature != nextLayoutSignature {
+            transcriptLayoutTick &+= 1
+        }
     }
 
     private func scheduleScrollToBottom(
@@ -490,6 +669,171 @@ private struct ConversationMessageList: View {
     }
 }
 
+private struct ConversationTurnRow: View {
+    let turn: TranscriptTurn
+    let isExpanded: Bool
+    let canCollapse: Bool
+    let serverId: String
+    let agentDirectoryVersion: Int
+    let textScale: CGFloat
+    let messageActionsDisabled: Bool
+    let onToggleExpansion: () -> Void
+    let onStreamingSnapshotRendered: (() -> Void)?
+    let resolveTargetLabel: (String) -> String?
+    let onWidgetPrompt: (String) -> Void
+    let onEditUserMessage: (ChatMessage) -> Void
+    let onForkFromUserMessage: (ChatMessage) -> Void
+
+    private var streamingAssistantMessageId: UUID? {
+        guard turn.isLive else { return nil }
+        return turn.messages.last(where: { $0.role == .assistant })?.id
+    }
+
+    var body: some View {
+        if isExpanded {
+            expandedContent
+        } else {
+            collapsedCard
+        }
+    }
+
+    private var expandedContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(turn.messages) { message in
+                EquatableMessageBubble(
+                    message: message,
+                    serverId: serverId,
+                    agentDirectoryVersion: bubbleAgentDirectoryVersion(for: message),
+                    textScale: textScale,
+                    isStreamingMessage: message.id == streamingAssistantMessageId,
+                    messageActionsDisabled: messageActionsDisabled,
+                    onStreamingSnapshotRendered: message.id == streamingAssistantMessageId ? onStreamingSnapshotRendered : nil,
+                    resolveTargetLabel: resolveTargetLabel,
+                    onWidgetPrompt: onWidgetPrompt,
+                    onEditUserMessage: onEditUserMessage,
+                    onForkFromUserMessage: onForkFromUserMessage
+                )
+                .equatable()
+                .id(message.id)
+            }
+
+            if canCollapse {
+                Button("Show Less", systemImage: "chevron.up", action: onToggleExpansion)
+                    .font(LitterFont.styled(.caption, weight: .semibold, scale: textScale))
+                    .foregroundColor(LitterTheme.textSecondary)
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    private var collapsedCard: some View {
+        Button(action: onToggleExpansion) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(turn.preview.primaryText)
+                    .font(LitterFont.styled(.body, weight: .semibold, scale: textScale))
+                    .foregroundColor(LitterTheme.textPrimary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let secondaryText = secondaryPreviewText {
+                    Text(secondaryText)
+                        .font(LitterFont.styled(.footnote, scale: textScale))
+                        .foregroundColor(LitterTheme.textSecondary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                footerRow
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .modifier(GlassRectModifier(cornerRadius: 16, tint: LitterTheme.surface.opacity(0.34)))
+        }
+        .buttonStyle(.plain)
+        .contentShape(RoundedRectangle(cornerRadius: 16))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    private var footerRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            if let footerMetadataText {
+                Text(footerMetadataText)
+                    .font(LitterFont.styled(.caption2, scale: textScale))
+                    .foregroundColor(LitterTheme.textSecondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 11 * textScale, weight: .semibold))
+                .foregroundColor(LitterTheme.textMuted)
+        }
+        .padding(.top, secondaryPreviewText == nil ? 2 : 4)
+    }
+
+    private var footerMetadataText: String? {
+        var parts: [String] = []
+        if let durationText = turn.preview.durationText {
+            parts.append(durationText)
+        }
+        if turn.preview.toolCallCount > 0 {
+            parts.append("\(turn.preview.toolCallCount) \(turn.preview.toolCallCount == 1 ? "tool" : "tools")")
+        }
+        if turn.preview.eventCount > 0 {
+            parts.append("\(turn.preview.eventCount) \(turn.preview.eventCount == 1 ? "event" : "events")")
+        }
+        if turn.preview.widgetCount > 0 {
+            parts.append("\(turn.preview.widgetCount) \(turn.preview.widgetCount == 1 ? "widget" : "widgets")")
+        }
+        if turn.preview.imageCount > 0 {
+            parts.append("\(turn.preview.imageCount) \(turn.preview.imageCount == 1 ? "image" : "images")")
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    private var secondaryPreviewText: String? {
+        guard let secondaryText = turn.preview.secondaryText,
+              secondaryText != turn.preview.primaryText else {
+            return nil
+        }
+        return secondaryText
+    }
+
+    private var accessibilitySummary: String {
+        var parts = [turn.preview.primaryText]
+        if let secondaryPreviewText {
+            parts.append(secondaryPreviewText)
+        }
+        if let durationText = turn.preview.durationText {
+            parts.append("Duration \(durationText)")
+        }
+        if turn.preview.toolCallCount > 0 {
+            parts.append("\(turn.preview.toolCallCount) tool \(turn.preview.toolCallCount == 1 ? "call" : "calls")")
+        }
+        if turn.preview.widgetCount > 0 {
+            parts.append("\(turn.preview.widgetCount) \(turn.preview.widgetCount == 1 ? "widget" : "widgets")")
+        }
+        if turn.preview.eventCount > 0 {
+            parts.append("\(turn.preview.eventCount) \(turn.preview.eventCount == 1 ? "event" : "events")")
+        }
+        if turn.preview.imageCount > 0 {
+            parts.append("\(turn.preview.imageCount) \(turn.preview.imageCount == 1 ? "image" : "images")")
+        }
+        return parts.joined(separator: ". ")
+    }
+
+    private func bubbleAgentDirectoryVersion(for message: ChatMessage) -> Int {
+        ToolCallMessageParser.usesResolvedTargets(message) ? agentDirectoryVersion : 0
+    }
+}
+
 private struct EquatableMessageBubble: View, Equatable {
     let message: ChatMessage
     let serverId: String?
@@ -505,9 +849,7 @@ private struct EquatableMessageBubble: View, Equatable {
 
     static func == (lhs: EquatableMessageBubble, rhs: EquatableMessageBubble) -> Bool {
         lhs.message.id == rhs.message.id &&
-        lhs.message.role == rhs.message.role &&
-        lhs.message.text == rhs.message.text &&
-        lhs.message.images.count == rhs.message.images.count &&
+        lhs.message.renderDigest == rhs.message.renderDigest &&
         lhs.serverId == rhs.serverId &&
         lhs.textScale == rhs.textScale &&
         lhs.isStreamingMessage == rhs.isStreamingMessage &&
@@ -664,8 +1006,11 @@ private struct ScrollPinchCapture: UIViewRepresentable {
 }
 
 private struct ConversationInputBar: View {
-    @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
+    @ObservedObject var thread: ThreadState
+    @ObservedObject var connection: ServerConnection
+    let serverManager: ServerManager
+    let composerPrefillRequest: ServerManager.ComposerPrefillRequest?
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
 
     let onSend: (String, [SkillMentionSelection]) -> Void
@@ -714,7 +1059,33 @@ private struct ConversationInputBar: View {
     }
 
     private var isTurnActive: Bool {
-        serverManager.activeThread?.hasTurnActive == true
+        thread.hasTurnActive
+    }
+
+    private var selectedModelBinding: Binding<String> {
+        Binding(
+            get: {
+                let pending = appState.selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    return pending
+                }
+                return thread.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            },
+            set: { appState.selectedModel = $0 }
+        )
+    }
+
+    private var reasoningEffortBinding: Binding<String> {
+        Binding(
+            get: {
+                let pending = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !pending.isEmpty {
+                    return pending
+                }
+                return thread.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            },
+            set: { appState.reasoningEffort = $0 }
+        )
     }
 
     var body: some View {
@@ -742,14 +1113,13 @@ private struct ConversationInputBar: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
             }
-            composerRow
-                .overlay(alignment: .bottomTrailing) {
-                    if bottomInset > 20 {
-                        contextBar
-                            .offset(y: 16)
-                    }
-                }
-                .padding(.bottom, bottomInset)
+            VStack(alignment: .trailing, spacing: 0) {
+                composerRow
+                contextBar
+                    .padding(.horizontal, 12)
+                    .padding(.top, -2)
+            }
+            .padding(.bottom, bottomInset)
         }
         .overlay(alignment: .bottom) {
             if showSlashPopup {
@@ -770,8 +1140,8 @@ private struct ConversationInputBar: View {
         .onChange(of: inputText) { _, next in
             scheduleComposerPopupRefresh(for: next)
         }
-        .onChange(of: serverManager.composerPrefillRequest?.id) { _, _ in
-            guard let prefill = serverManager.composerPrefillRequest else { return }
+        .onChange(of: composerPrefillRequest?.id) { _, _ in
+            guard let prefill = composerPrefillRequest else { return }
             inputText = prefill.text
             attachedImage = nil
             hideComposerPopups()
@@ -809,9 +1179,11 @@ private struct ConversationInputBar: View {
                 .ignoresSafeArea()
         }
         .sheet(isPresented: $showModelSelector) {
-            ModelSelectorSheet()
-                .environmentObject(serverManager)
-                .environmentObject(appState)
+            ModelSelectorSheet(
+                models: connection.models,
+                selectedModel: selectedModelBinding,
+                reasoningEffort: reasoningEffortBinding
+            )
                 .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
@@ -1052,9 +1424,9 @@ private struct ConversationInputBar: View {
                         .frame(width: 48, height: 20)
                     Button {
                         Task {
-                            let auth = await serverManager.activeConnection?.getAuthToken()
+                            let auth = await connection.getAuthToken()
                             if let text = await voiceManager.stopAndTranscribe(
-                                authMethod: auth?.method, authToken: auth?.token
+                                authMethod: auth.method, authToken: auth.token
                             ), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 inputText = text
                             }
@@ -1116,8 +1488,8 @@ private struct ConversationInputBar: View {
 
     @ViewBuilder
     private var contextBar: some View {
-        let rateLimits = serverManager.activeConnection?.rateLimits
-        let contextPct = contextPercent(thread: serverManager.activeThread)
+        let rateLimits = connection.rateLimits
+        let contextPct = contextPercent(thread: thread)
         let hasAnything = rateLimits?.primary != nil || rateLimits?.secondary != nil || contextPct != nil
 
         if hasAnything {
@@ -1402,6 +1774,22 @@ private struct ConversationInputBar: View {
 
     private func scheduleComposerPopupRefresh(for nextText: String) {
         popupRefreshTask?.cancel()
+        let needsPopupEvaluation =
+            showSlashPopup ||
+            showFilePopup ||
+            showSkillPopup ||
+            activeSlashToken != nil ||
+            activeAtToken != nil ||
+            activeDollarToken != nil ||
+            nextText.contains("/") ||
+            nextText.contains("@") ||
+            nextText.contains("$")
+
+        guard needsPopupEvaluation else {
+            hideComposerPopups()
+            return
+        }
+
         popupRefreshTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 70_000_000)
             guard !Task.isCancelled else { return }
@@ -1537,7 +1925,7 @@ private struct ConversationInputBar: View {
         case .rename:
             let initialName = args?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if initialName.isEmpty {
-                let currentTitle = serverManager.activeThread?.preview.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let currentTitle = thread.preview.trimmingCharacters(in: .whitespacesAndNewlines)
                 renameCurrentThreadTitle = currentTitle.isEmpty ? "Untitled thread" : currentTitle
                 renameDraft = ""
                 showRenamePrompt = true
@@ -1601,7 +1989,7 @@ private struct ConversationInputBar: View {
     }
 
     private func loadExperimentalFeatures() async {
-        guard let conn = serverManager.activeConnection, conn.isConnected else {
+        guard connection.isConnected else {
             experimentalFeatures = []
             slashErrorMessage = "Not connected to a server"
             return
@@ -1609,7 +1997,7 @@ private struct ConversationInputBar: View {
         experimentalFeaturesLoading = true
         defer { experimentalFeaturesLoading = false }
         do {
-            let response = try await conn.listExperimentalFeatures(limit: 200)
+            let response = try await connection.listExperimentalFeatures(limit: 200)
             experimentalFeatures = response.data.sorted { lhs, rhs in
                 let left = (lhs.displayName?.isEmpty == false ? lhs.displayName! : lhs.name).lowercased()
                 let right = (rhs.displayName?.isEmpty == false ? rhs.displayName! : rhs.name).lowercased()
@@ -1625,7 +2013,7 @@ private struct ConversationInputBar: View {
     }
 
     private func setExperimentalFeature(named featureName: String, enabled: Bool) async {
-        guard let conn = serverManager.activeConnection, conn.isConnected else {
+        guard connection.isConnected else {
             slashErrorMessage = "Not connected to a server"
             return
         }
@@ -1645,7 +2033,7 @@ private struct ConversationInputBar: View {
             )
         }
         do {
-            _ = try await conn.writeConfigValue(keyPath: "features.\(featureName)", value: enabled)
+            _ = try await connection.writeConfigValue(keyPath: "features.\(featureName)", value: enabled)
         } catch {
             slashErrorMessage = error.localizedDescription
             if let rollbackIndex = experimentalFeatures.firstIndex(where: { $0.name == currentFeature.name }) {
@@ -1667,7 +2055,7 @@ private struct ConversationInputBar: View {
     }
 
     private func loadSkills(forceReload: Bool = false, showErrors: Bool) async {
-        guard let conn = serverManager.activeConnection, conn.isConnected else {
+        guard connection.isConnected else {
             skills = []
             mentionSkillPathsByName = [:]
             if showErrors {
@@ -1678,7 +2066,7 @@ private struct ConversationInputBar: View {
         skillsLoading = true
         defer { skillsLoading = false }
         do {
-            let response = try await conn.listSkills(cwds: [workDir], forceReload: forceReload)
+            let response = try await connection.listSkills(cwds: [workDir], forceReload: forceReload)
             let loadedSkills = response.data.flatMap(\.skills).sorted { $0.name.lowercased() < $1.name.lowercased() }
             skills = loadedSkills
             let validPaths = Set(loadedSkills.map(\.path))

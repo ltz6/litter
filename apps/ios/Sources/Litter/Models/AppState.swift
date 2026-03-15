@@ -13,9 +13,10 @@ final class AppState: ObservableObject {
     @Published var sessionSidebarShowOnlyForks = false
     @Published var sessionSidebarWorkspaceSortModeRaw = "mostRecent"
     @Published var selectedModel = ""
-    @Published var reasoningEffort = "medium"
+    @Published var reasoningEffort = ""
     @Published var showModelSelector = false
     @Published var showSettings = false
+    @Published var requestedConversationKey: ThreadKey?
     @Published var approvalPolicy: String {
         didSet {
             UserDefaults.standard.set(approvalPolicy, forKey: Self.approvalPolicyKey)

@@ -83,7 +83,6 @@ struct ContentView: View {
     @StateObject private var appState = AppState()
     @State private var sidebarDragOffset: CGFloat = 0
     @State private var isEdgeOpeningSidebar = false
-    @State private var keyboardHeight: CGFloat = 0
 
     private let sidebarAnimation = Animation.spring(response: 0.3, dampingFraction: 0.86)
 
@@ -92,12 +91,43 @@ struct ContentView: View {
         return min(1, max(0, 1 + (sidebarDragOffset / SidebarOverlay.sidebarWidth)))
     }
 
+    private var rootSnapshot: ContentRootSnapshot {
+        ContentRootSnapshot(
+            activeThreadKey: serverManager.activeThreadKey,
+            requestedConversationKey: appState.requestedConversationKey,
+            composerPrefillRequest: serverManager.composerPrefillRequest,
+            agentDirectoryVersion: serverManager.agentDirectoryVersion,
+            activePendingApproval: serverManager.activePendingApproval
+        )
+    }
+
+    private func activeConversationContext(
+        for snapshot: ContentRootSnapshot
+    ) -> (thread: ThreadState, connection: ServerConnection, key: ThreadKey)? {
+        guard let key = snapshot.effectiveConversationKey,
+              let thread = serverManager.threads[key],
+              let connection = serverManager.connections[key.serverId] else {
+            return nil
+        }
+        return (thread, connection, key)
+    }
+
     var body: some View {
+        let snapshot = rootSnapshot
+        let activeConversationContext = activeConversationContext(for: snapshot)
+        let hasActiveConversation = snapshot.effectiveConversationKey != nil
+
         GeometryReader { geometry in
+        let composerBottomInset = resolvedComposerBottomInset(fallback: geometry.safeAreaInsets.bottom)
         ZStack {
             LitterTheme.backgroundGradient.ignoresSafeArea()
 
-            mainContent(topInset: geometry.safeAreaInsets.top, bottomInset: keyboardHeight > 0 ? 0 : geometry.safeAreaInsets.bottom)
+            mainContent(
+                snapshot: snapshot,
+                activeConversationContext: activeConversationContext,
+                topInset: geometry.safeAreaInsets.top,
+                bottomInset: composerBottomInset
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .overlay {
@@ -112,31 +142,32 @@ struct ContentView: View {
                     }
                 }
                 .overlay(alignment: .top) {
-                    if serverManager.activeThreadKey != nil {
-                        HeaderView(topInset: geometry.safeAreaInsets.top)
+                    if let activeConversationContext {
+                        HeaderView(
+                            thread: activeConversationContext.thread,
+                            connection: activeConversationContext.connection,
+                            serverManager: serverManager,
+                            topInset: geometry.safeAreaInsets.top
+                        )
                     }
                 }
-            .id(themeManager.themeVersion)
-            .allowsHitTesting(!appState.sidebarOpen)
-            .simultaneousGesture(edgeOpenGesture)
+                .id(themeManager.themeVersion)
+                .allowsHitTesting(!appState.sidebarOpen)
+                .overlay(alignment: .leading) {
+                    if hasActiveConversation && !appState.sidebarOpen {
+                        edgeOpenHandle
+                    }
+                }
 
             SidebarOverlay(dragOffset: $sidebarDragOffset, topInset: geometry.safeAreaInsets.top)
 
-            if let approval = serverManager.activePendingApproval {
+            if let approval = snapshot.activePendingApproval {
                 ApprovalPromptView(approval: approval) { decision in
                     serverManager.respondToPendingApproval(requestId: approval.requestId, decision: decision)
                 }
             }
         }
         .ignoresSafeArea(.container)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
-            if let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
-                keyboardHeight = frame.height
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardHeight = 0
         }
         .environmentObject(appState)
         .onAppear {
@@ -149,12 +180,23 @@ struct ContentView: View {
         .onChange(of: appState.sidebarOpen) { _, isOpen in
             if !isOpen { sidebarDragOffset = 0 }
         }
+        .onChange(of: serverManager.activeThreadKey) { _, _ in
+            appState.selectedModel = ""
+            appState.reasoningEffort = ""
+            appState.showModelSelector = false
+        }
+        .onChange(of: serverManager.activeThreadKey) { _, nextKey in
+            appState.requestedConversationKey = nextKey
+        }
         .enableInjection()
         .sheet(isPresented: $appState.showServerPicker) {
+            let shouldOpenSidebarAfterConnect = snapshot.effectiveConversationKey != nil
             NavigationStack {
-                DiscoveryView(onServerSelected: { server in
+                DiscoveryView(onServerSelected: { _ in
                     appState.showServerPicker = false
-                    appState.sidebarOpen = true
+                    if shouldOpenSidebarAfterConnect {
+                        appState.sidebarOpen = true
+                    }
                 })
                 .environmentObject(serverManager)
                 .environmentObject(appState)
@@ -165,6 +207,22 @@ struct ContentView: View {
                 .environmentObject(serverManager)
                 .environmentObject(appState)
         }
+    }
+
+    private var edgeOpenHandle: some View {
+        Color.clear
+            .frame(width: 24)
+            .contentShape(Rectangle())
+            .gesture(edgeOpenGesture)
+    }
+
+    private func resolvedComposerBottomInset(fallback: CGFloat) -> CGFloat {
+        let keyWindowInset = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)?
+            .safeAreaInsets.bottom ?? 0
+        return keyWindowInset > 0 ? keyWindowInset : fallback
     }
 
     private var edgeOpenGesture: some Gesture {
@@ -204,10 +262,29 @@ struct ContentView: View {
             }
     }
 
-    private func mainContent(topInset: CGFloat, bottomInset: CGFloat) -> some View {
+    private func mainContent(
+        snapshot: ContentRootSnapshot,
+        activeConversationContext: (thread: ThreadState, connection: ServerConnection, key: ThreadKey)?,
+        topInset: CGFloat,
+        bottomInset: CGFloat
+    ) -> some View {
         Group {
-            if serverManager.activeThreadKey != nil {
-                ConversationView(topInset: topInset, bottomInset: bottomInset)
+            if let activeConversationContext {
+                ConversationView(
+                    thread: activeConversationContext.thread,
+                    connection: activeConversationContext.connection,
+                    activeThreadKey: activeConversationContext.key,
+                    serverManager: serverManager,
+                    composerPrefillRequest: snapshot.composerPrefillRequest,
+                    agentDirectoryVersion: snapshot.agentDirectoryVersion,
+                    topInset: topInset,
+                    bottomInset: bottomInset
+                )
+            } else if snapshot.effectiveConversationKey != nil {
+                ProgressView()
+                    .tint(LitterTheme.accent)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
             } else {
                 HomeNavigationView()
                     .environmentObject(serverManager)
@@ -217,25 +294,189 @@ struct ContentView: View {
     }
 }
 
+private struct ContentRootSnapshot {
+    let activeThreadKey: ThreadKey?
+    let requestedConversationKey: ThreadKey?
+    let composerPrefillRequest: ServerManager.ComposerPrefillRequest?
+    let agentDirectoryVersion: Int
+    let activePendingApproval: ServerManager.PendingApproval?
+
+    var effectiveConversationKey: ThreadKey? {
+        activeThreadKey ?? requestedConversationKey
+    }
+}
+
 private struct HomeNavigationView: View {
     @EnvironmentObject var serverManager: ServerManager
     @EnvironmentObject var appState: AppState
-    @State private var showSessions = false
+    @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
+    @State private var navigationPath: [HomeNavigationRoute] = []
+    @State private var directoryPickerSheet: SessionLaunchSupport.DirectoryPickerSheetModel?
+    @State private var openingRecentSessionKey: ThreadKey?
+    @State private var actionErrorMessage: String?
+
+    private enum HomeNavigationRoute: Hashable {
+        case sessions(serverId: String, title: String)
+    }
+
+    private var connectedServers: [ServerConnection] {
+        HomeDashboardSupport.sortedConnectedServers(
+            from: Array(serverManager.connections.values),
+            activeServerId: serverManager.activeThreadKey?.serverId
+        )
+    }
+
+    private var connectedServerOptions: [DirectoryPickerServerOption] {
+        connectedServers.map { connection in
+            DirectoryPickerServerOption(
+                id: connection.id,
+                name: connection.server.name,
+                sourceLabel: connection.server.source.rawString
+            )
+        }
+    }
+
+    private var recentSessions: [ThreadState] {
+        HomeDashboardSupport.recentConnectedSessions(
+            from: serverManager.sortedThreads,
+            connectedServerIds: Set(connectedServers.map(\.id))
+        )
+    }
 
     var body: some View {
-        NavigationStack {
-            DiscoveryView(onServerSelected: { _ in
-                showSessions = true
-            })
-            .environmentObject(serverManager)
-            .navigationDestination(isPresented: $showSessions) {
-                SessionSidebarView()
-                    .navigationTitle("Sessions")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+        NavigationStack(path: $navigationPath) {
+            HomeDashboardView(
+                recentSessions: recentSessions,
+                connectedServers: connectedServers,
+                openingRecentSessionKey: openingRecentSessionKey,
+                onOpenRecentSession: openRecentSession,
+                onOpenServerSessions: openServerSessions,
+                onNewSession: handleNewSessionTap,
+                onConnectServer: { appState.showServerPicker = true },
+                onShowSettings: { appState.showSettings = true }
+            )
+            .navigationDestination(for: HomeNavigationRoute.self) { route in
+                switch route {
+                case let .sessions(serverId, title):
+                    SessionSidebarView()
+                        .navigationTitle(title)
+                        .navigationBarTitleDisplayMode(.inline)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                        .onAppear {
+                            appState.sessionSidebarSelectedServerFilterId = serverId
+                            appState.sessionSidebarShowOnlyForks = false
+                        }
+                }
             }
         }
+        .sheet(item: $directoryPickerSheet) { _ in
+            NavigationStack {
+                DirectoryPickerView(
+                    servers: connectedServerOptions,
+                    selectedServerId: Binding(
+                        get: { directoryPickerSheet?.selectedServerId ?? defaultNewSessionServerId() ?? "" },
+                        set: { nextServerId in
+                            guard var sheet = directoryPickerSheet else { return }
+                            sheet.selectedServerId = nextServerId
+                            directoryPickerSheet = sheet
+                        }
+                    ),
+                    onServerChanged: { nextServerId in
+                        guard var sheet = directoryPickerSheet else { return }
+                        sheet.selectedServerId = nextServerId
+                        directoryPickerSheet = sheet
+                    },
+                    onDirectorySelected: { serverId, cwd in
+                        directoryPickerSheet = nil
+                        Task { await startNewSession(serverId: serverId, cwd: cwd) }
+                    },
+                    onDismissRequested: {
+                        directoryPickerSheet = nil
+                    }
+                )
+                .environmentObject(serverManager)
+            }
+        }
+        .alert("Home Action Failed", isPresented: Binding(
+            get: { actionErrorMessage != nil },
+            set: { if !$0 { actionErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { actionErrorMessage = nil }
+        } message: {
+            Text(actionErrorMessage ?? "Unknown error")
+        }
+    }
+
+    private func defaultNewSessionServerId(preferredServerId: String? = nil) -> String? {
+        SessionLaunchSupport.defaultConnectedServerId(
+            connectedServerIds: connectedServerOptions.map(\.id),
+            activeThreadKey: serverManager.activeThreadKey,
+            preferredServerId: preferredServerId
+        )
+    }
+
+    private func handleNewSessionTap() {
+        if let defaultServerId = defaultNewSessionServerId() {
+            directoryPickerSheet = SessionLaunchSupport.DirectoryPickerSheetModel(selectedServerId: defaultServerId)
+        } else {
+            appState.showServerPicker = true
+        }
+    }
+
+    private func openServerSessions(_ connection: ServerConnection) {
+        appState.sessionSidebarSelectedServerFilterId = connection.id
+        appState.sessionSidebarShowOnlyForks = false
+        navigationPath.append(.sessions(serverId: connection.id, title: connection.server.name))
+    }
+
+    private func openRecentSession(_ thread: ThreadState) async {
+        guard openingRecentSessionKey == nil else { return }
+        openingRecentSessionKey = thread.key
+        actionErrorMessage = nil
+        defer { openingRecentSessionKey = nil }
+
+        workDir = thread.cwd
+        appState.currentCwd = thread.cwd
+        appState.requestedConversationKey = thread.key
+        let opened = await serverManager.viewThread(
+            thread.key,
+            approvalPolicy: appState.approvalPolicy,
+            sandboxMode: appState.sandboxMode
+        )
+        guard opened else {
+            appState.requestedConversationKey = nil
+            if let selectedThread = serverManager.threads[thread.key],
+               case .error(let message) = selectedThread.status {
+                actionErrorMessage = message
+            } else {
+                actionErrorMessage = "Failed to open conversation."
+            }
+            return
+        }
+
+        appState.requestedConversationKey = thread.key
+    }
+
+    private func startNewSession(serverId: String, cwd: String) async {
+        workDir = cwd
+        appState.currentCwd = cwd
+        let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
+        let startedKey = try? await serverManager.startThread(
+            serverId: serverId,
+            cwd: cwd,
+            model: model,
+            approvalPolicy: appState.approvalPolicy,
+            sandboxMode: appState.sandboxMode
+        )
+
+        guard let startedKey else {
+            actionErrorMessage = "Failed to start a new session."
+            return
+        }
+
+        appState.requestedConversationKey = startedKey
+        _ = RecentDirectoryStore.shared.record(path: cwd, for: serverId)
     }
 }
 

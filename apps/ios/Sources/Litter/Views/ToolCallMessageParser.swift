@@ -191,6 +191,19 @@ enum ToolCallMessageParser {
         )
     }
 
+    static func usesResolvedTargets(_ message: ChatMessage) -> Bool {
+        guard message.role == .system,
+              let system = parseSystemEnvelope(message.text),
+              ToolCallKind.from(title: system.title) != nil else {
+            return false
+        }
+
+        return system.body.range(
+            of: #"(?im)^targets(?:\s*:)?(?:\s|$)"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private struct ParsedSystemMessage {
         let title: String
         let body: String

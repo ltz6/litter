@@ -4,17 +4,9 @@ struct SettingsView: View {
     @EnvironmentObject var serverManager: ServerManager
     @Environment(\.dismiss) private var dismiss
     @AppStorage("fontFamily") private var fontFamily = FontFamilyOption.mono.rawValue
-    @State private var apiKey = ""
-    @State private var isAuthWorking = false
-    @State private var authError: String?
-    @State private var showOAuth = false
 
-    private var conn: ServerConnection? {
+    private var connection: ServerConnection? {
         serverManager.activeConnection ?? serverManager.connections.values.first(where: { $0.isConnected })
-    }
-
-    private var authStatus: AuthStatus {
-        conn?.authStatus ?? .unknown
     }
 
     private var connectedServers: [ServerConnection] {
@@ -45,18 +37,6 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                         .foregroundColor(LitterTheme.accent)
                 }
-            }
-        }
-        .sheet(isPresented: $showOAuth) {
-            oauthSheet
-        }
-        .onChange(of: conn?.oauthURL) { _, url in
-            showOAuth = url != nil
-        }
-        .onChange(of: conn?.loginCompleted) { _, completed in
-            if completed == true {
-                showOAuth = false
-                conn?.loginCompleted = false
             }
         }
     }
@@ -143,94 +123,12 @@ struct SettingsView: View {
     // MARK: - Account Section (inline, no nested sheet)
 
     private var accountSection: some View {
-        Section {
-            // Current status
-            HStack(spacing: 12) {
-                Circle()
-                    .fill(authColor)
-                    .frame(width: 10, height: 10)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(authTitle)
-                        .font(LitterFont.styled(.subheadline))
-                        .foregroundColor(LitterTheme.textPrimary)
-                    if let sub = authSubtitle {
-                        Text(sub)
-                            .font(LitterFont.styled(.caption))
-                            .foregroundColor(LitterTheme.textSecondary)
-                    }
-                }
-                Spacer()
-                if authStatus != .notLoggedIn && authStatus != .unknown {
-                    Button("Logout") {
-                        Task { await conn?.logout() }
-                    }
-                    .font(LitterFont.styled(.caption))
-                    .foregroundColor(LitterTheme.danger)
-                }
+        Group {
+            if let connection {
+                SettingsConnectionAccountSection(connection: connection)
+            } else {
+                SettingsDisconnectedAccountSection()
             }
-            .listRowBackground(LitterTheme.surface.opacity(0.6))
-
-            // Login actions
-            if case .notLoggedIn = authStatus {
-                Button {
-                    Task {
-                        isAuthWorking = true
-                        authError = nil
-                        await conn?.loginWithChatGPT()
-                        isAuthWorking = false
-                    }
-                } label: {
-                    HStack {
-                        if isAuthWorking {
-                            ProgressView().tint(LitterTheme.textPrimary).scaleEffect(0.8)
-                        }
-                        Image(systemName: "person.crop.circle.badge.checkmark")
-                        Text("Login with ChatGPT")
-                            .font(LitterFont.styled(.subheadline))
-                    }
-                    .foregroundColor(LitterTheme.accent)
-                }
-                .disabled(isAuthWorking)
-                .listRowBackground(LitterTheme.surface.opacity(0.6))
-
-                HStack(spacing: 8) {
-                    SecureField("sk-...", text: $apiKey)
-                        .font(LitterFont.styled(.footnote))
-                        .foregroundColor(LitterTheme.textPrimary)
-                        .textInputAutocapitalization(.never)
-                    Button("Save") {
-                        let key = apiKey.trimmingCharacters(in: .whitespaces)
-                        guard !key.isEmpty else { return }
-                        Task {
-                            isAuthWorking = true
-                            authError = nil
-                            await conn?.loginWithApiKey(key)
-                            isAuthWorking = false
-                        }
-                    }
-                    .font(LitterFont.styled(.caption))
-                    .foregroundColor(LitterTheme.accent)
-                    .disabled(apiKey.trimmingCharacters(in: .whitespaces).isEmpty || isAuthWorking)
-                }
-                .listRowBackground(LitterTheme.surface.opacity(0.6))
-            }
-
-            if case .unknown = authStatus, conn == nil {
-                Text("Connect to a server first")
-                    .font(LitterFont.styled(.caption))
-                    .foregroundColor(LitterTheme.textMuted)
-                    .listRowBackground(LitterTheme.surface.opacity(0.6))
-            }
-
-            if let err = authError {
-                Text(err)
-                    .font(LitterFont.styled(.caption))
-                    .foregroundColor(LitterTheme.danger)
-                    .listRowBackground(LitterTheme.surface.opacity(0.6))
-            }
-        } header: {
-            Text("Account")
-                .foregroundColor(LitterTheme.textSecondary)
         }
     }
 
@@ -273,16 +171,122 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - OAuth Sheet
+}
+
+private struct SettingsConnectionAccountSection: View {
+    @ObservedObject var connection: ServerConnection
+    @State private var apiKey = ""
+    @State private var isAuthWorking = false
+    @State private var authError: String?
+    @State private var showOAuth = false
+
+    private var authStatus: AuthStatus {
+        connection.authStatus
+    }
+
+    var body: some View {
+        Section {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(authColor)
+                    .frame(width: 10, height: 10)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(authTitle)
+                        .font(LitterFont.styled(.subheadline))
+                        .foregroundColor(LitterTheme.textPrimary)
+                    if let sub = authSubtitle {
+                        Text(sub)
+                            .font(LitterFont.styled(.caption))
+                            .foregroundColor(LitterTheme.textSecondary)
+                    }
+                }
+                Spacer()
+                if authStatus != .notLoggedIn && authStatus != .unknown {
+                    Button("Logout") {
+                        Task { await connection.logout() }
+                    }
+                    .font(LitterFont.styled(.caption))
+                    .foregroundColor(LitterTheme.danger)
+                }
+            }
+            .listRowBackground(LitterTheme.surface.opacity(0.6))
+
+            if case .notLoggedIn = authStatus {
+                Button {
+                    Task {
+                        isAuthWorking = true
+                        authError = nil
+                        await connection.loginWithChatGPT()
+                        isAuthWorking = false
+                    }
+                } label: {
+                    HStack {
+                        if isAuthWorking {
+                            ProgressView().tint(LitterTheme.textPrimary).scaleEffect(0.8)
+                        }
+                        Image(systemName: "person.crop.circle.badge.checkmark")
+                        Text("Login with ChatGPT")
+                            .font(LitterFont.styled(.subheadline))
+                    }
+                    .foregroundColor(LitterTheme.accent)
+                }
+                .disabled(isAuthWorking)
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+
+                HStack(spacing: 8) {
+                    SecureField("sk-...", text: $apiKey)
+                        .font(LitterFont.styled(.footnote))
+                        .foregroundColor(LitterTheme.textPrimary)
+                        .textInputAutocapitalization(.never)
+                    Button("Save") {
+                        let key = apiKey.trimmingCharacters(in: .whitespaces)
+                        guard !key.isEmpty else { return }
+                        Task {
+                            isAuthWorking = true
+                            authError = nil
+                            await connection.loginWithApiKey(key)
+                            isAuthWorking = false
+                        }
+                    }
+                    .font(LitterFont.styled(.caption))
+                    .foregroundColor(LitterTheme.accent)
+                    .disabled(apiKey.trimmingCharacters(in: .whitespaces).isEmpty || isAuthWorking)
+                }
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+            }
+
+            if let authError {
+                Text(authError)
+                    .font(LitterFont.styled(.caption))
+                    .foregroundColor(LitterTheme.danger)
+                    .listRowBackground(LitterTheme.surface.opacity(0.6))
+            }
+        } header: {
+            Text("Account")
+                .foregroundColor(LitterTheme.textSecondary)
+        }
+        .sheet(isPresented: $showOAuth) {
+            oauthSheet
+        }
+        .onChange(of: connection.oauthURL) { _, url in
+            showOAuth = url != nil
+        }
+        .onChange(of: connection.loginCompleted) { _, completed in
+            if completed == true {
+                showOAuth = false
+                connection.loginCompleted = false
+            }
+        }
+    }
 
     @ViewBuilder
     private var oauthSheet: some View {
-        if let url = conn?.oauthURL {
+        if let url = connection.oauthURL {
             NavigationStack {
                 OAuthWebView(url: url, onCallbackIntercepted: { callbackURL in
-                    conn?.forwardOAuthCallback(callbackURL)
+                    connection.forwardOAuthCallback(callbackURL)
                 }) {
-                    Task { await conn?.cancelLogin() }
+                    Task { await connection.cancelLogin() }
                 }
                 .ignoresSafeArea()
                 .navigationTitle("Login with ChatGPT")
@@ -290,7 +294,7 @@ struct SettingsView: View {
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button("Cancel") {
-                            Task { await conn?.cancelLogin() }
+                            Task { await connection.cancelLogin() }
                             showOAuth = false
                         }
                         .foregroundColor(LitterTheme.danger)
@@ -300,12 +304,10 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Auth Helpers
-
     private var authColor: Color {
         switch authStatus {
         case .chatgpt: return LitterTheme.accent
-        case .apiKey:  return Color(hex: "#00AAFF")
+        case .apiKey: return Color(hex: "#00AAFF")
         case .notLoggedIn, .unknown: return LitterTheme.textMuted
         }
     }
@@ -324,6 +326,20 @@ struct SettingsView: View {
         case .chatgpt: return "ChatGPT account"
         case .apiKey: return "OpenAI API key"
         default: return nil
+        }
+    }
+}
+
+private struct SettingsDisconnectedAccountSection: View {
+    var body: some View {
+        Section {
+            Text("Connect to a server first")
+                .font(LitterFont.styled(.caption))
+                .foregroundColor(LitterTheme.textMuted)
+                .listRowBackground(LitterTheme.surface.opacity(0.6))
+        } header: {
+            Text("Account")
+                .foregroundColor(LitterTheme.textSecondary)
         }
     }
 }
