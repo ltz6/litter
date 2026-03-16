@@ -126,18 +126,27 @@ unsafe impl Send for ChannelState {}
 unsafe impl Sync for ChannelState {}
 
 /// Send-safe wrapper for delivering JSON messages to the Swift callback.
-/// Bundles the function pointer and context pointer together.
-#[derive(Clone, Copy)]
+/// Bundles the function pointer and context pointer together with a
+/// closed flag to prevent use-after-free on the Swift side.
+#[derive(Clone)]
 struct CallbackHandle {
     cb: MessageCallback,
     ctx: *mut c_void,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 unsafe impl Send for CallbackHandle {}
 unsafe impl Sync for CallbackHandle {}
 
 impl CallbackHandle {
     unsafe fn deliver(&self, json: &str) {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         unsafe { (self.cb)(self.ctx, json.as_ptr() as *const c_char, json.len()); }
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -250,7 +259,8 @@ pub extern "C" fn codex_channel_open(
         let sender = handle.sender();
 
         // Spawn the event loop that delivers server events to Swift via callback.
-        let cb_handle = CallbackHandle { cb: callback, ctx: callback_ctx };
+        let closed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cb_handle = CallbackHandle { cb: callback, ctx: callback_ctx, closed: closed_flag.clone() };
         let event_task = runtime().spawn(async move {
             while let Some(event) = handle.next_event().await {
                 if let Some(json) = serialize_server_event(&event) {
@@ -262,7 +272,11 @@ pub extern "C" fn codex_channel_open(
 
         Ok(ChannelState {
             sender,
-            cb_handle: CallbackHandle { cb: callback, ctx: callback_ctx },
+            cb_handle: CallbackHandle {
+                cb: callback,
+                ctx: callback_ctx,
+                closed: closed_flag,
+            },
             event_task,
             request_tasks: std::sync::Mutex::new(Vec::new()),
         })
@@ -323,7 +337,7 @@ pub extern "C" fn codex_channel_send(
 
         let request_id = value["id"].clone();
         let sender = state.sender.clone();
-        let cb_handle = state.cb_handle;
+        let cb_handle = state.cb_handle.clone();
 
         let request_task = runtime().spawn(async move {
             match sender.request(request).await {
@@ -430,6 +444,10 @@ pub extern "C" fn codex_channel_close(handle: *mut c_void) {
         return;
     }
     let state = unsafe { Box::from_raw(handle as *mut ChannelState) };
+
+    // Mark closed FIRST — prevents any in-flight callback from touching Swift memory.
+    state.cb_handle.mark_closed();
+
     let ChannelState {
         sender: _sender,
         cb_handle: _cb_handle,

@@ -193,7 +193,7 @@ actor CodexChannel {
 /// Bridging object that receives messages from the Rust tokio thread
 /// and forwards them to the CodexChannel actor.
 private final class CallbackReceiver: @unchecked Sendable {
-    let channel: CodexChannel
+    weak var channel: CodexChannel?
 
     init(channel: CodexChannel) {
         self.channel = channel
@@ -209,5 +209,5 @@ private func channelMessageCallback(
     guard let ctx, let json else { return }
     let data = Data(bytes: json, count: jsonLen)
     let receiver = Unmanaged<CallbackReceiver>.fromOpaque(ctx).takeUnretainedValue()
-    receiver.channel.receiveMessage(data)
+    receiver.channel?.receiveMessage(data)
 }

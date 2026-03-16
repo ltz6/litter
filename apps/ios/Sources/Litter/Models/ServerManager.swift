@@ -3266,11 +3266,6 @@ final class ServerManager {
         deregisterPushProxy()
         endBackgroundTaskIfNeeded()
 
-        // Immediately mark all connections as connecting so the UI reflects reconnection in progress
-        for (_, conn) in connections {
-            conn.connectionHealth = .connecting
-        }
-
         let keysToSync = backgroundedTurnKeys.union(
             threads.compactMap { $0.value.hasTurnActive ? $0.key : nil }
         )
@@ -3278,6 +3273,12 @@ final class ServerManager {
 
         Task {
             for (serverId, conn) in connections {
+                // Skip connections that are still healthy (channel or WebSocket).
+                if conn.connectionHealth == .connected {
+                    NSLog("[%@ bg] skipping reconnect for healthy %@", ts, serverId)
+                    continue
+                }
+                conn.connectionHealth = .connecting
                 NSLog("[%@ bg] reconnecting server %@", ts, serverId)
                 conn.disconnect()
                 await conn.connect()
