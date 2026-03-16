@@ -3,13 +3,17 @@ use codex_app_server::in_process::{InProcessClientSender, InProcessServerEvent, 
 use codex_app_server::run_main_with_transport;
 use codex_app_server_protocol::{
     ClientNotification, ClientRequest, InitializeCapabilities, InitializeParams,
-    ClientInfo, RequestId, SessionSource,
+    ClientInfo, RequestId,
 };
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::auth::AuthManager;
 use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::LoaderOverrides;
+use codex_core::features::Feature;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_core::ThreadManager;
 use codex_feedback::CodexFeedback;
+use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::ffi::c_void;
 use std::fs;
@@ -184,16 +188,6 @@ pub extern "C" fn codex_channel_open(
     eprintln!("[codex-channel] opening in-process channel");
 
     let result: Result<ChannelState, String> = runtime().block_on(async {
-        #[cfg(target_os = "ios")]
-        let cli_overrides = CliConfigOverrides {
-            // The staged iOS core currently exposes unified-exec without working
-            // session semantics. Keep one-shot shell execution available, but
-            // suppress the model-facing exec_command/write_stdin tools locally.
-            raw_overrides: vec!["features.unified_exec=false".to_string()],
-        }
-        .parse_overrides()
-        .map_err(|e| format!("config override parse failed: {e}"))?;
-        #[cfg(not(target_os = "ios"))]
         let cli_overrides = Vec::new();
 
         // Build config with defaults (mirrors run_main_with_transport's setup).
@@ -203,38 +197,50 @@ pub extern "C" fn codex_channel_open(
             .await
             .map_err(|e| format!("config build failed: {e}"))?;
 
-        let cloud_requirements = {
-            let auth_manager = AuthManager::shared(
-                config.codex_home.clone(),
-                false,
-                config.cli_auth_credentials_store_mode,
-            );
-            cloud_requirements_loader(
-                auth_manager,
-                config.chatgpt_base_url.clone(),
-                config.codex_home.clone(),
-            )
-        };
+        let auth_manager = AuthManager::shared(
+            config.codex_home.clone(),
+            false,
+            config.cli_auth_credentials_store_mode,
+        );
+        let cloud_requirements = cloud_requirements_loader(
+            auth_manager.clone(),
+            config.chatgpt_base_url.clone(),
+            config.codex_home.clone(),
+        );
 
         // Rebuild with cloud requirements for full config resolution.
         let config = ConfigBuilder::default()
-            .cli_overrides(cli_overrides)
+            .cli_overrides(cli_overrides.clone())
             .cloud_requirements(cloud_requirements.clone())
             .build()
             .await
             .unwrap_or(config);
 
         let feedback = CodexFeedback::new();
+        let session_source: SessionSource = SessionSource::VSCode;
+        let thread_manager = Arc::new(ThreadManager::new(
+            &config,
+            auth_manager.clone(),
+            session_source.clone(),
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+        ));
 
         let args = InProcessStartArgs {
             arg0_paths: Default::default(),
             config: Arc::new(config),
-            cli_overrides: Vec::new(),
+            // Preserve startup config flags for per-turn config derivation.
+            cli_overrides,
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements,
+            auth_manager: Some(auth_manager),
+            thread_manager: Some(thread_manager),
             feedback,
             config_warnings: Vec::new(),
-            session_source: SessionSource::VsCode.into(),
+            session_source,
             enable_codex_api_key_env: false,
             initialize: InitializeParams {
                 client_info: ClientInfo {
