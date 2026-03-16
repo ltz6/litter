@@ -31,8 +31,7 @@ final class RealtimeConversationProtocolTests: XCTestCase {
         let params = ThreadRealtimeStartParams(
             threadId: "thread-123",
             prompt: "hello",
-            sessionId: "session-456",
-            clientControlledHandoff: true
+            sessionId: "session-456"
         )
 
         let data = try JSONEncoder().encode(params)
@@ -41,7 +40,6 @@ final class RealtimeConversationProtocolTests: XCTestCase {
         XCTAssertEqual(json["threadId"] as? String, "thread-123")
         XCTAssertEqual(json["prompt"] as? String, "hello")
         XCTAssertEqual(json["sessionId"] as? String, "session-456")
-        XCTAssertEqual(json["clientControlledHandoff"] as? Bool, true)
     }
 
     func testThreadRealtimeOutputAudioNotificationDecodesAudioChunk() throws {

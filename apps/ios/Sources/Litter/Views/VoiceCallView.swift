@@ -196,7 +196,7 @@ struct VoiceCallView: View {
 
     private func phaseColor(_ phase: VoiceSessionPhase) -> Color {
         switch phase {
-        case .connecting, .thinking, .handoff:
+        case .connecting, .thinking:
             return LitterTheme.warning
         case .listening, .speaking:
             return LitterTheme.accent
@@ -217,8 +217,6 @@ struct VoiceCallView: View {
             return "dot.radiowaves.left.and.right"
         case .airPlay:
             return "airplayaudio"
-        case .carPlay:
-            return "car.fill"
         case .unknown:
             return "speaker.wave.2.fill"
         }

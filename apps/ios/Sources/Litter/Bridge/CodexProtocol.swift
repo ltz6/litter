@@ -744,8 +744,6 @@ struct ThreadRealtimeStartParams: Encodable {
     let threadId: String
     let prompt: String
     let sessionId: String?
-    let clientControlledHandoff: Bool?
-    let dynamicTools: [DynamicToolSpec]?
 }
 
 struct ThreadRealtimeStartResponse: Decodable {}
@@ -769,21 +767,6 @@ struct ThreadRealtimeStopParams: Encodable {
 }
 
 struct ThreadRealtimeStopResponse: Decodable {}
-
-struct ThreadRealtimeResolveHandoffParams: Encodable {
-    let threadId: String
-    let handoffId: String
-    let outputText: String
-}
-
-struct ThreadRealtimeResolveHandoffResponse: Decodable {}
-
-struct ThreadRealtimeFinalizeHandoffParams: Encodable {
-    let threadId: String
-    let handoffId: String
-}
-
-struct ThreadRealtimeFinalizeHandoffResponse: Decodable {}
 
 struct ThreadRealtimeStartedNotification: Decodable {
     let threadId: String

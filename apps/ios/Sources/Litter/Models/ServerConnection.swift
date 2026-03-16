@@ -366,55 +366,16 @@ final class ServerConnection: Identifiable {
         )
     }
 
-    func prepareLocalRealtimeConversationIfNeeded() async {
-        await configureLocalRealtimeConversationFeatureIfNeeded()
-    }
-
-    func startRealtimeConversation(
-        threadId: String,
-        prompt: String,
-        sessionId: String? = nil,
-        clientControlledHandoff: Bool = false,
-        dynamicTools: [DynamicToolSpec]? = nil
-    ) async throws {
-        let _: ThreadRealtimeStartResponse = try await routedSendRequest(
+    func startRealtimeConversation(threadId: String, prompt: String, sessionId: String? = nil) async throws {
+        let _: ThreadRealtimeStartResponse = try await client.sendRequest(
             method: "thread/realtime/start",
-            params: ThreadRealtimeStartParams(
-                threadId: threadId,
-                prompt: prompt,
-                sessionId: sessionId,
-                clientControlledHandoff: clientControlledHandoff ? true : nil,
-                dynamicTools: dynamicTools
-            ),
+            params: ThreadRealtimeStartParams(threadId: threadId, prompt: prompt, sessionId: sessionId),
             responseType: ThreadRealtimeStartResponse.self
         )
     }
 
-    func resolveRealtimeHandoff(threadId: String, handoffId: String, outputText: String) async throws {
-        let _: ThreadRealtimeResolveHandoffResponse = try await routedSendRequest(
-            method: "thread/realtime/resolveHandoff",
-            params: ThreadRealtimeResolveHandoffParams(
-                threadId: threadId,
-                handoffId: handoffId,
-                outputText: outputText
-            ),
-            responseType: ThreadRealtimeResolveHandoffResponse.self
-        )
-    }
-
-    func finalizeRealtimeHandoff(threadId: String, handoffId: String) async throws {
-        let _: ThreadRealtimeFinalizeHandoffResponse = try await routedSendRequest(
-            method: "thread/realtime/finalizeHandoff",
-            params: ThreadRealtimeFinalizeHandoffParams(
-                threadId: threadId,
-                handoffId: handoffId
-            ),
-            responseType: ThreadRealtimeFinalizeHandoffResponse.self
-        )
-    }
-
     func appendRealtimeAudio(threadId: String, audio: ThreadRealtimeAudioChunk) async throws {
-        let _: ThreadRealtimeAppendAudioResponse = try await routedSendRequest(
+        let _: ThreadRealtimeAppendAudioResponse = try await client.sendRequest(
             method: "thread/realtime/appendAudio",
             params: ThreadRealtimeAppendAudioParams(threadId: threadId, audio: audio),
             responseType: ThreadRealtimeAppendAudioResponse.self
@@ -422,7 +383,7 @@ final class ServerConnection: Identifiable {
     }
 
     func appendRealtimeText(threadId: String, text: String) async throws {
-        let _: ThreadRealtimeAppendTextResponse = try await routedSendRequest(
+        let _: ThreadRealtimeAppendTextResponse = try await client.sendRequest(
             method: "thread/realtime/appendText",
             params: ThreadRealtimeAppendTextParams(threadId: threadId, text: text),
             responseType: ThreadRealtimeAppendTextResponse.self
@@ -430,7 +391,7 @@ final class ServerConnection: Identifiable {
     }
 
     func stopRealtimeConversation(threadId: String) async throws {
-        let _: ThreadRealtimeStopResponse = try await routedSendRequest(
+        let _: ThreadRealtimeStopResponse = try await client.sendRequest(
             method: "thread/realtime/stop",
             params: ThreadRealtimeStopParams(threadId: threadId),
             responseType: ThreadRealtimeStopResponse.self
@@ -529,7 +490,7 @@ final class ServerConnection: Identifiable {
         edits: [ConfigEdit],
         reloadUserConfig: Bool = false
     ) async throws -> ConfigWriteResponse {
-        try await routedSendRequest(
+        try await client.sendRequest(
             method: "config/batchWrite",
             params: ConfigBatchWriteParams(
                 edits: edits,
@@ -1200,77 +1161,5 @@ final class ServerConnection: Identifiable {
             current = next
         }
         return current as? String
-    }
-
-    private static func localRealtimeAPIKeyIsSaved(for target: ConnectionTarget) -> Bool {
-        guard target == .local else { return false }
-        let storedKey = (try? RealtimeAPIKeyStore.shared.load()) ?? nil
-        return storedKey?.isEmpty == false
-    }
-
-    private static func realtimeAPIKeyIsSaved(for target: ConnectionTarget) -> Bool {
-        localRealtimeAPIKeyIsSaved(for: target)
-    }
-
-    private func applyLocalRealtimeAPIKeyEnvironment() {
-        guard target == .local else { return }
-        do {
-            try RealtimeAPIKeyStore.shared.applyProcessEnvironment()
-            hasOpenAIApiKey = Self.localRealtimeAPIKeyIsSaved(for: target)
-        } catch {
-            lastAuthError = error.localizedDescription
-            hasOpenAIApiKey = false
-        }
-    }
-
-    private func restoreLocalChatGPTAuthIfNeeded() async {
-        guard target == .local else { return }
-
-        do {
-            let currentAuth: GetAccountResponse = try await routedSendRequest(
-                method: "account/read",
-                params: GetAccountParams(refreshToken: false),
-                responseType: GetAccountResponse.self
-            )
-            if currentAuth.account?.type == "chatgpt" {
-                return
-            }
-        } catch {
-            // Fall through and attempt local auth replay.
-        }
-
-        guard let storedTokens = try? ChatGPTOAuth.loadStoredTokens(),
-              !storedTokens.accountID.isEmpty else {
-            return
-        }
-
-        let tokensForRestore: ChatGPTOAuthTokenBundle
-        if let refreshToken = storedTokens.refreshToken, !refreshToken.isEmpty {
-            if let refreshed = try? await ChatGPTOAuth.refreshStoredTokens(previousAccountID: storedTokens.accountID) {
-                tokensForRestore = refreshed
-            } else {
-                tokensForRestore = storedTokens
-            }
-        } else {
-            tokensForRestore = storedTokens
-        }
-
-        guard !tokensForRestore.accessToken.isEmpty else {
-            return
-        }
-
-        do {
-            let _: LoginStartResponse = try await routedSendRequest(
-                method: "account/login/start",
-                params: LoginStartChatGPTAuthTokensParams(
-                    accessToken: tokensForRestore.accessToken,
-                    chatgptAccountId: tokensForRestore.accountID,
-                    chatgptPlanType: tokensForRestore.planType
-                ),
-                responseType: LoginStartResponse.self
-            )
-        } catch {
-            NSLog("[auth] Local ChatGPT auth restore failed: %@", error.localizedDescription)
-        }
     }
 }

@@ -105,8 +105,6 @@ final class ServerManager {
     @ObservationIgnored private var voicePreviousActiveThreadKey: ThreadKey?
     @ObservationIgnored private var voiceStopRequestedThreadKey: ThreadKey?
     @ObservationIgnored private var lastHandledVoiceEndRequestToken: String?
-    @ObservationIgnored private var lastRealtimeTranscriptDelta: [ThreadKey: (speaker: String, delta: String, timestamp: CFAbsoluteTime)] = [:]
-    @ObservationIgnored private var pendingRealtimeMessageIDs: [ThreadKey: (user: String?, assistant: String?)] = [:]
     @ObservationIgnored private let notificationDecodeQueue = DispatchQueue(label: "Litter.ServerManager.NotificationDecode", qos: .userInitiated)
     @ObservationIgnored private var notificationWorkTask: Task<Void, Never>?
     @ObservationIgnored private let networkMonitor = NetworkMonitor()
@@ -374,22 +372,6 @@ final class ServerManager {
             discardThreadState(key)
         }
 
-        return try await createPinnedLocalVoiceThread(
-            serverId: serverId,
-            cwd: cwd,
-            model: model,
-            approvalPolicy: approvalPolicy,
-            sandboxMode: sandboxMode
-        )
-    }
-
-    private func createPinnedLocalVoiceThread(
-        serverId: String,
-        cwd: String,
-        model: String? = nil,
-        approvalPolicy: String = "never",
-        sandboxMode: String? = nil
-    ) async throws -> ThreadKey {
         let key = try await startThread(
             serverId: serverId,
             cwd: preferredVoiceThreadCwd(for: nil, fallback: cwd),
@@ -565,6 +547,10 @@ final class ServerManager {
             self?.removePendingUserInputRequests(forServerId: serverId)
             if self?.activeVoiceSession?.threadKey.serverId == serverId {
                 let key = self?.activeVoiceSession?.threadKey ?? ThreadKey(serverId: serverId, threadId: "")
+                self?.appendVoiceSessionSystemMessage(
+                    "Realtime voice disconnected from server",
+                    to: key
+                )
                 self?.failVoiceSession("Realtime voice disconnected")
             }
         }
@@ -921,7 +907,6 @@ final class ServerManager {
         session.outputLevel = 0
         session.transcriptSpeaker = "System"
         session.transcriptText = "Hanging up..."
-        session.transcriptLiveMessageID = nil
         session.lastError = nil
         appendVoiceSessionDebug("phase stopping", to: &session)
         activeVoiceSession = session
@@ -934,12 +919,7 @@ final class ServerManager {
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
     ) async throws {
-        if let existing = activeVoiceSession, existing.phase != .error {
-            return
-        }
-        if activeVoiceSession != nil {
-            endVoiceSessionImmediately()
-        }
+        guard activeVoiceSession == nil else { return }
 
         let previousKey = activeThreadKey
         let key = try await ensurePinnedLocalVoiceThread(
@@ -954,60 +934,10 @@ final class ServerManager {
             activeThreadKey = nil
         }
 
-        do {
-            try await startRealtimeVoiceSession(
-                for: key,
-                model: model,
-                previousActiveThreadKey: previousKey
-            )
-        } catch {
-            guard isUnsupportedRealtimeThreadError(error) else {
-                throw error
-            }
-
-            setPersistedLocalVoiceThreadId(nil)
-            discardThreadState(key)
-            endVoiceSessionImmediately()
-
-            let freshKey = try await createPinnedLocalVoiceThread(
-                serverId: Self.localServerID,
-                cwd: cwd,
-                model: model,
-                approvalPolicy: approvalPolicy,
-                sandboxMode: sandboxMode
-            )
-            if let previousKey, previousKey != freshKey {
-                activeThreadKey = previousKey
-            } else if previousKey == nil {
-                activeThreadKey = nil
-            }
-
-            try await startRealtimeVoiceSession(
-                for: freshKey,
-                model: model,
-                previousActiveThreadKey: previousKey
-            )
-        }
-    }
-
-    func startVoiceOnThread(_ key: ThreadKey) async throws {
-        if let existing = activeVoiceSession, existing.phase != .error {
-            return
-        }
-        if activeVoiceSession != nil {
-            endVoiceSessionImmediately()
-        }
-        guard key.serverId == Self.localServerID else {
-            throw NSError(
-                domain: "Litter",
-                code: 3310,
-                userInfo: [NSLocalizedDescriptionKey: "Voice is only available on the local server"]
-            )
-        }
-
         try await startRealtimeVoiceSession(
             for: key,
-            previousActiveThreadKey: activeThreadKey
+            model: model,
+            previousActiveThreadKey: previousKey
         )
     }
 
@@ -1026,10 +956,6 @@ final class ServerManager {
             )
         }
 
-        if key.serverId == Self.localServerID {
-            await connection.prepareLocalRealtimeConversationIfNeeded()
-        }
-
         let features = try await connection.listExperimentalFeatures(limit: 200)
         guard Self.isRealtimeConversationEnabled(features.data) else {
             throw NSError(
@@ -1043,7 +969,7 @@ final class ServerManager {
         let runtimeSessionId = "litter-voice-\(UUID().uuidString.lowercased())"
 
         voicePreviousActiveThreadKey = previousActiveThreadKey
-        pendingRealtimeMessageIDs[key] = (nil, nil)
+        activeThreadKey = key
         activeVoiceSession = VoiceSessionState.initial(
             threadKey: key,
             threadTitle: thread.preview,
@@ -1054,10 +980,8 @@ final class ServerManager {
             "phase connection=\(connection.connectionPhase) auth=\(debugAuthStatus(connection.authStatus)) authMethod=\(authSnapshot.method ?? "nil") tokenPresent=\(authSnapshot.token != nil)",
             for: key
         )
-        let remoteServers = connectedRemoteServers()
-        let prompt = VoiceSessionControl.buildPrompt(remoteServers: remoteServers)
         recordVoiceSessionDebug(
-            "-> thread/realtime/start clientControlledHandoff=true remoteServers=\(remoteServers.map(\.name))",
+            "-> thread/realtime/start \(debugJSONString(ThreadRealtimeStartParams(threadId: key.threadId, prompt: VoiceSessionControl.defaultPrompt, sessionId: runtimeSessionId)))",
             for: key
         )
         syncVoiceCallActivity()
@@ -1065,10 +989,8 @@ final class ServerManager {
         do {
             try await connection.startRealtimeConversation(
                 threadId: key.threadId,
-                prompt: prompt,
-                sessionId: runtimeSessionId,
-                clientControlledHandoff: true,
-                dynamicTools: CrossServerTools.buildDynamicToolSpecs()
+                prompt: VoiceSessionControl.defaultPrompt,
+                sessionId: runtimeSessionId
             )
             recordVoiceSessionDebug("<- thread/realtime/start {}", for: key)
         } catch {
@@ -1077,13 +999,6 @@ final class ServerManager {
             failVoiceSession(error.localizedDescription)
             throw error
         }
-    }
-
-    private func isUnsupportedRealtimeThreadError(_ error: Error) -> Bool {
-        let message = error.localizedDescription.lowercased()
-        return message.contains("does not support realtime conversation")
-            || message.contains("doesn't support realtime")
-            || message.contains("doesnt support realtime")
     }
 
     func stopActiveVoiceSession() async {
@@ -1115,6 +1030,10 @@ final class ServerManager {
         } catch {
             recordVoiceSessionDebug("<- thread/realtime/stop error \(error.localizedDescription)", for: key)
             voiceStopRequestedThreadKey = nil
+            appendVoiceSessionSystemMessage(
+                "Failed to stop realtime voice: \(error.localizedDescription)",
+                to: key
+            )
             failVoiceSession("Failed to hang up: \(error.localizedDescription)")
         }
     }
@@ -2910,6 +2829,7 @@ final class ServerManager {
             syncVoiceCallActivity()
 
         case .failure(let message):
+            appendVoiceSessionSystemMessage(message, to: session.threadKey)
             failVoiceSession(message)
         }
     }
@@ -2923,6 +2843,7 @@ final class ServerManager {
         do {
             try await connection.appendRealtimeAudio(threadId: key.threadId, audio: chunk)
         } catch {
+            appendVoiceSessionSystemMessage("Realtime voice audio failed: \(error.localizedDescription)", to: key)
             failVoiceSession(error.localizedDescription)
         }
     }
@@ -2953,241 +2874,12 @@ final class ServerManager {
                 await self.appendRealtimeAudioChunk(chunk, for: key)
             }
         } catch {
+            appendVoiceSessionSystemMessage(
+                "Failed to start microphone capture: \(error.localizedDescription)",
+                to: key
+            )
             failVoiceSession(error.localizedDescription)
         }
-    }
-
-    private func appendFinalRealtimeMessage(
-        role: String,
-        text: String,
-        itemId: String,
-        to session: inout VoiceSessionState
-    ) {
-        guard !text.isEmpty else { return }
-        let speaker = role == "user" ? "You" : "Codex"
-        let messageId = "rtv-\(itemId)"
-        let item = VoiceSessionTranscriptEntry(
-            id: messageId,
-            speaker: speaker,
-            text: text,
-            timestamp: Date()
-        )
-
-        if let existingIndex = session.transcriptHistory.firstIndex(where: { $0.id == messageId }) {
-            session.transcriptHistory[existingIndex] = item
-        } else {
-            session.transcriptHistory.append(item)
-        }
-    }
-
-    private func reserveRealtimeTranscriptMessage(
-        role: String,
-        itemId: String,
-        to session: inout VoiceSessionState
-    ) {
-        let speaker = role == "user" ? "You" : "Codex"
-        let messageId = "rtv-\(itemId)"
-        guard !session.transcriptHistory.contains(where: { $0.id == messageId }) else { return }
-
-        session.transcriptHistory.append(
-            VoiceSessionTranscriptEntry(
-                id: messageId,
-                speaker: speaker,
-                text: "",
-                timestamp: Date()
-            )
-        )
-    }
-
-    private func isProvisionalRealtimeMessageID(_ itemId: String?) -> Bool {
-        guard let itemId, !itemId.isEmpty else { return false }
-        return !itemId.hasPrefix("item_")
-    }
-
-    private func rekeyRealtimeTranscriptMessage(
-        from oldItemId: String?,
-        to newItemId: String,
-        speaker: String,
-        session: inout VoiceSessionState
-    ) {
-        guard let oldItemId,
-              oldItemId != newItemId else {
-            return
-        }
-
-        let oldMessageId = "rtv-\(oldItemId)"
-        let newMessageId = "rtv-\(newItemId)"
-        guard oldMessageId != newMessageId else { return }
-
-        if let oldIndex = session.transcriptHistory.firstIndex(where: { $0.id == oldMessageId }) {
-            let oldEntry = session.transcriptHistory[oldIndex]
-            let mergedEntry = VoiceSessionTranscriptEntry(
-                id: newMessageId,
-                speaker: speaker,
-                text: oldEntry.text,
-                timestamp: oldEntry.timestamp
-            )
-
-            if let existingNewIndex = session.transcriptHistory.firstIndex(where: { $0.id == newMessageId }) {
-                let existingNew = session.transcriptHistory[existingNewIndex]
-                let preferredText = existingNew.text.count >= mergedEntry.text.count ? existingNew.text : mergedEntry.text
-                let preferredTimestamp = oldIndex <= existingNewIndex ? oldEntry.timestamp : existingNew.timestamp
-                let replacement = VoiceSessionTranscriptEntry(
-                    id: newMessageId,
-                    speaker: speaker,
-                    text: preferredText,
-                    timestamp: preferredTimestamp
-                )
-
-                if oldIndex < existingNewIndex {
-                    session.transcriptHistory[oldIndex] = replacement
-                    session.transcriptHistory.remove(at: existingNewIndex)
-                } else {
-                    session.transcriptHistory[existingNewIndex] = replacement
-                    session.transcriptHistory.remove(at: oldIndex)
-                }
-            } else {
-                session.transcriptHistory[oldIndex] = mergedEntry
-            }
-        }
-
-        if session.transcriptLiveMessageID == oldMessageId {
-            session.transcriptLiveMessageID = newMessageId
-        }
-    }
-
-    private func flushRealtimeTranscriptIfNeeded(
-        for key: ThreadKey,
-        session: inout VoiceSessionState,
-        speaker: String? = nil
-    ) {
-        let resolvedSpeaker = speaker ?? session.transcriptSpeaker
-        guard let resolvedSpeaker,
-              let text = session.transcriptText?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else {
-            return
-        }
-
-        let role: String
-        switch resolvedSpeaker {
-        case "You":
-            role = "user"
-        case "Codex":
-            role = "assistant"
-        default:
-            return
-        }
-
-        let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
-        let itemId = (role == "user" ? pending.user : pending.assistant) ?? UUID().uuidString
-        appendFinalRealtimeMessage(role: role, text: text, itemId: itemId, to: &session)
-
-        if session.transcriptSpeaker == resolvedSpeaker {
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-        }
-    }
-
-    private func shouldSkipRealtimeTranscriptDelta(
-        _ delta: String,
-        speaker: String,
-        for key: ThreadKey
-    ) -> Bool {
-        let now = CFAbsoluteTimeGetCurrent()
-        if let previous = lastRealtimeTranscriptDelta[key],
-           previous.speaker == speaker,
-           previous.delta == delta,
-           now - previous.timestamp < 0.5 {
-            return true
-        }
-        lastRealtimeTranscriptDelta[key] = (speaker: speaker, delta: delta, timestamp: now)
-        return false
-    }
-
-    private func applyRealtimeTranscriptDelta(
-        _ delta: String,
-        speaker: String,
-        phase: VoiceSessionPhase,
-        key: ThreadKey,
-        session: inout VoiceSessionState
-    ) {
-        guard !delta.isEmpty else { return }
-        guard !shouldSkipRealtimeTranscriptDelta(delta, speaker: speaker, for: key) else { return }
-
-        let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
-        let pendingItemID: String
-        if speaker == "You" {
-            pendingItemID = pending.user ?? UUID().uuidString
-            if pending.user == nil {
-                pendingRealtimeMessageIDs[key] = (pendingItemID, pending.assistant)
-            }
-        } else {
-            let existingAssistantId = pending.assistant
-            let shouldRotateAssistantRow: Bool = {
-                guard let existingAssistantId else { return true }
-                if isProvisionalRealtimeMessageID(existingAssistantId) {
-                    return false
-                }
-                let existingMessageId = "rtv-\(existingAssistantId)"
-                let hasPersistedText = session.transcriptHistory.contains(where: {
-                    $0.id == existingMessageId && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                })
-                let isCurrentLive = session.transcriptLiveMessageID == existingMessageId
-                return hasPersistedText && !isCurrentLive
-            }()
-
-            if shouldRotateAssistantRow {
-                pendingItemID = UUID().uuidString
-                pendingRealtimeMessageIDs[key] = (pending.user, pendingItemID)
-            } else {
-                pendingItemID = existingAssistantId ?? UUID().uuidString
-                if existingAssistantId == nil {
-                    pendingRealtimeMessageIDs[key] = (pending.user, pendingItemID)
-                }
-            }
-        }
-
-        let messageId = "rtv-\(pendingItemID)"
-        let existingHistoryText = session.transcriptHistory.first(where: { $0.id == messageId })?.text
-        let liveTextForSpeaker: String? = (
-            session.transcriptSpeaker == speaker && session.transcriptLiveMessageID == messageId
-        ) ? session.transcriptText : nil
-        let existing = liveTextForSpeaker ?? existingHistoryText ?? ""
-
-        let mergedText: String
-        if existing == delta || existing.hasSuffix(delta) {
-            mergedText = existing
-        } else if delta.hasPrefix(existing) {
-            mergedText = delta
-        } else if existing.hasPrefix(delta) {
-            mergedText = existing
-        } else {
-            mergedText = existing + delta
-        }
-
-        appendFinalRealtimeMessage(role: speaker == "You" ? "user" : "assistant", text: mergedText, itemId: pendingItemID, to: &session)
-
-        let shouldPromoteToLive: Bool
-        if session.transcriptSpeaker == nil || session.transcriptSpeaker == speaker {
-            shouldPromoteToLive = true
-        } else {
-            // When the backend emits a late transcript replacement for the
-            // previous speaker after the next speaker has already started,
-            // keep the current live speaker on screen and just update the
-            // previous speaker's persisted row in history.
-            shouldPromoteToLive = existingHistoryText == nil
-        }
-
-        if shouldPromoteToLive {
-            session.transcriptText = mergedText
-            session.transcriptSpeaker = speaker
-            session.transcriptLiveMessageID = messageId
-            session.phase = phase
-        }
-
-        activeVoiceSession = session
-        syncVoiceCallActivity()
     }
 
     private func handleRealtimeItemAdded(serverId: String, data: Data) {
@@ -3197,349 +2889,32 @@ final class ServerManager {
         ) else {
             return
         }
-        handleRealtimeItemAdded(
-            serverId: serverId,
-            threadId: notification.threadId,
-            item: notification.item
-        )
-    }
-
-    private func handleRealtimeItemAdded(serverId: String, threadId: String, item rawItem: Any?) {
-        let key = ThreadKey(serverId: serverId, threadId: threadId)
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
         guard var session = activeVoiceSession,
-              session.threadKey == key else {
+              session.threadKey == key,
+              let item = notification.item.value as? [String: Any],
+              (extractString(item, keys: ["type"]) ?? "") == "message" else {
             return
         }
 
-        let item: [String: Any]
-        if let dict = rawItem as? [String: Any] {
-            item = dict
-        } else if let codable = rawItem as? AnyCodable, let dict = codable.value as? [String: Any] {
-            item = dict
-        } else {
-            return
+        let role = extractString(item, keys: ["role"]) ?? "assistant"
+        let content = item["content"] as? [[String: Any]] ?? []
+        let text = content.compactMap { part -> String? in
+            guard (extractString(part, keys: ["type"]) ?? "") == "text" else { return nil }
+            return extractString(part, keys: ["text"])
         }
+        .joined(separator: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let itemType = extractString(item, keys: ["type"]) ?? ""
-
-        if itemType != "input_transcript_delta" && itemType != "output_transcript_delta" {
-            if let rawJSON = try? JSONSerialization.data(withJSONObject: item, options: [.fragmentsAllowed]),
-               let rawString = String(data: rawJSON, encoding: .utf8) {
-                NSLog("[rtv] itemAdded type=%@ raw=%@", itemType, String(rawString.prefix(500)))
-            }
-        }
-
-        switch itemType {
-        case "message":
-            let role = extractString(item, keys: ["role"]) ?? "assistant"
-            let itemId = extractString(item, keys: ["id"]) ?? UUID().uuidString
-            let content = item["content"] as? [[String: Any]] ?? []
-
-            if role == "user" {
-                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "Codex")
-                voiceSessionCoordinator.flushPlayback()
-                let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
-                if let pendingUserId = pending.user,
-                   isProvisionalRealtimeMessageID(pendingUserId),
-                   (session.transcriptHistory.contains(where: { $0.id == "rtv-\(pendingUserId)" }) ||
-                    session.transcriptLiveMessageID == "rtv-\(pendingUserId)") {
-                    rekeyRealtimeTranscriptMessage(
-                        from: pendingUserId,
-                        to: itemId,
-                        speaker: "You",
-                        session: &session
-                    )
-                }
-                pendingRealtimeMessageIDs[key] = (itemId, pending.assistant)
-                reserveRealtimeTranscriptMessage(role: role, itemId: itemId, to: &session)
-            } else {
-                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "You")
-                let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
-                if let pendingAssistantId = pending.assistant,
-                   isProvisionalRealtimeMessageID(pendingAssistantId),
-                   (session.transcriptHistory.contains(where: { $0.id == "rtv-\(pendingAssistantId)" }) ||
-                    session.transcriptLiveMessageID == "rtv-\(pendingAssistantId)") {
-                    rekeyRealtimeTranscriptMessage(
-                        from: pendingAssistantId,
-                        to: itemId,
-                        speaker: "Codex",
-                        session: &session
-                    )
-                }
-                pendingRealtimeMessageIDs[key] = (pending.user, itemId)
-                reserveRealtimeTranscriptMessage(role: role, itemId: itemId, to: &session)
-            }
-
-            let text = content.compactMap { part -> String? in
-                guard (extractString(part, keys: ["type"]) ?? "") == "text" else { return nil }
-                return extractString(part, keys: ["text"])
-            }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            if text.isEmpty {
-                if role == "user", session.transcriptSpeaker == "You" {
-                    session.transcriptLiveMessageID = "rtv-\(itemId)"
-                } else if role == "assistant", session.transcriptSpeaker == "Codex" {
-                    session.transcriptLiveMessageID = "rtv-\(itemId)"
-                }
-                activeVoiceSession = session
-                return
-            }
-
-            appendVoiceSessionDebug("<- thread/realtime/itemAdded role=\(role) text=\(text)", to: &session)
-
-            appendFinalRealtimeMessage(role: role, text: text, itemId: itemId, to: &session)
-
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-            if role == "assistant", !session.isSpeaking {
-                session.phase = .thinking
-            }
-            activeVoiceSession = session
-            syncVoiceCallActivity()
-
-        case "input_transcript_delta", "output_transcript_delta":
-            let delta = extractString(item, keys: ["delta"]) ?? ""
-            guard !delta.isEmpty else { return }
-            let speaker = itemType == "input_transcript_delta" ? "You" : "Codex"
-            let phase: VoiceSessionPhase = itemType == "input_transcript_delta" ? .listening : .speaking
-            applyRealtimeTranscriptDelta(
-                delta,
-                speaker: speaker,
-                phase: phase,
-                key: key,
-                session: &session
-            )
-
-        case "handoff_request":
-            flushRealtimeTranscriptIfNeeded(for: key, session: &session)
-            let handoffId = extractString(item, keys: ["handoff_id"]) ?? UUID().uuidString
-            let inputTranscript = extractString(item, keys: ["input_transcript"]) ?? ""
-            let transcriptEntries = (item["active_transcript"] as? [[String: Any]]) ?? []
-            let activeTranscript = transcriptEntries
-                .compactMap { entry -> String? in
-                    guard let role = entry["role"] as? String,
-                          let text = entry["text"] as? String else {
-                        return nil
-                    }
-                    return "\(role): \(text)"
-                }
-                .joined(separator: "\n")
-            let transcript = activeTranscript.isEmpty ? inputTranscript : activeTranscript
-
-            appendVoiceSessionDebug(
-                "<- thread/realtime/itemAdded handoff_request id=\(handoffId) transcript=\(transcript)",
-                to: &session
-            )
-
-            let server = extractString(item, keys: ["server"])
-            let userRequest = inputTranscript.isEmpty
-                ? (transcript.isEmpty ? (session.transcriptText ?? "") : transcript)
-                : inputTranscript
-
-            let targetServerId: String?
-            let targetServerName: String
-            let isLocal: Bool
-            if let server, server == "local" {
-                targetServerId = Self.localServerID
-                targetServerName = "local"
-                isLocal = true
-            } else if let server,
-                      let (serverId, connection) = connections.first(where: {
-                          $0.key != Self.localServerID &&
-                          $0.value.server.name.caseInsensitiveCompare(server) == .orderedSame
-                      }) {
-                targetServerId = serverId
-                targetServerName = connection.server.name
-                isLocal = false
-            } else {
-                targetServerId = nil
-                targetServerName = server ?? "unknown"
-                isLocal = false
-            }
-
-            let agentLabel = isLocal ? "local" : targetServerName
-            threads[key]?.items.append(
-                ConversationItem(
-                    id: "rtv-handoff-\(handoffId)",
-                    content: .multiAgentAction(
-                        ConversationMultiAgentActionData(
-                            tool: "handoff",
-                            status: "in_progress",
-                            prompt: userRequest.isEmpty ? nil : userRequest,
-                            targets: [agentLabel],
-                            receiverThreadIds: [],
-                            agentStates: [ConversationMultiAgentState(
-                                targetId: agentLabel,
-                                status: "running",
-                                message: nil
-                            )]
-                        )
-                    ),
-                    timestamp: Date()
-                )
-            )
-            threads[key]?.updatedAt = Date()
-
-            session.phase = .handoff
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-            activeVoiceSession = session
-            syncVoiceCallActivity()
-
-            if let targetServerId {
-                if isLocal {
-                    Task { [weak self] in
-                        await self?.routeHandoffToLocalCodex(
-                            localKey: key,
-                            handoffId: handoffId,
-                            transcript: userRequest
-                        )
-                    }
-                } else {
-                    Task { [weak self] in
-                        await self?.routeHandoffToRemote(
-                            localKey: key,
-                            remoteServerId: targetServerId,
-                            handoffId: handoffId,
-                            transcript: userRequest
-                        )
-                    }
-                }
-            } else {
-                Task { [weak self] in
-                    await self?.resolveHandoffLocally(
-                        localKey: key,
-                        handoffId: handoffId,
-                        text: "Server '\(targetServerName)' is not available."
-                    )
-                }
-            }
-
-        case "tool_call_request":
-            flushRealtimeTranscriptIfNeeded(for: key, session: &session)
-            let callId = extractString(item, keys: ["call_id", "callId", "id"]) ?? UUID().uuidString
-            let tool = extractString(item, keys: ["tool", "name"]) ?? ""
-            let arguments = realtimeToolCallArguments(from: item["arguments"])
-
-            appendVoiceSessionDebug(
-                "<- thread/realtime/itemAdded tool_call_request id=\(callId) tool=\(tool)",
-                to: &session
-            )
-
+        guard !text.isEmpty else { return }
+        appendVoiceSessionDebug("<- thread/realtime/itemAdded role=\(role) text=\(text)", to: &session)
+        session.transcriptText = text
+        session.transcriptSpeaker = role == "assistant" ? "Codex" : "You"
+        if role == "assistant", !session.isSpeaking {
             session.phase = .thinking
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-            activeVoiceSession = session
-            syncVoiceCallActivity()
-
-            Task { @MainActor [weak self] in
-                await self?.handleRealtimeToolCallRequest(
-                    localKey: key,
-                    callId: callId,
-                    tool: tool,
-                    arguments: arguments
-                )
-            }
-
-        case "speech_started":
-            voiceSessionCoordinator.flushPlayback()
-            let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
-            pendingRealtimeMessageIDs[key] = (nil, pending.assistant)
-            if session.transcriptSpeaker == "Codex" {
-                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "Codex")
-            } else if session.transcriptSpeaker != "You" {
-                session.transcriptText = nil
-                session.transcriptSpeaker = nil
-                session.transcriptLiveMessageID = nil
-            }
-            activeVoiceSession = session
-
-        default:
-            appendVoiceSessionDebug(
-                "<- thread/realtime/itemAdded unknown type=\(itemType)",
-                to: &session
-            )
-            activeVoiceSession = session
         }
-    }
-
-    private func realtimeToolCallArguments(from raw: Any?) -> [String: Any] {
-        if let dict = raw as? [String: Any] {
-            return dict
-        }
-        if let codable = raw as? AnyCodable {
-            if let dict = codable.value as? [String: Any] {
-                return dict
-            }
-            if let string = codable.value as? String,
-               let data = string.data(using: .utf8),
-               let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-                return dict
-            }
-        }
-        if let string = raw as? String,
-           let data = string.data(using: .utf8),
-           let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            return dict
-        }
-        return [:]
-    }
-
-    private func handleRealtimeToolCallRequest(
-        localKey: ThreadKey,
-        callId: String,
-        tool: String,
-        arguments: [String: Any]
-    ) async {
-        guard !tool.isEmpty else {
-            await resolveHandoffLocally(
-                localKey: localKey,
-                handoffId: callId,
-                text: "Error: realtime tool call was missing a tool name."
-            )
-            return
-        }
-
-        let result = await dynamicToolResult(for: tool, arguments: arguments)
-        let outputText: String
-        switch result {
-        case .success(let text):
-            outputText = boundedRealtimeHandoffOutput(text)
-        case .failure(let error):
-            outputText = boundedRealtimeHandoffOutput("Error running \(tool): \(error.localizedDescription)")
-        }
-
-        guard let localConnection = connections[localKey.serverId], localConnection.isConnected else {
-            return
-        }
-
-        recordVoiceSessionDebug(
-            "-> resolveHandoff tool_call id=\(callId) tool=\(tool)",
-            for: localKey
-        )
-        do {
-            try await localConnection.resolveRealtimeHandoff(
-                threadId: localKey.threadId,
-                handoffId: callId,
-                outputText: outputText
-            )
-            recordVoiceSessionDebug(
-                "<- resolveHandoff tool_call success id=\(callId)",
-                for: localKey
-            )
-        } catch {
-            recordVoiceSessionDebug(
-                "resolveHandoff tool_call error: \(error.localizedDescription)",
-                for: localKey
-            )
-        }
-
-        await finalizeHandoff(localKey: localKey, handoffId: callId)
+        activeVoiceSession = session
+        syncVoiceCallActivity()
     }
 
     private func handleRealtimeOutputAudioDelta(serverId: String, data: Data) {
@@ -3574,9 +2949,7 @@ final class ServerManager {
             "<- thread/realtime/error threadId=\(notification.threadId) message=\(notification.message)",
             for: key
         )
-        if notification.message.contains("active response in progress") {
-            return
-        }
+        appendVoiceSessionSystemMessage("Realtime voice error: \(notification.message)", to: key)
         failVoiceSession(notification.message)
     }
 
@@ -3590,11 +2963,6 @@ final class ServerManager {
         let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
         guard activeVoiceSession?.threadKey == key else { return }
 
-        if var session = activeVoiceSession, session.threadKey == key {
-            flushRealtimeTranscriptIfNeeded(for: key, session: &session)
-            activeVoiceSession = session
-        }
-
         recordVoiceSessionDebug(
             "<- thread/realtime/closed threadId=\(notification.threadId) reason=\(notification.reason ?? "nil")",
             for: key
@@ -3605,330 +2973,24 @@ final class ServerManager {
             endVoiceSessionImmediately()
             return
         }
+        if !reason.isEmpty, reason != "requested" {
+            appendVoiceSessionSystemMessage("Realtime voice closed: \(reason)", to: key)
+        }
         failVoiceSession(reason.isEmpty ? "Voice session closed" : reason)
     }
 
-    private func connectedRemoteServers() -> [(name: String, hostname: String)] {
-        connections.values.compactMap { connection in
-            guard connection.id != Self.localServerID, connection.isConnected else {
-                return nil
-            }
-            return (name: connection.server.name, hostname: connection.server.hostname)
-        }
-    }
-
-    private func routeHandoffToLocalCodex(
-        localKey: ThreadKey,
-        handoffId: String,
-        transcript: String
-    ) async {
-        guard connections[Self.localServerID]?.isConnected == true else {
-            await resolveHandoffLocally(
-                localKey: localKey,
-                handoffId: handoffId,
-                text: "Local server is disconnected."
+    private func appendVoiceSessionSystemMessage(_ message: String, to key: ThreadKey) {
+        guard let thread = threads[key] else { return }
+        thread.items.append(
+            ConversationItem(
+                id: UUID().uuidString,
+                content: .note(
+                    ConversationNoteData(title: "Voice", body: message)
+                ),
+                timestamp: Date()
             )
-            return
-        }
-
-        let handoffKey: ThreadKey
-        if let existing = voiceHandoffThreads[Self.localServerID], threads[existing] != nil {
-            handoffKey = existing
-            recordVoiceSessionDebug("reusing local handoff thread=\(existing.threadId)", for: localKey)
-        } else {
-            do {
-                let key = try await startThread(
-                    serverId: Self.localServerID,
-                    cwd: "/",
-                    approvalPolicy: "never",
-                    dynamicTools: localHandoffDynamicToolSpecs(),
-                    activate: false
-                )
-                voiceHandoffThreads[Self.localServerID] = key
-                handoffKey = key
-                recordVoiceSessionDebug("created local handoff thread=\(key.threadId)", for: localKey)
-            } catch {
-                await resolveHandoffLocally(
-                    localKey: localKey,
-                    handoffId: handoffId,
-                    text: "Failed to start local thread: \(error.localizedDescription)"
-                )
-                return
-            }
-        }
-
-        updateHandoffItem(handoffId: handoffId, threadKey: handoffKey, voiceThreadKey: localKey)
-        handoffThreadKeys[handoffId] = handoffKey
-        if var session = activeVoiceSession, session.threadKey == localKey {
-            session.handoffRemoteThreadKey = handoffKey
-            activeVoiceSession = session
-        }
-
-        let baseItemCount = threads[handoffKey]?.items.count ?? 0
-        guard let localConnection = connections[Self.localServerID] else { return }
-        do {
-            try await localConnection.sendTurn(
-                threadId: handoffKey.threadId,
-                text: transcript,
-                approvalPolicy: "never"
-            )
-        } catch {
-            await resolveHandoffLocally(
-                localKey: localKey,
-                handoffId: handoffId,
-                text: "Failed to send local turn: \(error.localizedDescription)"
-            )
-            return
-        }
-
-        await streamRemoteItemsToHandoff(
-            localKey: localKey,
-            remoteKey: handoffKey,
-            handoffId: handoffId,
-            baseItemCount: baseItemCount,
-            timeout: 120
         )
-    }
-
-    private func routeHandoffToRemote(
-        localKey: ThreadKey,
-        remoteServerId: String,
-        handoffId: String,
-        transcript: String
-    ) async {
-        guard let remoteConnection = connections[remoteServerId], remoteConnection.isConnected else {
-            await resolveHandoffLocally(
-                localKey: localKey,
-                handoffId: handoffId,
-                text: "Remote server is disconnected."
-            )
-            return
-        }
-
-        let remoteKey: ThreadKey
-        if let existing = voiceHandoffThreads[remoteServerId], threads[existing] != nil {
-            remoteKey = existing
-            recordVoiceSessionDebug("reusing remote thread=\(existing.threadId)", for: localKey)
-        } else {
-            do {
-                let key = try await startThread(
-                    serverId: remoteServerId,
-                    cwd: remoteConnection.server.hostname == "localhost" ? "/" : "/tmp",
-                    approvalPolicy: "never",
-                    sandboxMode: "danger-full-access",
-                    activate: false
-                )
-                voiceHandoffThreads[remoteServerId] = key
-                remoteKey = key
-                recordVoiceSessionDebug("started remote thread=\(key.threadId)", for: localKey)
-            } catch {
-                await resolveHandoffLocally(
-                    localKey: localKey,
-                    handoffId: handoffId,
-                    text: "Failed to start remote thread: \(error.localizedDescription)"
-                )
-                return
-            }
-        }
-
-        updateHandoffItem(handoffId: handoffId, threadKey: remoteKey, voiceThreadKey: localKey)
-        handoffThreadKeys[handoffId] = remoteKey
-        if var session = activeVoiceSession, session.threadKey == localKey {
-            session.handoffRemoteThreadKey = remoteKey
-            activeVoiceSession = session
-        }
-
-        let turnModel = handoffModel?.isEmpty == false ? handoffModel : nil
-        let turnEffort = handoffEffort?.isEmpty == false ? handoffEffort : nil
-        let turnServiceTier: String? = handoffFastMode ? "flex" : nil
-        let baseItemCount = threads[remoteKey]?.items.count ?? 0
-        do {
-            try await remoteConnection.sendTurn(
-                threadId: remoteKey.threadId,
-                text: transcript,
-                approvalPolicy: "never",
-                model: turnModel,
-                effort: turnEffort,
-                serviceTier: turnServiceTier
-            )
-        } catch {
-            await resolveHandoffLocally(
-                localKey: localKey,
-                handoffId: handoffId,
-                text: "Failed to send turn to remote server: \(error.localizedDescription)"
-            )
-            return
-        }
-
-        await streamRemoteItemsToHandoff(
-            localKey: localKey,
-            remoteKey: remoteKey,
-            handoffId: handoffId,
-            baseItemCount: baseItemCount,
-            timeout: 120
-        )
-    }
-
-    private func streamRemoteItemsToHandoff(
-        localKey: ThreadKey,
-        remoteKey: ThreadKey,
-        handoffId: String,
-        baseItemCount: Int,
-        timeout: Int
-    ) async {
-        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
-        var turnStarted = false
-
-        while Date() < deadline {
-            if let thread = threads[remoteKey], thread.hasTurnActive {
-                turnStarted = true
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-
-        guard turnStarted else {
-            recordVoiceSessionDebug("remote turn did not start within timeout", for: localKey)
-            await finalizeHandoff(localKey: localKey, handoffId: handoffId)
-            return
-        }
-
-        var sentText: [String: String] = [:]
-
-        while Date() < deadline {
-            guard let thread = threads[remoteKey] else { break }
-            guard let localConnection = connections[localKey.serverId], localConnection.isConnected else { break }
-
-            let turnActive = thread.hasTurnActive
-            let currentItems = Array(thread.items.suffix(from: min(baseItemCount, thread.items.count)))
-
-            for item in currentItems {
-                let text = extractItemText(item)
-                guard !text.isEmpty else { continue }
-                if sentText[item.id] == text { continue }
-                if turnActive, case .assistant = item.content, item.id == currentItems.last?.id {
-                    continue
-                }
-
-                sentText[item.id] = text
-                do {
-                    try await localConnection.resolveRealtimeHandoff(
-                        threadId: localKey.threadId,
-                        handoffId: handoffId,
-                        outputText: boundedRealtimeHandoffOutput(text)
-                    )
-                } catch {
-                    recordVoiceSessionDebug("resolveHandoff stream error: \(error.localizedDescription)", for: localKey)
-                }
-            }
-
-            if !turnActive {
-                recordVoiceSessionDebug("<- handoff turn complete (\(sentText.count) items streamed)", for: localKey)
-                break
-            }
-
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-
-        if sentText.isEmpty,
-           let localConnection = connections[localKey.serverId],
-           localConnection.isConnected {
-            do {
-                try await localConnection.resolveRealtimeHandoff(
-                    threadId: localKey.threadId,
-                    handoffId: handoffId,
-                    outputText: boundedRealtimeHandoffOutput("(No response)")
-                )
-            } catch {
-                recordVoiceSessionDebug("resolveHandoff placeholder error: \(error.localizedDescription)", for: localKey)
-            }
-        }
-
-        await finalizeHandoff(localKey: localKey, handoffId: handoffId)
-    }
-
-    private func updateHandoffItem(handoffId: String, threadKey: ThreadKey, voiceThreadKey: ThreadKey) {
-        let itemId = "rtv-handoff-\(handoffId)"
-        guard let thread = threads[voiceThreadKey],
-              let index = thread.items.firstIndex(where: { $0.id == itemId }),
-              case .multiAgentAction(var data) = thread.items[index].content else {
-            return
-        }
-        data.receiverThreadIds = [threadKey.threadId]
-        thread.items[index].content = .multiAgentAction(data)
-        ensureThreadExistsByKey(serverId: threadKey.serverId, threadId: threadKey.threadId)
-        threads[threadKey]?.requiresOpenHydration = false
-    }
-
-    private func completeHandoffItem(handoffId: String, voiceThreadKey: ThreadKey) {
-        let itemId = "rtv-handoff-\(handoffId)"
-        guard let thread = threads[voiceThreadKey],
-              let index = thread.items.firstIndex(where: { $0.id == itemId }),
-              case .multiAgentAction(var data) = thread.items[index].content else {
-            return
-        }
-        data.status = "completed"
-        for idx in data.agentStates.indices {
-            data.agentStates[idx].status = "completed"
-        }
-        thread.items[index].content = .multiAgentAction(data)
-    }
-
-    private func extractItemText(_ item: ConversationItem) -> String {
-        switch item.content {
-        case .assistant(let data):
-            return truncateTextForToolOutput(data.text, maxBytes: 12_000)
-        default:
-            return ""
-        }
-    }
-
-    private func boundedRealtimeHandoffOutput(_ text: String) -> String {
-        truncateTextForToolOutput(text, maxBytes: 180_000)
-    }
-
-    private func finalizeHandoff(localKey: ThreadKey, handoffId: String) async {
-        guard let localConnection = connections[localKey.serverId], localConnection.isConnected else {
-            return
-        }
-        recordVoiceSessionDebug("-> finalizeHandoff handoffId=\(handoffId)", for: localKey)
-        do {
-            try await localConnection.finalizeRealtimeHandoff(
-                threadId: localKey.threadId,
-                handoffId: handoffId
-            )
-            recordVoiceSessionDebug("<- finalizeHandoff success", for: localKey)
-        } catch {
-            recordVoiceSessionDebug("finalizeHandoff error: \(error.localizedDescription)", for: localKey)
-        }
-
-        completeHandoffItem(handoffId: handoffId, voiceThreadKey: localKey)
-        if var session = activeVoiceSession,
-           session.threadKey == localKey {
-            if session.phase == .handoff {
-                session.phase = .listening
-            }
-            session.handoffRemoteThreadKey = nil
-            activeVoiceSession = session
-            syncVoiceCallActivity()
-        }
-        handoffThreadKeys.removeValue(forKey: handoffId)
-    }
-
-    private func resolveHandoffLocally(localKey: ThreadKey, handoffId: String, text: String) async {
-        guard let localConnection = connections[localKey.serverId], localConnection.isConnected else {
-            return
-        }
-        do {
-            try await localConnection.resolveRealtimeHandoff(
-                threadId: localKey.threadId,
-                handoffId: handoffId,
-                outputText: boundedRealtimeHandoffOutput(text)
-            )
-        } catch {
-            recordVoiceSessionDebug("resolveHandoff fallback error: \(error.localizedDescription)", for: localKey)
-        }
-        await finalizeHandoff(localKey: localKey, handoffId: handoffId)
+        thread.updatedAt = Date()
     }
 
     private func failVoiceSession(_ message: String) {
@@ -3940,8 +3002,6 @@ final class ServerManager {
             endVoiceSessionImmediately()
             return
         }
-
-        flushRealtimeTranscriptIfNeeded(for: session.threadKey, session: &session)
 
         session.phase = .error
         session.lastError = message
@@ -3955,9 +3015,6 @@ final class ServerManager {
     }
 
     private func endVoiceSessionImmediately() {
-        if let activeKey = activeVoiceSession?.threadKey {
-            pendingRealtimeMessageIDs.removeValue(forKey: activeKey)
-        }
         voiceInputDecayToken = nil
         voiceOutputDecayToken = nil
         voiceStopRequestedThreadKey = nil
@@ -3969,8 +3026,6 @@ final class ServerManager {
             activeThreadKey = nil
         }
         voicePreviousActiveThreadKey = nil
-        voiceHandoffThreads.removeAll()
-        handoffThreadKeys.removeAll()
         activeVoiceSession = nil
         endVoiceCallActivity()
     }
