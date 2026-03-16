@@ -215,6 +215,10 @@ final class ServerManager {
         connections.values.contains { $0.isConnected }
     }
 
+    var hasInstalledNetworkMonitorCallbacks: Bool {
+        networkMonitor.onNetworkLost != nil && networkMonitor.onNetworkRestored != nil
+    }
+
     private func debugAgentDirectoryLog(_ message: @autoclosure () -> String) {
         _ = message
     }
@@ -294,6 +298,8 @@ final class ServerManager {
     // MARK: - Server Lifecycle
 
     func addServer(_ server: DiscoveredServer, target: ConnectionTarget) async {
+        startNetworkMonitorIfNeeded()
+
         if let existing = connections[server.id] {
             if existing.server == server && existing.target == target {
                 configureConnectionCallbacks(existing, serverId: server.id)

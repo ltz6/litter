@@ -102,6 +102,7 @@ struct LitterApp: App {
 struct ContentView: View {
     @ObserveInjection var inject
     @Environment(ServerManager.self) private var serverManager
+    @Environment(ThemeManager.self) private var themeManager
     @State private var appState = AppState()
     @State private var stableSafeAreaInsets = StableSafeAreaInsets()
     @State private var conversationWarmup = ConversationWarmupCoordinator()
@@ -120,6 +121,7 @@ struct ContentView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
+                .id(themeManager.themeVersion)
 
                 if let approval = serverManager.activePendingApproval {
                     ApprovalPromptView(approval: approval) { decision in

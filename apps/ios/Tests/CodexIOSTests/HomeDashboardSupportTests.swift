@@ -82,6 +82,25 @@ final class HomeDashboardSupportTests: XCTestCase {
         XCTAssertFalse(discovered.hasCodexServer)
     }
 
+    func testAddServerInstallsNetworkMonitorCallbacks() async {
+        let manager = ServerManager()
+        let server = DiscoveredServer(
+            id: "network-monitor-test",
+            name: "Network Monitor Test",
+            hostname: "network-monitor-test.local",
+            port: 8390,
+            source: .manual,
+            hasCodexServer: true
+        )
+        defer { manager.removeServer(id: server.id) }
+
+        XCTAssertFalse(manager.hasInstalledNetworkMonitorCallbacks)
+
+        await manager.addServer(server, target: .remote(host: "", port: 8390))
+
+        XCTAssertTrue(manager.hasInstalledNetworkMonitorCallbacks)
+    }
+
     func testHomeDashboardModelRefreshesWhenObservedConnectionChanges() async {
         let server = DiscoveredServer(
             id: "server-a",
