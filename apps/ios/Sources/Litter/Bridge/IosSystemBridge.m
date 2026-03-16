@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <TargetConditionals.h>
 #include <Foundation/Foundation.h>
 
@@ -13,6 +14,20 @@
 // slice), so we use popen here instead.
 
 void codex_ios_system_init(void) {}
+
+NSString *codex_ios_default_cwd(void) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!docs) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *dirs = @[@"home/codex", @"tmp", @"var/log", @"etc"];
+    for (NSString *dir in dirs) {
+        NSString *path = [docs stringByAppendingPathComponent:dir];
+        if (![fm fileExistsAtPath:path]) {
+            [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+    }
+    return [docs stringByAppendingPathComponent:@"home/codex"];
+}
 
 int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t *output_len) {
     *output = NULL;
@@ -87,6 +102,9 @@ extern void ios_waitpid(pid_t pid);
 extern pid_t ios_currentPid(void);
 extern bool joinMainThread;
 extern void initializeEnvironment(void);
+extern void ios_switchSession(const void *sessionid);
+extern void ios_setContext(const void *context);
+extern __thread void *thread_context;
 extern NSError *addCommandList(NSString *fileLocation);
 
 static NSString *codex_find_command_plist(NSString *name) {
@@ -131,10 +149,68 @@ static void codex_load_command_list(NSString *name) {
     }
 }
 
+/// Returns the sandbox root (~/Documents), creating a Unix-like directory layout inside it.
+static NSString *codex_sandbox_root(void) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!docs) return nil;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *dirs = @[
+        @"home/codex",
+        @"tmp",
+        @"var/log",
+        @"etc",
+    ];
+    for (NSString *dir in dirs) {
+        NSString *path = [docs stringByAppendingPathComponent:dir];
+        if (![fm fileExistsAtPath:path]) {
+            [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+    }
+
+    return docs;
+}
+
+static FILE *codex_ios_command_stdin(void) {
+    static FILE *nullInput = NULL;
+    if (nullInput == NULL) {
+        nullInput = fopen("/dev/null", "r");
+    }
+    return nullInput != NULL ? nullInput : stdin;
+}
+
+static const char *codex_ios_session_name(void) {
+    static __thread char *sessionName = NULL;
+    if (sessionName == NULL) {
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "codex_session_%p", (void *)pthread_self());
+        sessionName = strdup(buffer);
+    }
+    return sessionName;
+}
+
+/// Returns the default working directory for codex sessions (/home/codex inside the sandbox).
+NSString *codex_ios_default_cwd(void) {
+    NSString *root = codex_sandbox_root();
+    if (!root) return nil;
+    return [root stringByAppendingPathComponent:@"home/codex"];
+}
+
 void codex_ios_system_init(void) {
     initializeEnvironment();
     codex_load_command_list(@"commandDictionary");
     codex_load_command_list(@"extraCommandsDictionary");
+
+    // Set up the sandbox filesystem layout.
+    NSString *root = codex_sandbox_root();
+
+    // Configure environment for bundled tools.
+    NSString *home = NSHomeDirectory();
+    if (home) {
+        // SSH/curl config directories.
+        setenv("SSH_HOME", [root stringByAppendingPathComponent:@"home/codex"].UTF8String, 0);
+        setenv("CURL_HOME", [root stringByAppendingPathComponent:@"home/codex"].UTF8String, 0);
+    }
 }
 
 int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t *output_len) {
@@ -142,6 +218,16 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
     *output_len = 0;
 
     NSLog(@"[ios-system] run cmd='%s' cwd='%s'", cmd, cwd ? cwd : "(null)");
+
+    // ios_system treats both session IDs and session contexts as C strings and
+    // compares them with strcmp(). Using an Objective-C object pointer here
+    // leads to undefined behavior once signal handling checks the session.
+    const char *sessionName = codex_ios_session_name();
+    ios_setContext(NULL);
+    thread_context = NULL;
+    ios_switchSession(sessionName);
+    ios_setContext(sessionName);
+    thread_context = (void *)sessionName;
 
     int old_cwd_fd = open(".", O_RDONLY);
     if (cwd) {
@@ -152,23 +238,18 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
             [fm createDirectoryAtPath:cwdStr withIntermediateDirectories:YES attributes:nil error:nil];
         }
         if (chdir(cwd) != 0) {
-            NSLog(@"[ios-system] chdir FAILED errno=%d (%s) for cwd='%s', falling back to Documents", errno, strerror(errno), cwd);
-            // Fall back to the app's Documents directory.
-            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-            if (docs && chdir(docs.UTF8String) != 0) {
-                NSLog(@"[ios-system] fallback chdir to Documents also FAILED");
+            NSLog(@"[ios-system] chdir FAILED errno=%d (%s) for cwd='%s', falling back to /home/codex", errno, strerror(errno), cwd);
+            NSString *fallback = codex_ios_default_cwd();
+            if (!fallback || chdir(fallback.UTF8String) != 0) {
+                NSLog(@"[ios-system] fallback chdir also FAILED");
                 if (old_cwd_fd >= 0) close(old_cwd_fd);
                 return -1;
             }
         }
     }
 
-    // Use ios_setStreams to capture output via a temp file.
-    // joinMainThread=true makes ios_system block until all sub-commands finish.
-    // We intentionally NEVER fclose the FILE* — ios_system's background
-    // thread cleanup accesses it after return and crashes in flockfile if
-    // we close it. The FILE* is leaked but the temp file is unlinked, so
-    // the kernel reclaims it when all fds/FILE*s are released naturally.
+    // Capture output via a temp file. We intentionally NEVER fclose the FILE* —
+    // ios_system's background thread cleanup may still reference it.
     NSString *tmpDir = NSTemporaryDirectory();
     NSString *tmpPath = [tmpDir stringByAppendingPathComponent:
         [NSString stringWithFormat:@"codex_exec_%u.tmp", arc4random()]];
@@ -181,34 +262,40 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
 
     bool savedJoin = joinMainThread;
     joinMainThread = true;
-    ios_setStreams(NULL, wf, wf);
+    ios_setStreams(codex_ios_command_stdin(), wf, wf);
     int code = ios_system(cmd);
     joinMainThread = savedJoin;
     fflush(wf);
-    // DO NOT fclose(wf) — ios_system threads may still reference it.
-    ios_setStreams(NULL, stdout, stderr);
+    ios_setStreams(stdin, stdout, stderr);
 
-    NSLog(@"[ios-system] ios_system code=%d for cmd='%s'", code, cmd);
+    // Read captured output.
+    NSData *data = [NSData dataWithContentsOfFile:tmpPath];
+    unlink(tmpPath.UTF8String);
+
+    size_t total = 0;
+    char *buf = NULL;
+    if (data.length > 0) {
+        buf = malloc(data.length + 1);
+        if (buf) {
+            memcpy(buf, data.bytes, data.length);
+            total = data.length;
+        }
+    }
+
+    NSLog(@"[ios-system] code=%d output_len=%zu for cmd='%s'", code, total, cmd);
 
     if (old_cwd_fd >= 0) {
         fchdir(old_cwd_fd);
         close(old_cwd_fd);
     }
 
-    // Read the output from the temp file via a separate fd.
-    NSData *data = [NSData dataWithContentsOfFile:tmpPath];
-    unlink(tmpPath.UTF8String);
-
-    if (data.length == 0) {
-        return code;
+    if (buf && total > 0) {
+        buf[total] = '\0';
+        *output = buf;
+        *output_len = total;
+    } else {
+        free(buf);
     }
-
-    char *buf = malloc(data.length + 1);
-    if (!buf) { return code; }
-    memcpy(buf, data.bytes, data.length);
-    buf[data.length] = '\0';
-    *output = buf;
-    *output_len = data.length;
     return code;
 }
 
