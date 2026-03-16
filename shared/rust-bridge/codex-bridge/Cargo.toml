@@ -13,6 +13,7 @@ codex-app-server-client = { path = "../../third_party/codex/codex-rs/app-server-
 codex-app-server-protocol = { path = "../../third_party/codex/codex-rs/app-server-protocol" }
 codex-utils-cli = { path = "../../third_party/codex/codex-rs/utils/cli" }
 codex-core = { path = "../../third_party/codex/codex-rs/core" }
+codex-apply-patch = { path = "../../third_party/codex/codex-rs/apply-patch" }
 codex-arg0 = { path = "../../third_party/codex/codex-rs/arg0" }
 codex-feedback = { path = "../../third_party/codex/codex-rs/feedback" }
 codex-cloud-requirements = { path = "../../third_party/codex/codex-rs/cloud-requirements" }

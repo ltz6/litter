@@ -1361,6 +1361,7 @@ dependencies = [
  "codex-app-server",
  "codex-app-server-client",
  "codex-app-server-protocol",
+ "codex-apply-patch",
  "codex-arg0",
  "codex-cloud-requirements",
  "codex-core",

@@ -331,7 +331,13 @@ private struct HomeNavigationView: View {
     }
 
     private func handleNewSessionTap() {
-        if let defaultServerId = defaultNewSessionServerId() {
+        if let defaultServerId = defaultNewSessionServerId(preferredServerId: appState.sessionsSelectedServerFilterId) {
+            // For local on-device server, skip directory picker and use Documents.
+            if let conn = serverManager.connections[defaultServerId], conn.target == .local {
+                let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? NSHomeDirectory()
+                Task { await startNewSession(serverId: defaultServerId, cwd: docs) }
+                return
+            }
             directoryPickerSheet = SessionLaunchSupport.DirectoryPickerSheetModel(selectedServerId: defaultServerId)
         } else {
             appState.showServerPicker = true

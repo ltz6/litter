@@ -96,6 +96,7 @@ struct ThreadStartParams: Encodable {
     let sandbox: String?
     let dynamicTools: [DynamicToolSpec]?
     let persistExtendedHistory: Bool? = true
+    let developerInstructions: String?
 }
 
 struct ThreadStartResponse: Decodable {

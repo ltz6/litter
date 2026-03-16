@@ -263,6 +263,13 @@ pub extern "C" fn codex_channel_open(
         let cb_handle = CallbackHandle { cb: callback, ctx: callback_ctx, closed: closed_flag.clone() };
         let event_task = runtime().spawn(async move {
             while let Some(event) = handle.next_event().await {
+                let event_kind = match &event {
+                    InProcessServerEvent::ServerRequest(r) => format!("ServerRequest({})", serde_json::to_value(r).ok().and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from))).unwrap_or_default()),
+                    InProcessServerEvent::ServerNotification(n) => format!("ServerNotification({})", serde_json::to_value(n).ok().and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from))).unwrap_or_default()),
+                    InProcessServerEvent::LegacyNotification(n) => format!("LegacyNotification({})", &n.method),
+                    InProcessServerEvent::Lagged { skipped } => format!("Lagged({skipped})"),
+                };
+                eprintln!("[codex-channel] event: {event_kind}");
                 if let Some(json) = serialize_server_event(&event) {
                     unsafe { cb_handle.deliver(&json); }
                 }

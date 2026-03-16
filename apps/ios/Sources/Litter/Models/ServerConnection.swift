@@ -30,6 +30,7 @@ enum ConnectionHealth: Equatable {
 @Observable
 final class ServerConnection: Identifiable {
     private static let defaultSandboxMode = "workspace-write"
+    private static let localSandboxMode = "danger-full-access"
     private static let fallbackSandboxMode = "danger-full-access"
 
     let id: String
@@ -177,7 +178,7 @@ final class ServerConnection: Identifiable {
         sandboxMode: String? = nil,
         dynamicTools: [DynamicToolSpec]? = nil
     ) async throws -> ThreadStartResponse {
-        let preferredSandbox = sandboxMode ?? Self.defaultSandboxMode
+        let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await startThread(
                 cwd: cwd,
@@ -204,7 +205,7 @@ final class ServerConnection: Identifiable {
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
     ) async throws -> ThreadResumeResponse {
-        let preferredSandbox = sandboxMode ?? Self.defaultSandboxMode
+        let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await resumeThread(
                 threadId: threadId,
@@ -229,7 +230,7 @@ final class ServerConnection: Identifiable {
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
     ) async throws -> ThreadForkResponse {
-        let preferredSandbox = sandboxMode ?? Self.defaultSandboxMode
+        let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await forkThread(
                 threadId: threadId,
@@ -249,9 +250,10 @@ final class ServerConnection: Identifiable {
     }
 
     private func startThread(cwd: String, model: String?, approvalPolicy: String, sandbox: String, dynamicTools: [DynamicToolSpec]? = nil) async throws -> ThreadStartResponse {
-        try await routedSendRequest(
+        let instructions = target == .local ? Self.localSystemInstructions : nil
+        return try await routedSendRequest(
             method: "thread/start",
-            params: ThreadStartParams(model: model, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox, dynamicTools: dynamicTools),
+            params: ThreadStartParams(model: model, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox, dynamicTools: dynamicTools, developerInstructions: instructions),
             responseType: ThreadStartResponse.self
         )
     }
@@ -564,6 +566,36 @@ final class ServerConnection: Identifiable {
             break
         }
     }
+
+    // MARK: - Local System Instructions
+
+    private static let localSystemInstructions = """
+    You are running on an iOS device with limited shell capabilities via ios_system.
+
+    Environment:
+    - Working directory: ~/Documents (the app's sandboxed Documents folder)
+    - Shell: ios_system (not a full POSIX shell — no fork/exec, no process spawning)
+    - Available commands: ls, cat, echo, touch, find, grep, cp, mv, rm, mkdir, pwd, wc, head, tail, sort, uniq, sed, awk, tr, tee, env, date, and other single-binary utilities bundled via ios_system
+    - /bin/sh is available but runs in-process — compound commands (&&, ||, pipes) work but may behave differently than on a full system
+
+    Limitations:
+    - apply_patch runs in-process but may fail with "Operation not permitted" on some paths. When it fails, fall back to shell commands (echo > file, cat >> file) to create/edit files.
+    - Do NOT use absolute container paths like /var/mobile/Containers/... in file operations — use relative paths from the working directory instead.
+    - The container UUID changes between app installs, so absolute paths from previous sessions are invalid.
+    - File redirection (> and >>) works. Use `echo 'content' > file.txt` to create files when apply_patch fails.
+    - For multi-line file creation, use multiple echo commands with >> (append).
+    - git is NOT available.
+    - No package managers (npm, pip, brew, etc).
+    - No network tools (curl, wget) via shell — but the app handles network requests internally.
+    - Commands run synchronously. Long-running commands will block.
+
+    Best practices:
+    - Always use relative paths for file operations.
+    - Prefer simple, single commands over complex pipelines.
+    - When creating files, try apply_patch first. If it fails, use echo/cat with redirection.
+    - Keep file operations within ~/Documents.
+    - Be concise — this is a mobile device with limited screen space.
+    """
 
     // MARK: - Transport Routing
 

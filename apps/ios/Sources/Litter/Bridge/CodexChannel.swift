@@ -136,6 +136,10 @@ actor CodexChannel {
     // MARK: - Receiving (called from callback)
 
     nonisolated func receiveMessage(_ data: Data) {
+        if let str = String(data: data, encoding: .utf8) {
+            let preview = str.prefix(200)
+            NSLog("[codex-channel-swift] recv: %@", String(preview))
+        }
         Task { await handleIncomingData(data) }
     }
 

@@ -19,9 +19,19 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
     *output_len = 0;
 
     int old_cwd_fd = open(".", O_RDONLY);
-    if (cwd && chdir(cwd) != 0) {
-        if (old_cwd_fd >= 0) close(old_cwd_fd);
-        return -1;
+    if (cwd) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *cwdStr = [NSString stringWithUTF8String:cwd];
+        if (![fm fileExistsAtPath:cwdStr]) {
+            [fm createDirectoryAtPath:cwdStr withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        if (chdir(cwd) != 0) {
+            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            if (docs && chdir(docs.UTF8String) != 0) {
+                if (old_cwd_fd >= 0) close(old_cwd_fd);
+                return -1;
+            }
+        }
     }
 
     FILE *fp = popen(cmd, "r");
@@ -71,7 +81,11 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
 // Use ios_system (linked via the ios_system Swift Package) for fork-free exec.
 
 extern int ios_system(const char *cmd);
+extern FILE *ios_popen(const char *command, const char *type);
 extern void ios_setStreams(FILE *in_stream, FILE *out_stream, FILE *err_stream);
+extern void ios_waitpid(pid_t pid);
+extern pid_t ios_currentPid(void);
+extern bool joinMainThread;
 extern void initializeEnvironment(void);
 extern NSError *addCommandList(NSString *fileLocation);
 
@@ -127,61 +141,74 @@ int codex_ios_system_run(const char *cmd, const char *cwd, char **output, size_t
     *output = NULL;
     *output_len = 0;
 
+    NSLog(@"[ios-system] run cmd='%s' cwd='%s'", cmd, cwd ? cwd : "(null)");
+
     int old_cwd_fd = open(".", O_RDONLY);
-    if (cwd && chdir(cwd) != 0) {
-        if (old_cwd_fd >= 0) close(old_cwd_fd);
-        return -1;
-    }
-
-    int pfd[2];
-    if (pipe(pfd) != 0) {
-        if (old_cwd_fd >= 0) {
-            fchdir(old_cwd_fd);
-            close(old_cwd_fd);
+    if (cwd) {
+        // Ensure the cwd exists (iOS temp dirs may not be pre-created).
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *cwdStr = [NSString stringWithUTF8String:cwd];
+        if (![fm fileExistsAtPath:cwdStr]) {
+            [fm createDirectoryAtPath:cwdStr withIntermediateDirectories:YES attributes:nil error:nil];
         }
-        return -1;
+        if (chdir(cwd) != 0) {
+            NSLog(@"[ios-system] chdir FAILED errno=%d (%s) for cwd='%s', falling back to Documents", errno, strerror(errno), cwd);
+            // Fall back to the app's Documents directory.
+            NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            if (docs && chdir(docs.UTF8String) != 0) {
+                NSLog(@"[ios-system] fallback chdir to Documents also FAILED");
+                if (old_cwd_fd >= 0) close(old_cwd_fd);
+                return -1;
+            }
+        }
     }
 
-    FILE *wf = fdopen(pfd[1], "w");
+    // Use ios_setStreams to capture output via a temp file.
+    // joinMainThread=true makes ios_system block until all sub-commands finish.
+    // We intentionally NEVER fclose the FILE* — ios_system's background
+    // thread cleanup accesses it after return and crashes in flockfile if
+    // we close it. The FILE* is leaked but the temp file is unlinked, so
+    // the kernel reclaims it when all fds/FILE*s are released naturally.
+    NSString *tmpDir = NSTemporaryDirectory();
+    NSString *tmpPath = [tmpDir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"codex_exec_%u.tmp", arc4random()]];
+    FILE *wf = fopen(tmpPath.UTF8String, "w");
     if (!wf) {
-        close(pfd[0]);
-        close(pfd[1]);
-        if (old_cwd_fd >= 0) {
-            fchdir(old_cwd_fd);
-            close(old_cwd_fd);
-        }
+        NSLog(@"[ios-system] tmpfile FAILED for cmd='%s'", cmd);
+        if (old_cwd_fd >= 0) { fchdir(old_cwd_fd); close(old_cwd_fd); }
         return -1;
     }
 
+    bool savedJoin = joinMainThread;
+    joinMainThread = true;
     ios_setStreams(NULL, wf, wf);
     int code = ios_system(cmd);
+    joinMainThread = savedJoin;
     fflush(wf);
-    fclose(wf);
+    // DO NOT fclose(wf) — ios_system threads may still reference it.
     ios_setStreams(NULL, stdout, stderr);
+
+    NSLog(@"[ios-system] ios_system code=%d for cmd='%s'", code, cmd);
+
     if (old_cwd_fd >= 0) {
         fchdir(old_cwd_fd);
         close(old_cwd_fd);
     }
 
-    size_t buf_size = 8192;
-    char *buf = malloc(buf_size);
-    if (!buf) { close(pfd[0]); return code; }
+    // Read the output from the temp file via a separate fd.
+    NSData *data = [NSData dataWithContentsOfFile:tmpPath];
+    unlink(tmpPath.UTF8String);
 
-    size_t total = 0;
-    ssize_t n;
-    while ((n = read(pfd[0], buf + total, buf_size - total - 1)) > 0) {
-        total += (size_t)n;
-        if (total + 256 >= buf_size) {
-            buf_size *= 2;
-            char *nb = realloc(buf, buf_size);
-            if (!nb) break;
-            buf = nb;
-        }
+    if (data.length == 0) {
+        return code;
     }
-    close(pfd[0]);
-    buf[total] = '\0';
+
+    char *buf = malloc(data.length + 1);
+    if (!buf) { return code; }
+    memcpy(buf, data.bytes, data.length);
+    buf[data.length] = '\0';
     *output = buf;
-    *output_len = total;
+    *output_len = data.length;
     return code;
 }
 

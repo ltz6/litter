@@ -306,8 +306,14 @@ struct SessionsScreen: View {
             .accessibilityIdentifier("sessions.settingsButton")
 
             Button {
-                if let defaultServerId = defaultNewSessionServerId() {
-                    directoryPickerSheet = SessionLaunchSupport.DirectoryPickerSheetModel(selectedServerId: defaultServerId)
+                if let defaultServerId = defaultNewSessionServerId(preferredServerId: appState.sessionsSelectedServerFilterId) {
+                    // For local on-device server, skip directory picker and use Documents.
+                    if let conn = serverManager.connections[defaultServerId], conn.target == .local {
+                        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? NSHomeDirectory()
+                        Task { await startNewSession(serverId: defaultServerId, cwd: docs) }
+                    } else {
+                        directoryPickerSheet = SessionLaunchSupport.DirectoryPickerSheetModel(selectedServerId: defaultServerId)
+                    }
                 } else {
                     appState.showServerPicker = true
                 }

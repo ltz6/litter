@@ -177,6 +177,13 @@ struct HeaderView: View {
         let threadReasoning = thread.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !threadReasoning.isEmpty { return threadReasoning }
 
+        // Fall back to the model's default reasoning effort from the loaded model list.
+        let currentModel = thread.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let model = connection.models.first(where: { $0.model == currentModel }),
+           !model.defaultReasoningEffort.isEmpty {
+            return model.defaultReasoningEffort
+        }
+
         return "default"
     }
 
