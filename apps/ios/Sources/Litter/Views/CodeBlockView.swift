@@ -6,58 +6,24 @@ struct CodeBlockView: View {
     let language: String
     let code: String
     var fontSize: CGFloat = 13
-    @State private var copied = false
-
-    private var headerScale: CGFloat {
-        max(0.8, fontSize / 13.0)
-    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                if !language.isEmpty {
-                    Text(language)
-                        .font(LitterFont.styled(.caption2, weight: .medium, scale: headerScale))
-                        .foregroundColor(LitterTheme.textSecondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(4)
-                }
-                Spacer()
-                Button {
-                    UIPasteboard.general.string = code
-                    copied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        copied = false
-                    }
-                } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(LitterFont.styled(.caption2, scale: headerScale))
-                        .foregroundColor(copied ? LitterTheme.accent : LitterTheme.textSecondary)
+        ScrollView(.horizontal, showsIndicators: false) {
+            Group {
+                if let highlighted = CodeBlockHighlighter.shared.highlight(code: code, language: language, fontSize: fontSize) {
+                    Text(highlighted)
+                        .textSelection(.enabled)
+                } else {
+                    Text(code)
+                        .font(LitterFont.monospaced(size: fontSize))
+                        .foregroundColor(LitterTheme.textBody)
+                        .textSelection(.enabled)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                Group {
-                    if let highlighted = CodeBlockHighlighter.shared.highlight(code: code, language: language, fontSize: fontSize) {
-                        Text(highlighted)
-                            .textSelection(.enabled)
-                    } else {
-                        Text(code)
-                            .font(LitterFont.monospaced(size: fontSize))
-                            .foregroundColor(LitterTheme.textBody)
-                            .textSelection(.enabled)
-                    }
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .background(LitterTheme.codeBackground.opacity(0.8))
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .background(LitterTheme.codeBackground.opacity(0.8))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .modifier(GlassRectModifier(cornerRadius: 8))
     }

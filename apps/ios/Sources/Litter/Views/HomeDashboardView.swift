@@ -4,6 +4,7 @@ struct HomeDashboardView: View {
     let recentSessions: [ThreadState]
     let connectedServers: [ServerConnection]
     let openingRecentSessionKey: ThreadKey?
+    let isStartingNewSession: Bool
     let onOpenRecentSession: @MainActor (ThreadState) async -> Void
     let onOpenServerSessions: (ServerConnection) -> Void
     let onNewSession: () -> Void
@@ -39,7 +40,13 @@ struct HomeDashboardView: View {
 
     private var recentSessionsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionHeader(title: "Recent Sessions", buttonTitle: "New Session", systemImage: "plus", action: onNewSession)
+            sectionHeader(
+                title: "Recent Sessions",
+                buttonTitle: "New Session",
+                systemImage: "plus",
+                showsLoading: isStartingNewSession,
+                action: onNewSession
+            )
 
             if recentSessions.isEmpty {
                 emptyStateCard(
@@ -57,7 +64,7 @@ struct HomeDashboardView: View {
                             recentSessionCard(thread)
                         }
                         .buttonStyle(.plain)
-                        .disabled(openingRecentSessionKey != nil)
+                        .disabled(openingRecentSessionKey != nil || isStartingNewSession)
                     }
                 }
             }
@@ -92,6 +99,7 @@ struct HomeDashboardView: View {
         title: String,
         buttonTitle: String,
         systemImage: String,
+        showsLoading: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         HStack(alignment: .center, spacing: 12) {
@@ -102,63 +110,87 @@ struct HomeDashboardView: View {
             Spacer(minLength: 0)
 
             Button(action: action) {
-                Label(buttonTitle, systemImage: systemImage)
-                    .font(LitterFont.styled(.caption))
-                    .foregroundColor(LitterTheme.accent)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(LitterTheme.surface.opacity(0.72))
-                    .overlay(
-                        Capsule()
-                            .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
-                    )
-                    .clipShape(Capsule())
+                Group {
+                    if showsLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(LitterTheme.accent)
+                            .frame(width: 74)
+                    } else {
+                        Label(buttonTitle, systemImage: systemImage)
+                            .font(LitterFont.styled(.caption))
+                            .foregroundColor(LitterTheme.accent)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(LitterTheme.surface.opacity(0.72))
+                .overlay(
+                    Capsule()
+                        .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
+                )
+                .clipShape(Capsule())
             }
             .buttonStyle(.plain)
+            .disabled(showsLoading)
         }
     }
 
     private func recentSessionCard(_ thread: ThreadState) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                Text(thread.sessionSidebarTitle)
-                    .font(LitterFont.styled(.body))
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: thread.hasTurnActive ? "sparkles" : "text.bubble")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundColor(LitterTheme.accent)
+                .frame(width: 28, height: 28)
+                .background(LitterTheme.accent.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(thread.sessionTitle)
+                    .font(LitterFont.styled(.subheadline))
                     .foregroundColor(LitterTheme.textPrimary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
+                    .lineLimit(1)
 
-                Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    Text(thread.serverName)
 
-                if openingRecentSessionKey == thread.key {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(LitterTheme.accent)
-                } else if thread.hasTurnActive {
-                    statusBadge("Thinking")
-                }
-            }
+                    if let workspace = HomeDashboardSupport.workspaceLabel(for: thread) {
+                        metadataDivider
+                        Text(workspace)
+                    }
 
-            HStack(spacing: 8) {
-                Text(thread.serverName)
-
-                if let workspace = HomeDashboardSupport.workspaceLabel(for: thread) {
                     metadataDivider
-                    Text(workspace)
+                    Text(thread.updatedAt, style: .relative)
                 }
-
-                metadataDivider
-                Text(thread.updatedAt, style: .relative)
+                .font(LitterFont.styled(.caption))
+                .foregroundColor(LitterTheme.textMuted)
+                .lineLimit(1)
             }
-            .font(LitterFont.styled(.caption))
-            .foregroundColor(LitterTheme.textMuted)
+
+            Spacer(minLength: 0)
+
+            if openingRecentSessionKey == thread.key {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(LitterTheme.accent)
+            } else if thread.hasTurnActive {
+                statusBadge("Thinking")
+            } else {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(LitterTheme.textMuted)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .modifier(GlassRectModifier(cornerRadius: 16))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(LitterTheme.surface.opacity(0.6))
         .overlay(
-            RoundedRectangle(cornerRadius: 16)
+            RoundedRectangle(cornerRadius: 14)
                 .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
         )
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .accessibilityIdentifier("home.recentSessionCard")
     }
 
     private func connectedServerRow(_ connection: ServerConnection) -> some View {
@@ -207,6 +239,7 @@ struct HomeDashboardView: View {
                 .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 14))
+        .accessibilityIdentifier("home.connectedServerRow")
     }
 
     private func emptyStateCard(title: String, message: String) -> some View {

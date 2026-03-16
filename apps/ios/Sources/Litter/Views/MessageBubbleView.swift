@@ -53,6 +53,7 @@ struct AssistantBubble: View, Equatable {
     var label: String? = nil
     var textScale: CGFloat = 1.0
     var compact: Bool = false
+    var themeVersion: Int = 0
     @ScaledMetric(relativeTo: .body) private var mdBodySize: CGFloat = 14
     @ScaledMetric(relativeTo: .footnote) private var mdCodeSize: CGFloat = 13
 
@@ -63,13 +64,15 @@ struct AssistantBubble: View, Equatable {
         text: String,
         label: String? = nil,
         textScale: CGFloat = 1.0,
-        compact: Bool = false
+        compact: Bool = false,
+        themeVersion: Int = 0
     ) {
         self.markdownContent = MarkdownContent(text)
         self.markdownIdentity = text.hashValue
         self.label = label
         self.textScale = textScale
         self.compact = compact
+        self.themeVersion = themeVersion
     }
 
     init(
@@ -77,20 +80,23 @@ struct AssistantBubble: View, Equatable {
         markdownIdentity: Int,
         label: String? = nil,
         textScale: CGFloat = 1.0,
-        compact: Bool = false
+        compact: Bool = false,
+        themeVersion: Int = 0
     ) {
         self.markdownContent = markdownContent
         self.markdownIdentity = markdownIdentity
         self.label = label
         self.textScale = textScale
         self.compact = compact
+        self.themeVersion = themeVersion
     }
 
     static func == (lhs: AssistantBubble, rhs: AssistantBubble) -> Bool {
         lhs.markdownIdentity == rhs.markdownIdentity &&
         lhs.label == rhs.label &&
         lhs.textScale == rhs.textScale &&
-        lhs.compact == rhs.compact
+        lhs.compact == rhs.compact &&
+        lhs.themeVersion == rhs.themeVersion
     }
 
     var body: some View {
@@ -117,6 +123,7 @@ struct StreamingAssistantBubble: View {
     let text: String
     var label: String? = nil
     var textScale: CGFloat = 1.0
+    var themeVersion: Int = 0
     var onSnapshotRendered: (() -> Void)? = nil
     @State private var renderedText: String = ""
     @State private var pendingText: String?
@@ -134,7 +141,8 @@ struct StreamingAssistantBubble: View {
             markdownContent: renderedContent,
             markdownIdentity: renderedText.hashValue,
             label: label,
-            textScale: textScale
+            textScale: textScale,
+            themeVersion: themeVersion
         )
             .equatable()
             .opacity(snapshotOpacity)

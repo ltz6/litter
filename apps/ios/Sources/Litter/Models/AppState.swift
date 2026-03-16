@@ -1,28 +1,28 @@
+import Observation
 import SwiftUI
 
 @MainActor
-final class AppState: ObservableObject {
+@Observable
+final class AppState {
     private static let approvalPolicyKey = "litter.approvalPolicy"
     private static let sandboxModeKey = "litter.sandboxMode"
 
-    @Published var sidebarOpen = false
-    @Published var currentCwd = ""
-    @Published var showServerPicker = false
-    @Published var collapsedSessionFolders: Set<String> = []
-    @Published var sessionSidebarSelectedServerFilterId: String?
-    @Published var sessionSidebarShowOnlyForks = false
-    @Published var sessionSidebarWorkspaceSortModeRaw = "mostRecent"
-    @Published var selectedModel = ""
-    @Published var reasoningEffort = ""
-    @Published var showModelSelector = false
-    @Published var showSettings = false
-    @Published var requestedConversationKey: ThreadKey?
-    @Published var approvalPolicy: String {
+    var currentCwd = ""
+    var showServerPicker = false
+    var collapsedSessionFolders: Set<String> = []
+    var sessionsSelectedServerFilterId: String?
+    var sessionsShowOnlyForks = false
+    var sessionsWorkspaceSortModeRaw = "mostRecent"
+    var selectedModel = ""
+    var reasoningEffort = ""
+    var showModelSelector = false
+    var showSettings = false
+    var approvalPolicy: String {
         didSet {
             UserDefaults.standard.set(approvalPolicy, forKey: Self.approvalPolicyKey)
         }
     }
-    @Published var sandboxMode: String {
+    var sandboxMode: String {
         didSet {
             UserDefaults.standard.set(sandboxMode, forKey: Self.sandboxModeKey)
         }

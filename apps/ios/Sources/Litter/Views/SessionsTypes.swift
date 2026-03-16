@@ -1,12 +1,12 @@
 import Foundation
 
 extension ThreadState {
-    var sessionSidebarTitle: String {
+    var sessionTitle: String {
         let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Untitled session" : trimmed
     }
 
-    var sessionSidebarModelLabel: String? {
+    var sessionModelLabel: String? {
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedModel.isEmpty else { return nil }
         if let agentLabel = agentDisplayLabel {
@@ -60,8 +60,8 @@ struct SessionTreeNode: Identifiable {
     var id: ThreadKey { thread.key }
 }
 
-struct SessionSidebarDerivedData {
-    static let empty = SessionSidebarDerivedData(
+struct SessionsDerivedData {
+    static let empty = SessionsDerivedData(
         allThreads: [],
         allThreadKeys: [],
         filteredThreads: [],
@@ -86,7 +86,7 @@ struct SessionSidebarDerivedData {
     let childrenByKey: [ThreadKey: [ThreadState]]
 }
 
-func sessionSidebarNormalizedWorkspacePath(_ raw: String) -> String {
+func normalizedWorkspacePath(_ raw: String) -> String {
     var path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if path.isEmpty {
         return "/"
@@ -99,11 +99,11 @@ func sessionSidebarNormalizedWorkspacePath(_ raw: String) -> String {
 }
 
 @MainActor
-func sessionSidebarWorkspaceGroupID(for thread: ThreadState) -> String {
-    "\(thread.serverId)::\(sessionSidebarNormalizedWorkspacePath(thread.cwd))"
+func workspaceGroupID(for thread: ThreadState) -> String {
+    "\(thread.serverId)::\(normalizedWorkspacePath(thread.cwd))"
 }
 
-func sessionSidebarWorkspaceTitle(for workspacePath: String) -> String {
+func workspaceTitle(for workspacePath: String) -> String {
     if workspacePath == "/" {
         return "/"
     }

@@ -3,12 +3,14 @@ import Inject
 
 struct HeaderView: View {
     @ObserveInjection var inject
-    @EnvironmentObject var appState: AppState
-    @ObservedObject var thread: ThreadState
-    @ObservedObject var connection: ServerConnection
+    @Environment(AppState.self) private var appState
+    let thread: ThreadState
+    let connection: ServerConnection
     let serverManager: ServerManager
+    let onBack: () -> Void
     @State private var isReloading = false
     @State private var showOAuth = false
+    @State private var pulsing = false
 
     var topInset: CGFloat = 0
 
@@ -16,17 +18,15 @@ struct HeaderView: View {
         VStack(spacing: 4) {
             HStack(alignment: .center, spacing: 10) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        appState.sidebarOpen.toggle()
-                    }
+                    onBack()
                 } label: {
-                    Image(systemName: "line.3.horizontal")
+                    Image(systemName: "chevron.left")
                         .font(.system(size: 16, weight: .medium))
                         .foregroundColor(LitterTheme.textSecondary)
                         .frame(width: 44, height: 44)
                         .modifier(GlassCircleModifier())
                 }
-                .accessibilityIdentifier("header.sidebarButton")
+                .accessibilityIdentifier("header.homeButton")
 
                 Spacer(minLength: 0)
 
@@ -38,8 +38,13 @@ struct HeaderView: View {
                     VStack(spacing: 2) {
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(authDotColor)
+                                .fill(statusDotColor)
                                 .frame(width: 6, height: 6)
+                                .opacity(shouldPulse ? (pulsing ? 0.3 : 1.0) : 1.0)
+                                .animation(shouldPulse ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: pulsing)
+                                .onChange(of: shouldPulse) { _, pulse in
+                                    pulsing = pulse
+                                }
                             Text(sessionModelLabel)
                                 .foregroundColor(LitterTheme.textPrimary)
                             Text(sessionReasoningLabel)
@@ -108,11 +113,6 @@ struct HeaderView: View {
         .onChange(of: connection.loginCompleted) { _, completed in
             if completed == true {
                 showOAuth = false
-                connection.loginCompleted = false
-                Task {
-                    await serverManager.refreshAllSessions()
-                    await serverManager.syncActiveThreadFromServer()
-                }
             }
         }
         .sheet(isPresented: $showOAuth) {
@@ -141,11 +141,22 @@ struct HeaderView: View {
         .enableInjection()
     }
 
-    private var authDotColor: Color {
-        switch connection.authStatus {
-        case .chatgpt, .apiKey: return LitterTheme.success
-        case .notLoggedIn: return LitterTheme.danger
-        case .unknown: return LitterTheme.textMuted
+    private var shouldPulse: Bool {
+        connection.connectionHealth == .connecting || connection.connectionHealth == .unresponsive
+    }
+
+    private var statusDotColor: Color {
+        switch connection.connectionHealth {
+        case .disconnected:
+            return LitterTheme.danger
+        case .connecting, .unresponsive:
+            return .orange
+        case .connected:
+            switch connection.authStatus {
+            case .chatgpt, .apiKey: return LitterTheme.success
+            case .notLoggedIn: return LitterTheme.danger
+            case .unknown: return LitterTheme.textMuted
+            }
         }
     }
 
@@ -421,7 +432,8 @@ struct ModelSelectorSheet: View {
         HeaderView(
             thread: manager.activeThread!,
             connection: manager.activeConnection!,
-            serverManager: manager
+            serverManager: manager,
+            onBack: {}
         )
     }
 }

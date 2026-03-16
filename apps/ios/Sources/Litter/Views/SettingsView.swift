@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @EnvironmentObject var serverManager: ServerManager
+    @Environment(ServerManager.self) private var serverManager
     @Environment(\.dismiss) private var dismiss
     @AppStorage("fontFamily") private var fontFamily = FontFamilyOption.mono.rawValue
 
@@ -151,9 +151,9 @@ struct SettingsView: View {
                             Text(conn.server.name)
                                 .font(LitterFont.styled(.footnote))
                                 .foregroundColor(LitterTheme.textPrimary)
-                            Text(conn.isConnected ? "Connected" : "Disconnected")
+                            Text(conn.connectionHealth.settingsLabel)
                                 .font(LitterFont.styled(.caption))
-                                .foregroundColor(conn.isConnected ? LitterTheme.accent : LitterTheme.textSecondary)
+                                .foregroundColor(conn.connectionHealth.settingsColor)
                         }
                         Spacer()
                         Button("Remove") {
@@ -174,7 +174,7 @@ struct SettingsView: View {
 }
 
 private struct SettingsConnectionAccountSection: View {
-    @ObservedObject var connection: ServerConnection
+    let connection: ServerConnection
     @State private var apiKey = ""
     @State private var isAuthWorking = false
     @State private var authError: String?

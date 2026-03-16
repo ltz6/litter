@@ -45,7 +45,7 @@ final class ToolCallMessageParserTests: XCTestCase {
             """
             let item = try JSONDecoder().decode(ResumedThreadItem.self, from: Data(json.utf8))
 
-            guard case .webSearch(let query, let action, _) = item else {
+            guard case .webSearch(let query, let action, _, _) = item else {
                 XCTFail("Expected .webSearch for alias \(alias)")
                 continue
             }
@@ -154,7 +154,7 @@ final class ToolCallMessageParserTests: XCTestCase {
         let model = unwrap(ToolCallMessageParser.parse(message: ChatMessage(role: .system, text: text)))
         XCTAssertEqual(model.kind, .mcpToolCall)
         XCTAssertEqual(model.status, .inProgress)
-        XCTAssertEqual(model.summary, "fs/read (in progress)")
+        XCTAssertEqual(model.summary, "fs/read")
     }
 
     func testScalarAndInvalidJsonHandling() {

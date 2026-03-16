@@ -15,7 +15,7 @@ final class MessageRenderCache {
     }
 
     struct RevisionKey: Hashable {
-        let messageId: UUID
+        let messageId: String
         let revisionToken: Int
         let serverId: String
         let agentDirectoryVersion: Int
@@ -50,12 +50,24 @@ final class MessageRenderCache {
         for message: ChatMessage,
         key: RevisionKey
     ) -> [AssistantSegment] {
+        assistantSegments(
+            text: message.text,
+            messageId: message.id.uuidString,
+            key: key
+        )
+    }
+
+    func assistantSegments(
+        text: String,
+        messageId: String,
+        key: RevisionKey
+    ) -> [AssistantSegment] {
         if let cached = assistantCache[key] {
             touch(&assistantAccessOrder, key: key)
             return cached
         }
 
-        let parsed = extractInlineSegments(from: message.text, messageId: message.id, key: key)
+        let parsed = extractInlineSegments(from: text, messageId: messageId, key: key)
         assistantCache[key] = parsed
         touch(&assistantAccessOrder, key: key)
         trimIfNeeded(&assistantCache, accessOrder: &assistantAccessOrder)
@@ -116,8 +128,22 @@ final class MessageRenderCache {
         isStreaming: Bool
     ) -> RevisionKey {
         RevisionKey(
-            messageId: message.id,
+            messageId: message.id.uuidString,
             revisionToken: stableRevisionToken(for: message, isStreaming: isStreaming),
+            serverId: serverId ?? "<nil>",
+            agentDirectoryVersion: agentDirectoryVersion
+        )
+    }
+
+    static func makeRevisionKey(
+        for item: ConversationItem,
+        serverId: String?,
+        agentDirectoryVersion: Int,
+        isStreaming: Bool
+    ) -> RevisionKey {
+        RevisionKey(
+            messageId: item.id,
+            revisionToken: stableRevisionToken(for: item, isStreaming: isStreaming),
             serverId: serverId ?? "<nil>",
             agentDirectoryVersion: agentDirectoryVersion
         )
@@ -126,6 +152,13 @@ final class MessageRenderCache {
     static func stableRevisionToken(for message: ChatMessage, isStreaming: Bool) -> Int {
         var hasher = Hasher()
         hasher.combine(message.renderDigest)
+        hasher.combine(isStreaming)
+        return hasher.finalize()
+    }
+
+    static func stableRevisionToken(for item: ConversationItem, isStreaming: Bool) -> Int {
+        var hasher = Hasher()
+        hasher.combine(item.renderDigest)
         hasher.combine(isStreaming)
         return hasher.finalize()
     }
@@ -150,7 +183,7 @@ final class MessageRenderCache {
 
     private func extractInlineSegments(
         from text: String,
-        messageId: UUID,
+        messageId: String,
         key: RevisionKey
     ) -> [AssistantSegment] {
         if !text.contains("data:image/") {
@@ -214,7 +247,7 @@ final class MessageRenderCache {
                ),
                let image = Self.decodedImage(
                    from: data,
-                   cacheKey: "assistant-\(messageId.uuidString)-\(matchLower)-\(matchUpper)"
+                   cacheKey: "assistant-\(messageId)-\(matchLower)-\(matchUpper)"
                ) {
                 segments.append(
                     AssistantSegment(

@@ -42,7 +42,8 @@ enum HomeDashboardSupport {
             return "In-process server"
         }
 
-        let hostAndPort = if let port = server.port {
+        let visiblePort = server.hasCodexServer ? server.port : server.sshPort
+        let hostAndPort = if let port = visiblePort {
             "\(server.hostname):\(port)"
         } else {
             server.hostname

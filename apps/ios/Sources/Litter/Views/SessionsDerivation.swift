@@ -16,7 +16,7 @@ enum SessionsDerivation {
         workspaceSortMode: WorkspaceSortMode,
         searchQuery: String,
         frozenMostRecentOrder: [ThreadKey]?
-    ) -> SessionSidebarDerivedData {
+    ) -> SessionsDerivedData {
         let allThreads = sortThreads(
             Array(serverManager.threads.values),
             workspaceSortMode: workspaceSortMode,
@@ -68,15 +68,15 @@ enum SessionsDerivation {
             if searchQuery.isEmpty {
                 return true
             }
-            let parentTitle = parentByKey[thread.key]?.sessionSidebarTitle ?? ""
-            return thread.sessionSidebarTitle.localizedCaseInsensitiveContains(searchQuery) ||
+            let parentTitle = parentByKey[thread.key]?.sessionTitle ?? ""
+            return thread.sessionTitle.localizedCaseInsensitiveContains(searchQuery) ||
                 thread.cwd.localizedCaseInsensitiveContains(searchQuery) ||
                 thread.serverName.localizedCaseInsensitiveContains(searchQuery) ||
                 thread.modelProvider.localizedCaseInsensitiveContains(searchQuery) ||
                 parentTitle.localizedCaseInsensitiveContains(searchQuery)
         }
 
-        let groupedByWorkspace = Dictionary(grouping: filteredThreads) { sessionSidebarWorkspaceGroupID(for: $0) }
+        let groupedByWorkspace = Dictionary(grouping: filteredThreads) { workspaceGroupID(for: $0) }
         let workspaceGroups = groupedByWorkspace.compactMap { groupID, threads -> WorkspaceSessionGroup? in
             let sortedThreads = sortThreads(
                 threads,
@@ -84,7 +84,7 @@ enum SessionsDerivation {
                 frozenMostRecentOrder: frozenMostRecentOrder
             )
             guard let first = sortedThreads.first else { return nil }
-            let workspacePath = sessionSidebarNormalizedWorkspacePath(first.cwd)
+            let workspacePath = normalizedWorkspacePath(first.cwd)
             let serverHost = serverManager.connections[first.serverId]?.server.hostname ?? first.serverName
             return WorkspaceSessionGroup(
                 id: groupID,
@@ -92,7 +92,7 @@ enum SessionsDerivation {
                 serverName: first.serverName,
                 serverHost: serverHost,
                 workspacePath: workspacePath,
-                workspaceTitle: sessionSidebarWorkspaceTitle(for: workspacePath),
+                workspaceTitle: workspaceTitle(for: workspacePath),
                 latestUpdatedAt: first.updatedAt,
                 threads: sortedThreads,
                 treeRoots: buildSessionTree(for: sortedThreads, parentByKey: parentByKey)
@@ -103,10 +103,10 @@ enum SessionsDerivation {
         let workspaceSections = workspaceSections(for: sortedWorkspaceGroups, sortMode: workspaceSortMode)
         let workspaceGroupIDs = sortedWorkspaceGroups.map(\.id)
         let workspaceGroupIDByThreadKey = Dictionary(uniqueKeysWithValues: filteredThreads.map {
-            ($0.key, sessionSidebarWorkspaceGroupID(for: $0))
+            ($0.key, workspaceGroupID(for: $0))
         })
 
-        return SessionSidebarDerivedData(
+        return SessionsDerivedData(
             allThreads: allThreads,
             allThreadKeys: allThreads.map(\.key),
             filteredThreads: filteredThreads,

@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct AccountView: View {
-    @EnvironmentObject var serverManager: ServerManager
+    @Environment(ServerManager.self) private var serverManager
     @Environment(\.dismiss) private var dismiss
 
     private var connection: ServerConnection? {
@@ -18,7 +18,7 @@ struct AccountView: View {
 }
 
 private struct AccountConnectionView: View {
-    @ObservedObject var connection: ServerConnection
+    let connection: ServerConnection
     let dismiss: DismissAction
 
     @State private var apiKey = ""

@@ -2,18 +2,20 @@ import SwiftUI
 import Inject
 import os
 
-private let sessionSidebarSignpostLog = OSLog(
+private let sessionsScreenSignpostLog = OSLog(
     subsystem: Bundle.main.bundleIdentifier ?? "com.litter.ios",
-    category: "SessionSidebar"
+    category: "SessionsScreen"
 )
 
-struct SessionSidebarView: View {
+struct SessionsScreen: View {
     @ObserveInjection var inject
-    @EnvironmentObject var serverManager: ServerManager
-    @EnvironmentObject var appState: AppState
-    @StateObject private var sessionsModel = SessionsModel()
+    @Environment(ServerManager.self) private var serverManager
+    @Environment(AppState.self) private var appState
+    @Environment(ConversationWarmupCoordinator.self) private var conversationWarmup
+    @State private var sessionsModel = SessionsModel()
     @State private var isLoading: Bool
     @State private var resumingKey: ThreadKey?
+    @State private var isStartingNewSession = false
     @State private var directoryPickerSheet: SessionLaunchSupport.DirectoryPickerSheetModel?
     @State private var sessionSearchQuery = ""
     @State private var debouncedSessionSearchQuery = ""
@@ -28,51 +30,30 @@ struct SessionSidebarView: View {
     @State private var pendingActiveSessionScroll = false
     @State private var sessionSearchDebounceTask: Task<Void, Never>?
     @State private var hasLoadedInitialSessions = false
-    @State private var navigateToConversation = false
     private let autoLoadSessions: Bool
+    private let onOpenConversation: (ThreadKey) -> Void
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return formatter
     }()
 
-    init(autoLoadSessions: Bool = true) {
+    init(
+        autoLoadSessions: Bool = true,
+        onOpenConversation: @escaping (ThreadKey) -> Void
+    ) {
         self.autoLoadSessions = autoLoadSessions
+        self.onOpenConversation = onOpenConversation
         _isLoading = State(initialValue: autoLoadSessions)
     }
 
     var body: some View {
-        sidebarContent(derived: sessionsModel.derivedData)
-            .navigationDestination(isPresented: $navigateToConversation) {
-                if let activeConversationContext {
-                    ConversationView(
-                        thread: activeConversationContext.thread,
-                        connection: activeConversationContext.connection,
-                        activeThreadKey: activeConversationContext.key,
-                        serverManager: serverManager,
-                        composerPrefillRequest: serverManager.composerPrefillRequest,
-                        agentDirectoryVersion: serverManager.agentDirectoryVersion
-                    )
-                } else {
-                    ProgressView()
-                        .tint(LitterTheme.accent)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(LitterTheme.backgroundGradient.ignoresSafeArea())
-                }
-            }
+        screenContent(derived: sessionsModel.derivedData)
     }
 
-    private var activeConversationContext: (thread: ThreadState, connection: ServerConnection, key: ThreadKey)? {
-        guard let key = serverManager.activeThreadKey,
-              let thread = serverManager.threads[key],
-              let connection = serverManager.connections[key.serverId] else {
-            return nil
-        }
-        return (thread, connection, key)
-    }
 
-    private func sidebarContent(derived: SessionSidebarDerivedData) -> some View {
-        let base = sidebarLayout(derived: derived)
+    private func screenContent(derived: SessionsDerivedData) -> some View {
+        let base = screenLayout(derived: derived)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .enableInjection()
 
@@ -104,14 +85,13 @@ struct SessionSidebarView: View {
                         directoryPickerSheet = nil
                     }
                 )
-                .environmentObject(serverManager)
             }
         }
     }
 
     private func attachLifecycleHandlers<Content: View>(
         to content: Content,
-        derived: SessionSidebarDerivedData
+        derived: SessionsDerivedData
     ) -> some View {
         content
             .task {
@@ -128,16 +108,6 @@ struct SessionSidebarView: View {
             }
             .onChange(of: serverManager.activeThreadKey) { _, _ in
                 scheduleActiveSessionScrollIfNeeded()
-            }
-            .onChange(of: appState.sidebarOpen) { _, isOpen in
-                if isOpen {
-                    scheduleActiveSessionScrollIfNeeded()
-                } else {
-                    sessionSearchQuery = ""
-                    debouncedSessionSearchQuery = ""
-                    sessionsModel.updateSearchQuery("")
-                    pendingActiveSessionScroll = false
-                }
             }
             .onChange(of: connectedServerIds) { _, ids in
                 guard let pickerSheet = directoryPickerSheet else {
@@ -219,7 +189,7 @@ struct SessionSidebarView: View {
                 titleVisibility: Visibility.visible,
                 presenting: archiveTargetThread
             ) { thread in
-                Button("Delete \"\(thread.sessionSidebarTitle)\"", role: .destructive) {
+                Button("Delete \"\(thread.sessionTitle)\"", role: .destructive) {
                     Task { await confirmArchiveSession() }
                 }
                 Button("Cancel", role: .cancel) { archiveTargetKey = nil }
@@ -228,7 +198,7 @@ struct SessionSidebarView: View {
             }
     }
 
-    private func sidebarLayout(derived: SessionSidebarDerivedData) -> some View {
+    private func screenLayout(derived: SessionsDerivedData) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             newSessionButton
             Divider().background(LitterTheme.separator)
@@ -264,22 +234,22 @@ struct SessionSidebarView: View {
             }
 
         }
-        .accessibilityIdentifier("sidebar.container")
+        .accessibilityIdentifier("sessions.container")
     }
 
     private var selectedServerFilterId: String? {
-        get { appState.sessionSidebarSelectedServerFilterId }
-        nonmutating set { appState.sessionSidebarSelectedServerFilterId = newValue }
+        get { appState.sessionsSelectedServerFilterId }
+        nonmutating set { appState.sessionsSelectedServerFilterId = newValue }
     }
 
     private var showOnlyForks: Bool {
-        get { appState.sessionSidebarShowOnlyForks }
-        nonmutating set { appState.sessionSidebarShowOnlyForks = newValue }
+        get { appState.sessionsShowOnlyForks }
+        nonmutating set { appState.sessionsShowOnlyForks = newValue }
     }
 
     private var workspaceSortMode: WorkspaceSortMode {
-        get { WorkspaceSortMode(rawValue: appState.sessionSidebarWorkspaceSortModeRaw) ?? .mostRecent }
-        nonmutating set { appState.sessionSidebarWorkspaceSortModeRaw = newValue.rawValue }
+        get { WorkspaceSortMode(rawValue: appState.sessionsWorkspaceSortModeRaw) ?? .mostRecent }
+        nonmutating set { appState.sessionsWorkspaceSortModeRaw = newValue.rawValue }
     }
 
     private var connectedServerIds: [String] {
@@ -332,7 +302,7 @@ struct SessionSidebarView: View {
                     .frame(width: 44, height: 44)
                     .modifier(GlassRectModifier(cornerRadius: 10))
             }
-            .accessibilityIdentifier("sidebar.settingsButton")
+            .accessibilityIdentifier("sessions.settingsButton")
 
             Button {
                 if let defaultServerId = defaultNewSessionServerId() {
@@ -342,10 +312,16 @@ struct SessionSidebarView: View {
                 }
             } label: {
                 HStack {
-                    Image(systemName: "plus")
-                        .font(.system(.subheadline, weight: .medium))
-                    Text("New Session")
-                        .font(LitterFont.styled(.subheadline))
+                    if isStartingNewSession {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(LitterTheme.textOnAccent)
+                    } else {
+                        Image(systemName: "plus")
+                            .font(.system(.subheadline, weight: .medium))
+                        Text("New Session")
+                            .font(LitterFont.styled(.subheadline))
+                    }
                 }
                 .foregroundColor(LitterTheme.textOnAccent)
                 .frame(maxWidth: .infinity)
@@ -353,7 +329,8 @@ struct SessionSidebarView: View {
                 .background(LitterTheme.accent)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            .accessibilityIdentifier("sidebar.newSessionButton")
+            .disabled(isStartingNewSession)
+            .accessibilityIdentifier("sessions.newSessionButton")
         }
         .padding(16)
     }
@@ -372,10 +349,9 @@ struct SessionSidebarView: View {
                     .foregroundColor(LitterTheme.textMuted)
                 Spacer()
                 Button("Connect") {
-                    withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
                     appState.showServerPicker = true
                 }
-                .accessibilityIdentifier("sidebar.connectButton")
+                .accessibilityIdentifier("sessions.connectButton")
                 .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.accent)
             } else {
@@ -387,10 +363,9 @@ struct SessionSidebarView: View {
                     .foregroundColor(LitterTheme.textPrimary)
                 Spacer()
                 Button("Add") {
-                    withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
                     appState.showServerPicker = true
                 }
-                .accessibilityIdentifier("sidebar.addServerButton")
+                .accessibilityIdentifier("sessions.addServerButton")
                 .font(LitterFont.styled(.caption))
                 .foregroundColor(LitterTheme.accent)
                 if let activeThread {
@@ -578,7 +553,7 @@ struct SessionSidebarView: View {
         .buttonStyle(.plain)
     }
 
-    private func sessionList(derived: SessionSidebarDerivedData) -> some View {
+    private func sessionList(derived: SessionsDerivedData) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
@@ -669,7 +644,7 @@ struct SessionSidebarView: View {
     private func sessionRowContextMenu(_ thread: ThreadState) -> some View {
         Button {
             renamingThreadKey = thread.key
-            renameCurrentTitle = thread.sessionSidebarTitle
+            renameCurrentTitle = thread.sessionTitle
             renameDraft = ""
         } label: {
             Label("Rename", systemImage: "pencil")
@@ -691,7 +666,7 @@ struct SessionSidebarView: View {
     private func sessionRow(
         _ thread: ThreadState,
         isActive: Bool,
-        derived: SessionSidebarDerivedData,
+        derived: SessionsDerivedData,
         ephemeralState: SessionsModel.ThreadEphemeralState?,
         depth: Int,
         hasChildren: Bool,
@@ -731,12 +706,12 @@ struct SessionSidebarView: View {
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Text(thread.sessionSidebarTitle)
+                            Text(thread.sessionTitle)
                                 .font(LitterFont.styled(.footnote))
                                 .foregroundColor(LitterTheme.textPrimary)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.leading)
-                                .accessibilityIdentifier("sidebar.sessionTitle")
+                                .accessibilityIdentifier("sessions.sessionTitle")
 
                             if thread.isFork {
                                 Text("Fork")
@@ -760,7 +735,7 @@ struct SessionSidebarView: View {
                         HStack(spacing: 4) {
                             Text(relativeDate(updatedAt))
                                 .foregroundColor(LitterTheme.textSecondary)
-                            if let provider = thread.sessionSidebarModelLabel {
+                            if let provider = thread.sessionModelLabel {
                                 Text("•")
                                     .foregroundColor(LitterTheme.textMuted)
                                 Text(provider)
@@ -769,7 +744,7 @@ struct SessionSidebarView: View {
                             if let parent {
                                 Text("•")
                                     .foregroundColor(LitterTheme.textMuted)
-                                Text("from \(parent.sessionSidebarTitle)")
+                                Text("from \(parent.sessionTitle)")
                                     .foregroundColor(LitterTheme.textMuted)
                             }
                         }
@@ -780,7 +755,7 @@ struct SessionSidebarView: View {
                 .contentShape(Rectangle())
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isButton)
-                .accessibilityIdentifier("sidebar.sessionRow")
+                .accessibilityIdentifier("sessions.sessionRow")
                 .onTapGesture(perform: onSelectSession)
             }
 
@@ -799,7 +774,7 @@ struct SessionSidebarView: View {
         }
     }
 
-    private func lineageSummary(for thread: ThreadState, derived: SessionSidebarDerivedData) -> some View {
+    private func lineageSummary(for thread: ThreadState, derived: SessionsDerivedData) -> some View {
         let parent = derived.parentByKey[thread.key]
         let siblings = derived.siblingsByKey[thread.key] ?? []
         let children = derived.childrenByKey[thread.key] ?? []
@@ -823,7 +798,7 @@ struct SessionSidebarView: View {
                         if !siblings.isEmpty {
                             Menu {
                                 ForEach(siblings) { sibling in
-                                    Button(sibling.sessionSidebarTitle) {
+                                    Button(sibling.sessionTitle) {
                                         Task { await resumeSession(sibling) }
                                     }
                                 }
@@ -835,7 +810,7 @@ struct SessionSidebarView: View {
                         if !children.isEmpty {
                             Menu {
                                 ForEach(children) { child in
-                                    Button(child.sessionSidebarTitle) {
+                                    Button(child.sessionTitle) {
                                         Task { await resumeSession(child) }
                                     }
                                 }
@@ -890,19 +865,19 @@ struct SessionSidebarView: View {
     }
 
     private func scheduleActiveSessionScrollIfNeeded() {
-        guard appState.sidebarOpen, serverManager.activeThreadKey != nil else { return }
+        guard serverManager.activeThreadKey != nil else { return }
         pendingActiveSessionScroll = true
     }
 
-    private func scrollToActiveSessionIfNeeded(derived: SessionSidebarDerivedData, proxy: ScrollViewProxy) {
-        guard pendingActiveSessionScroll, appState.sidebarOpen, let activeKey = serverManager.activeThreadKey else { return }
+    private func scrollToActiveSessionIfNeeded(derived: SessionsDerivedData, proxy: ScrollViewProxy) {
+        guard pendingActiveSessionScroll, let activeKey = serverManager.activeThreadKey else { return }
 
         guard let activeThread = derived.filteredThreads.first(where: { $0.key == activeKey }) else {
             pendingActiveSessionScroll = false
             return
         }
 
-        let activeWorkspaceGroupID = derived.workspaceGroupIDByThreadKey[activeThread.key] ?? sessionSidebarWorkspaceGroupID(for: activeThread)
+        let activeWorkspaceGroupID = derived.workspaceGroupIDByThreadKey[activeThread.key] ?? workspaceGroupID(for: activeThread)
         if collapsedWorkspaceGroupIDs.contains(activeWorkspaceGroupID) {
             collapsedWorkspaceGroupIDs.remove(activeWorkspaceGroupID)
             return
@@ -921,7 +896,7 @@ struct SessionSidebarView: View {
         }
     }
 
-    private func ancestorThreadKeys(for key: ThreadKey, derived: SessionSidebarDerivedData) -> [ThreadKey] {
+    private func ancestorThreadKeys(for key: ThreadKey, derived: SessionsDerivedData) -> [ThreadKey] {
         var ancestors: [ThreadKey] = []
         var visited: Set<ThreadKey> = []
         var cursor: ThreadState? = derived.parentByKey[key]
@@ -944,9 +919,9 @@ struct SessionSidebarView: View {
     }
 
     private func loadSessions() async {
-        let signpostID = OSSignpostID(log: sessionSidebarSignpostLog)
-        os_signpost(.begin, log: sessionSidebarSignpostLog, name: "LoadSessions", signpostID: signpostID)
-        defer { os_signpost(.end, log: sessionSidebarSignpostLog, name: "LoadSessions", signpostID: signpostID) }
+        let signpostID = OSSignpostID(log: sessionsScreenSignpostLog)
+        os_signpost(.begin, log: sessionsScreenSignpostLog, name: "LoadSessions", signpostID: signpostID)
+        defer { os_signpost(.end, log: sessionsScreenSignpostLog, name: "LoadSessions", signpostID: signpostID) }
 
         guard serverManager.hasAnyConnection else {
             isLoading = false
@@ -962,6 +937,7 @@ struct SessionSidebarView: View {
         guard resumingKey == nil else { return }
         resumingKey = thread.key
         sessionActionErrorMessage = nil
+        await conversationWarmup.prewarmIfNeeded()
         workDir = thread.cwd
         appState.currentCwd = thread.cwd
         let opened = await serverManager.viewThread(
@@ -971,7 +947,6 @@ struct SessionSidebarView: View {
         )
         resumingKey = nil
         guard opened else {
-            appState.requestedConversationKey = nil
             if let selectedThread = serverManager.threads[thread.key],
                case .error(let message) = selectedThread.status {
                 sessionActionErrorMessage = message
@@ -980,12 +955,15 @@ struct SessionSidebarView: View {
             }
             return
         }
-        appState.requestedConversationKey = thread.key
-        navigateToConversation = true
-        withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
+        onOpenConversation(thread.key)
     }
 
     private func startNewSession(serverId: String, cwd: String) async {
+        guard !isStartingNewSession else { return }
+        isStartingNewSession = true
+        defer { isStartingNewSession = false }
+        sessionActionErrorMessage = nil
+        await conversationWarmup.prewarmIfNeeded()
         workDir = cwd
         appState.currentCwd = cwd
         let model = appState.selectedModel.isEmpty ? nil : appState.selectedModel
@@ -996,12 +974,12 @@ struct SessionSidebarView: View {
             approvalPolicy: appState.approvalPolicy,
             sandboxMode: appState.sandboxMode
         )
-        if startedKey != nil {
-            appState.requestedConversationKey = startedKey
-            navigateToConversation = true
+        if let startedKey {
+            onOpenConversation(startedKey)
             _ = RecentDirectoryStore.shared.record(path: cwd, for: serverId)
+        } else {
+            sessionActionErrorMessage = "Failed to start a new session."
         }
-        withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
     }
 
     private func forkThread(_ thread: ThreadState) async {
@@ -1009,7 +987,7 @@ struct SessionSidebarView: View {
         isForkingActiveThread = true
         defer { isForkingActiveThread = false }
         do {
-            _ = try await serverManager.forkThread(
+            let nextKey = try await serverManager.forkThread(
                 thread.key,
                 cwd: thread.cwd,
                 approvalPolicy: appState.approvalPolicy,
@@ -1019,9 +997,7 @@ struct SessionSidebarView: View {
                 workDir = nextCwd
                 appState.currentCwd = nextCwd
             }
-            appState.requestedConversationKey = serverManager.activeThreadKey
-            navigateToConversation = true
-            withAnimation(.easeInOut(duration: 0.25)) { appState.sidebarOpen = false }
+            onOpenConversation(nextKey)
         } catch {
             sessionActionErrorMessage = error.localizedDescription
         }
@@ -1086,14 +1062,14 @@ struct PulsingDot: View {
 }
 
 #if DEBUG
-#Preview("Session Sidebar") {
+#Preview("Sessions Screen") {
     LitterPreviewScene(
         serverManager: LitterPreviewData.makeSidebarManager(),
-        appState: LitterPreviewData.makeAppState(sidebarOpen: true)
+        appState: LitterPreviewData.makeAppState()
     ) {
-        SessionSidebarView(autoLoadSessions: false)
-            .frame(width: SidebarOverlay.sidebarWidth, height: 760)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        NavigationStack {
+            SessionsScreen(autoLoadSessions: false, onOpenConversation: { _ in })
+        }
     }
 }
 #endif
