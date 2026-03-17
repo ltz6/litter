@@ -8,15 +8,16 @@ struct ConversationComposerContentView: View {
     let contextPercent: Int64?
     let isTurnActive: Bool
     let voiceManager: VoiceTranscriptionManager
+    @Binding var showAttachMenu: Bool
     let onClearAttachment: () -> Void
     let onRespondToPendingUserInput: ([String: [String]]) -> Void
-    let onShowAttachMenu: () -> Void
+    let onPasteImage: (UIImage) -> Void
     let onSendText: () -> Void
     let onStopRecording: () -> Void
     let onStartRecording: () -> Void
     let onInterrupt: () -> Void
     @Binding var inputText: String
-    let isComposerFocused: FocusState<Bool>.Binding
+    @Binding var isComposerFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -52,11 +53,13 @@ struct ConversationComposerContentView: View {
                 }
 
                 ConversationComposerEntryRowView(
+                    showAttachMenu: $showAttachMenu,
                     inputText: $inputText,
-                    isComposerFocused: isComposerFocused,
+                    isComposerFocused: $isComposerFocused,
                     voiceManager: voiceManager,
                     isTurnActive: isTurnActive,
-                    onShowAttachMenu: onShowAttachMenu,
+                    hasAttachment: attachedImage != nil,
+                    onPasteImage: onPasteImage,
                     onSendText: onSendText,
                     onStopRecording: onStopRecording,
                     onStartRecording: onStartRecording,

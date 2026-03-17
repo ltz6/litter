@@ -1098,6 +1098,7 @@ final class ServerManager {
 
     func send(
         _ text: String,
+        attachmentImage: UIImage? = nil,
         skillMentions: [SkillMentionSelection] = [],
         cwd: String,
         model: String? = nil,
@@ -1106,6 +1107,10 @@ final class ServerManager {
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
     ) async {
+        let preparedAttachment = attachmentImage.flatMap(ConversationAttachmentSupport.prepareImage)
+        let images = preparedAttachment.map { [$0.chatImage] } ?? []
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty || !images.isEmpty || !skillMentions.isEmpty else { return }
         var key = activeThreadKey
         if key == nil {
             guard let serverId = connections.values.first(where: { $0.isConnected })?.id else { return }
@@ -1127,7 +1132,7 @@ final class ServerManager {
                     serverName: conn?.server.name ?? "Server",
                     serverSource: conn?.server.source ?? .local
                 )
-                state.items.append(makeUserItem(text: text, sourceTurnId: nil, sourceTurnIndex: nil, isBoundary: true))
+                state.items.append(makeUserItem(text: text, images: images, sourceTurnId: nil, sourceTurnIndex: nil, isBoundary: true))
                 state.items.append(makeErrorItem(message: error.localizedDescription, sourceTurnId: nil, sourceTurnIndex: nil))
                 state.status = .error(error.localizedDescription)
                 threads[errorKey] = state
@@ -1137,14 +1142,22 @@ final class ServerManager {
         }
         guard let key, let thread = threads[key], let conn = connections[key.serverId] else { return }
         let nextTurnIndex = threadTurnCounts[key] ?? inferredTurnCount(from: thread.items)
-        thread.items.append(makeUserItem(text: text, sourceTurnId: nil, sourceTurnIndex: nextTurnIndex, isBoundary: true))
+        thread.items.append(makeUserItem(text: text, images: images, sourceTurnId: nil, sourceTurnIndex: nextTurnIndex, isBoundary: true))
         thread.status = .thinking
         thread.updatedAt = Date()
         requestNotificationPermissionIfNeeded()
-        startLiveActivity(key: key, model: thread.model, cwd: thread.cwd, prompt: text)
+        startLiveActivity(
+            key: key,
+            model: thread.model,
+            cwd: thread.cwd,
+            prompt: !trimmedText.isEmpty ? text : (!images.isEmpty ? "Shared image" : text)
+        )
         do {
-            let skillInputs = skillMentions.map { mention in
+            var additionalInputs = skillMentions.map { mention in
                 UserInput(type: "skill", path: mention.path, name: mention.name)
+            }
+            if let preparedAttachment {
+                additionalInputs.append(preparedAttachment.userInput)
             }
             let resp = try await conn.sendTurn(
                 threadId: key.threadId,
@@ -1154,7 +1167,7 @@ final class ServerManager {
                 model: model,
                 effort: effort,
                 serviceTier: serviceTier,
-                additionalInput: skillInputs
+                additionalInput: additionalInputs
             )
             NSLog("[send] sendTurn succeeded, turnId=%@", resp.turnId ?? "nil")
             thread.activeTurnId = resp.turnId

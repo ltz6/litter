@@ -265,7 +265,7 @@ struct UserInput: Encodable {
         case text
         case path
         case name
-        case imageURL = "image_url"
+        case url
     }
 
     init(type: String, text: String? = nil, path: String? = nil, name: String? = nil, imageURL: String? = nil) {
@@ -274,6 +274,17 @@ struct UserInput: Encodable {
         self.path = path
         self.name = name
         self.imageURL = imageURL
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(text, forKey: .text)
+        try container.encodeIfPresent(path, forKey: .path)
+        try container.encodeIfPresent(name, forKey: .name)
+        if type == "image" {
+            try container.encodeIfPresent(imageURL, forKey: .url)
+        }
     }
 }
 

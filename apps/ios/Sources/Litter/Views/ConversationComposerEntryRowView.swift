@@ -1,11 +1,14 @@
 import SwiftUI
+import UIKit
 
 struct ConversationComposerEntryRowView: View {
+    @Binding var showAttachMenu: Bool
     @Binding var inputText: String
-    let isComposerFocused: FocusState<Bool>.Binding
+    @Binding var isComposerFocused: Bool
     let voiceManager: VoiceTranscriptionManager
     let isTurnActive: Bool
-    let onShowAttachMenu: () -> Void
+    let hasAttachment: Bool
+    let onPasteImage: (UIImage) -> Void
     let onSendText: () -> Void
     let onStopRecording: () -> Void
     let onStartRecording: () -> Void
@@ -15,10 +18,16 @@ struct ConversationComposerEntryRowView: View {
         !inputText.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
+    private var canSend: Bool {
+        hasText || hasAttachment
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
             if !voiceManager.isRecording && !voiceManager.isTranscribing && !isTurnActive {
-                Button(action: onShowAttachMenu) {
+                Button {
+                    showAttachMenu = true
+                } label: {
                     Image(systemName: "plus")
                         .litterFont(.body, weight: .semibold)
                         .foregroundColor(LitterTheme.textPrimary)
@@ -29,17 +38,24 @@ struct ConversationComposerEntryRowView: View {
             }
 
             HStack(spacing: 0) {
-                TextField("Message litter...", text: $inputText, axis: .vertical)
-                    .litterFont(.body)
-                    .foregroundColor(LitterTheme.textPrimary)
-                    .lineLimit(1...5)
-                    .focused(isComposerFocused)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .padding(.leading, 16)
-                    .padding(.vertical, 10)
+                ZStack(alignment: .topLeading) {
+                    ConversationComposerTextView(
+                        text: $inputText,
+                        isFocused: $isComposerFocused,
+                        onPasteImage: onPasteImage
+                    )
 
-                if hasText {
+                    if inputText.isEmpty {
+                        Text("Message litter...")
+                            .litterFont(.body)
+                            .foregroundColor(LitterTheme.textMuted)
+                            .padding(.leading, 16)
+                            .padding(.top, 10)
+                            .allowsHitTesting(false)
+                    }
+                }
+
+                if canSend {
                     Button(action: onSendText) {
                         Image(systemName: "arrow.up.circle.fill")
                             .litterFont(.title2)

@@ -329,8 +329,14 @@ final class ServerConnection: Identifiable {
         serviceTier: String? = nil,
         additionalInput: [UserInput] = []
     ) async throws -> TurnStartResponse {
-        var inputs: [UserInput] = [UserInput(type: "text", text: text)]
-        inputs.append(contentsOf: additionalInput)
+        let inputs = ConversationAttachmentSupport.buildTurnInputs(text: text, additionalInput: additionalInput)
+        guard !inputs.isEmpty else {
+            throw NSError(
+                domain: "Litter",
+                code: 1020,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot send an empty turn"]
+            )
+        }
         return try await routedSendRequest(
             method: "turn/start",
             params: TurnStartParams(
