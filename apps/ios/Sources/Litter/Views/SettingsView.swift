@@ -24,8 +24,8 @@ struct SettingsView: View {
                 LitterTheme.backgroundGradient.ignoresSafeArea()
                 Form {
                     appearanceSection
-                    conversationSection
                     fontSection
+                    conversationSection
                     experimentalSection
                     accountSection
                     serversSection

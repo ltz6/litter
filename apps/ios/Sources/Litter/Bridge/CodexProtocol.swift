@@ -284,6 +284,7 @@ struct TurnStartParams: Encodable {
     var sandboxPolicy: TurnSandboxPolicy?
     var model: String?
     var effort: String?
+    var serviceTier: String?
 }
 
 enum TurnSandboxPolicy: Encodable {

@@ -11,6 +11,7 @@ struct HeaderView: View {
     @State private var isReloading = false
     @State private var showOAuth = false
     @State private var pulsing = false
+    @AppStorage("fastMode") private var fastMode = false
 
     var topInset: CGFloat = 0
 
@@ -45,6 +46,11 @@ struct HeaderView: View {
                                 .onChange(of: shouldPulse) { _, pulse in
                                     pulsing = pulse
                                 }
+                            if fastMode {
+                                Image(systemName: "bolt.fill")
+                                    .litterFont(size: 10, weight: .semibold)
+                                    .foregroundColor(LitterTheme.warning)
+                            }
                             Text(sessionModelLabel)
                                 .foregroundColor(LitterTheme.textPrimary)
                             Text(sessionReasoningLabel)
@@ -265,6 +271,7 @@ struct InlineModelSelectorView: View {
     let models: [CodexModel]
     @Binding var selectedModel: String
     @Binding var reasoningEffort: String
+    @AppStorage("fastMode") private var fastMode = false
     var onDismiss: () -> Void
 
     private var currentModel: CodexModel? {
@@ -343,6 +350,29 @@ struct InlineModelSelectorView: View {
                     .padding(.vertical, 8)
                 }
             }
+
+            Divider().background(LitterTheme.separator).padding(.horizontal, 12)
+
+            HStack(spacing: 6) {
+                Button {
+                    fastMode.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "bolt.fill")
+                            .litterFont(size: 9, weight: .semibold)
+                        Text("Fast")
+                            .litterFont(.caption2, weight: .medium)
+                    }
+                    .foregroundColor(fastMode ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(fastMode ? LitterTheme.warning : LitterTheme.surfaceLight)
+                    .clipShape(Capsule())
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
         .padding(.vertical, 4)
         .fixedSize(horizontal: false, vertical: true)
@@ -354,6 +384,7 @@ struct ModelSelectorSheet: View {
     let models: [CodexModel]
     @Binding var selectedModel: String
     @Binding var reasoningEffort: String
+    @AppStorage("fastMode") private var fastMode = false
 
     private var currentModel: CodexModel? {
         models.first { $0.id == selectedModel }
@@ -420,6 +451,29 @@ struct ModelSelectorSheet: View {
                     .padding(.vertical, 12)
                 }
             }
+
+            Divider().background(LitterTheme.separator).padding(.leading, 20)
+
+            HStack(spacing: 6) {
+                Button {
+                    fastMode.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "bolt.fill")
+                            .litterFont(size: 9, weight: .semibold)
+                        Text("Fast")
+                            .litterFont(.caption2, weight: .medium)
+                    }
+                    .foregroundColor(fastMode ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(fastMode ? LitterTheme.warning : LitterTheme.surfaceLight)
+                    .clipShape(Capsule())
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
 
             Spacer()
         }

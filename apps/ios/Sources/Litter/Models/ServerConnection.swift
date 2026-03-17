@@ -326,6 +326,7 @@ final class ServerConnection: Identifiable {
         sandboxMode: String? = nil,
         model: String? = nil,
         effort: String? = nil,
+        serviceTier: String? = nil,
         additionalInput: [UserInput] = []
     ) async throws -> TurnStartResponse {
         var inputs: [UserInput] = [UserInput(type: "text", text: text)]
@@ -338,7 +339,8 @@ final class ServerConnection: Identifiable {
                 approvalPolicy: approvalPolicy,
                 sandboxPolicy: TurnSandboxPolicy(mode: sandboxMode),
                 model: model,
-                effort: effort
+                effort: effort,
+                serviceTier: serviceTier
             ),
             responseType: TurnStartResponse.self
         )

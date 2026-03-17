@@ -1102,6 +1102,7 @@ final class ServerManager {
         cwd: String,
         model: String? = nil,
         effort: String? = nil,
+        serviceTier: String? = nil,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
     ) async {
@@ -1152,6 +1153,7 @@ final class ServerManager {
                 sandboxMode: sandboxMode,
                 model: model,
                 effort: effort,
+                serviceTier: serviceTier,
                 additionalInput: skillInputs
             )
             NSLog("[send] sendTurn succeeded, turnId=%@", resp.turnId ?? "nil")

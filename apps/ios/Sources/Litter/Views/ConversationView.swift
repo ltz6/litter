@@ -24,6 +24,7 @@ struct ConversationView: View {
     var onResumeSessions: ((String) -> Void)? = nil
     @AppStorage("workDir") private var workDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"
     @AppStorage("conversationTextSizeStep") private var conversationTextSizeStep = ConversationTextSize.large.rawValue
+    @AppStorage("fastMode") private var fastMode = false
     @State private var messageActionError: String?
     @State private var hasLoggedFirstRender = false
 
@@ -131,6 +132,7 @@ struct ConversationView: View {
                 cwd: workDir,
                 model: pendingModelOverride,
                 effort: pendingReasoningOverride,
+                serviceTier: fastMode ? "fast" : nil,
                 approvalPolicy: appState.approvalPolicy,
                 sandboxMode: appState.sandboxMode
             )
@@ -145,6 +147,7 @@ struct ConversationView: View {
                 cwd: workDir,
                 model: pendingModelOverride,
                 effort: pendingReasoningOverride,
+                serviceTier: fastMode ? "fast" : nil,
                 approvalPolicy: appState.approvalPolicy,
                 sandboxMode: appState.sandboxMode
             )
@@ -255,7 +258,7 @@ struct RateLimitBadgeView: View, Equatable {
     var body: some View {
         HStack(spacing: 3) {
             Text(label)
-                .litterMonoFont(size: 7.5, weight: .semibold)
+                .litterMonoFont(size: 9.5, weight: .semibold)
                 .foregroundColor(LitterTheme.textSecondary)
             ContextBadgeView(percent: percent, tint: tint)
         }

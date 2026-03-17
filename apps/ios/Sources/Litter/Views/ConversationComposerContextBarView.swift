@@ -28,7 +28,7 @@ struct ConversationComposerContextBarView: View {
             }
         }
         // Keep the composer chrome height stable even when no badges are available.
-        .frame(maxWidth: .infinity, minHeight: 13, alignment: .trailing)
+        .frame(maxWidth: .infinity, minHeight: 16, alignment: .trailing)
         .padding(.horizontal, 12)
         .padding(.top, -2)
         .padding(.trailing, 40)
