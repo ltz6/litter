@@ -507,6 +507,9 @@ final class ServerConnection: Identifiable {
     }
 
     func loginWithChatGPT() async {
+        await checkAuth()
+        guard authStatus == .notLoggedIn else { return }
+
         do {
             let resp: LoginStartResponse = try await routedSendRequest(
                 method: "account/login/start",

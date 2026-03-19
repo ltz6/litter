@@ -320,7 +320,8 @@ final class ServerManager {
 
     // MARK: - Server Lifecycle
 
-    func addServer(_ server: DiscoveredServer, target: ConnectionTarget) async {
+    @discardableResult
+    func addServer(_ server: DiscoveredServer, target: ConnectionTarget) async -> String {
         startNetworkMonitorIfNeeded()
 
         if let existing = connections[server.id] {
@@ -332,11 +333,22 @@ final class ServerManager {
                         await refreshSessions(for: server.id)
                     }
                 }
-                return
+                return server.id
             }
 
             existing.disconnect()
             connections.removeValue(forKey: server.id)
+        }
+
+        if let existing = connections.values.first(where: { $0.server.deduplicationKey == server.deduplicationKey }) {
+            configureConnectionCallbacks(existing, serverId: existing.id)
+            if !existing.isConnected {
+                await existing.connect()
+                if existing.isConnected {
+                    await refreshSessions(for: existing.id)
+                }
+            }
+            return existing.id
         }
 
         let conn = ServerConnection(server: server, target: target)
@@ -347,6 +359,7 @@ final class ServerManager {
         if conn.isConnected {
             await refreshSessions(for: server.id)
         }
+        return server.id
     }
 
     private func configureConnectionCallbacks(_ conn: ServerConnection, serverId: String) {

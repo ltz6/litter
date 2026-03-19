@@ -24,7 +24,6 @@ private struct AccountConnectionView: View {
     @State private var apiKey = ""
     @State private var isWorking = false
     @State private var errorMsg: String?
-    @State private var showOAuth = false
 
     private var authStatus: AuthStatus {
         connection.authStatus
@@ -58,18 +57,7 @@ private struct AccountConnectionView: View {
                 }
             }
         }
-        .sheet(isPresented: $showOAuth) {
-            oauthSheet
-        }
-        .onChange(of: connection.oauthURL) { _, url in
-            showOAuth = url != nil
-        }
-        .onChange(of: connection.loginCompleted) { _, completed in
-            if completed == true {
-                showOAuth = false
-                connection.loginCompleted = false
-            }
-        }
+        .oauthLoginPresenter(connection: connection)
     }
 
     private var currentAccountSection: some View {
@@ -181,31 +169,6 @@ private struct AccountConnectionView: View {
                 }
                 .padding(.horizontal, 16)
                 .disabled(apiKey.trimmingCharacters(in: .whitespaces).isEmpty || isWorking)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var oauthSheet: some View {
-        if let url = connection.oauthURL {
-            NavigationStack {
-                OAuthWebView(url: url, onCallbackIntercepted: { callbackURL in
-                    connection.forwardOAuthCallback(callbackURL)
-                }) {
-                    Task { await connection.cancelLogin() }
-                }
-                .ignoresSafeArea()
-                .navigationTitle("Login with ChatGPT")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Cancel") {
-                            Task { await connection.cancelLogin() }
-                            showOAuth = false
-                        }
-                        .foregroundColor(LitterTheme.danger)
-                    }
-                }
             }
         }
     }

@@ -38,10 +38,18 @@ enum LitterPalette {
     static var textOnAccent: Pair   { pair("textOnAccent", lightFallback: "#FFFFFF", darkFallback: "#0D0D0D") }
     static var codeBackground: Pair { pair("codeBackground", lightFallback: "#F0F0F5", darkFallback: "#111111") }
 
-    // MARK: - Non-adaptive
+    // MARK: - Font
 
-    static let amberHex  = "#F5A623"
-    static let dangerHex = "#FF6B6B"
+    /// Whether the user prefers monospaced font. Reads from the shared App Group.
+    static var isMono: Bool {
+        let raw = shared?.string(forKey: "fontFamily") ?? "mono"
+        return raw == "mono"
+    }
+
+    /// Font design matching the user's font preference.
+    static var fontDesign: Font.Design {
+        isMono ? .monospaced : .default
+    }
 }
 
 // MARK: - SwiftUI helpers for widget / preview use
@@ -64,7 +72,3 @@ extension LitterPalette.Pair {
     }
 }
 
-extension LitterPalette {
-    static let amber  = LitterPalette.Pair.colorFromHex(amberHex)
-    static let dangerFixed = LitterPalette.Pair.colorFromHex(dangerHex)
-}
