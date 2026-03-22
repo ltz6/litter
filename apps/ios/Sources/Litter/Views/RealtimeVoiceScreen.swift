@@ -72,9 +72,9 @@ struct RealtimeVoiceScreen: View {
         }
         switch connection.authStatus {
         case .chatgpt:
-            return !connection.hasOpenAIApiKey
+            return true
         case .notLoggedIn:
-            return !connection.hasOpenAIApiKey
+            return true
         case .apiKey, .unknown:
             return false
         }
@@ -307,10 +307,15 @@ struct RealtimeVoiceScreen: View {
         apiKeyError = nil
 
         Task {
-            await connection.saveOpenAIApiKey(trimmedApiKey)
+            await connection.loginWithApiKey(trimmedApiKey)
             await connection.checkAuth()
 
-            let apiKeySaved = connection.hasOpenAIApiKey
+            let apiKeySaved: Bool
+            if case .apiKey = connection.authStatus {
+                apiKeySaved = true
+            } else {
+                apiKeySaved = false
+            }
             let authError = connection.lastAuthError
 
             if apiKeySaved {

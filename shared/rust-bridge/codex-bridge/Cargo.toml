@@ -8,18 +8,16 @@ name = "codex_bridge"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-codex-app-server = { path = "../../third_party/codex/codex-rs/app-server" }
-codex-app-server-client = { path = "../../third_party/codex/codex-rs/app-server-client" }
-codex-app-server-protocol = { path = "../../third_party/codex/codex-rs/app-server-protocol" }
-codex-protocol = { path = "../../third_party/codex/codex-rs/protocol" }
-codex-utils-cli = { path = "../../third_party/codex/codex-rs/utils/cli" }
-codex-core = { path = "../../third_party/codex/codex-rs/core" }
-codex-apply-patch = { path = "../../third_party/codex/codex-rs/apply-patch" }
-codex-arg0 = { path = "../../third_party/codex/codex-rs/arg0" }
-codex-feedback = { path = "../../third_party/codex/codex-rs/feedback" }
-codex-cloud-requirements = { path = "../../third_party/codex/codex-rs/cloud-requirements" }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+codex-mobile-client = { path = "../codex-mobile-client" }
+codex-app-server-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+codex-core = { workspace = true }
+codex-apply-patch = { workspace = true }
+webrtc-audio-processing = { version = "2.0.0", features = ["bundled"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 webrtc-audio-processing = { version = "2.0.0", features = ["bundled"] }
@@ -27,12 +25,3 @@ webrtc-audio-processing = { version = "2.0.0", features = ["bundled"] }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 openssl-sys = { version = "0.9", features = ["vendored"] }
-
-[patch.crates-io]
-webrtc-audio-processing-sys = { path = "../vendor/webrtc-audio-processing-sys" }
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
-crossterm = { git = "https://github.com/nornagon/crossterm", branch = "nornagon/color-query" }
-
-[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }

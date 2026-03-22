@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SSHLoginSheet: View {
     let server: DiscoveredServer
-    let onConnect: (ConnectionTarget, String?) -> Void
+    let onConnect: (ConnectionTarget) -> Void
     private let autoLoadSavedCredentials: Bool
 
     @Environment(\.dismiss) private var dismiss
@@ -21,7 +21,7 @@ struct SSHLoginSheet: View {
         server: DiscoveredServer,
         autoLoadSavedCredentials: Bool = true,
         initialUsername: String = "",
-        onConnect: @escaping (ConnectionTarget, String?) -> Void
+        onConnect: @escaping (ConnectionTarget) -> Void
     ) {
         self.server = server
         self.onConnect = onConnect
@@ -192,24 +192,6 @@ struct SSHLoginSheet: View {
 
         Task {
             do {
-                let ssh = SSHSessionManager.shared
-                try await ssh.connect(host: server.hostname, port: sshPort, credentials: credentials)
-                let port = try await ssh.startRemoteServer()
-                let detectedWakeMAC = await ssh.discoverWakeMACAddress()
-                var remoteHost = server.hostname
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-                    .replacingOccurrences(of: "%25", with: "%")
-                if !remoteHost.contains(":"), let pct = remoteHost.firstIndex(of: "%") {
-                    remoteHost = String(remoteHost[..<pct])
-                }
-                let target: ConnectionTarget
-                if server.sshPortForwardingEnabled {
-                    let localPort = try await ssh.establishLocalPortForward(remotePort: port)
-                    target = .remote(host: "127.0.0.1", port: localPort)
-                } else {
-                    target = .remote(host: remoteHost, port: port)
-                }
-
                 do {
                     if rememberCredentials {
                         try SSHCredentialStore.shared.save(
@@ -228,7 +210,7 @@ struct SSHLoginSheet: View {
 
                 clearSensitiveInput()
                 isConnecting = false
-                onConnect(target, detectedWakeMAC)
+                onConnect(.sshThenRemote(host: server.hostname, credentials: credentials))
             } catch {
                 isConnecting = false
                 errorMessage = error.localizedDescription
@@ -308,6 +290,6 @@ struct SSHLoginSheet: View {
         server: LitterPreviewData.sampleSSHServer,
         autoLoadSavedCredentials: false,
         initialUsername: "builder"
-    ) { _, _ in }
+    ) { _ in }
 }
 #endif

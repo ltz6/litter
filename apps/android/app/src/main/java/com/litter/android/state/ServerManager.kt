@@ -42,6 +42,11 @@ data class FuzzyFileSearchResult(
     val indices: List<Int> = emptyList(),
 )
 
+// MIGRATION: This class is being replaced by RustServerManagerBridge, which delegates
+// to the Rust MobileClient via RustMobileClient JNI instead of WebSocket-based transports.
+// See docs/server-manager-migration.md for the phased migration plan.
+// During the transition both classes coexist; do not delete this file until all call sites
+// have been moved to RustServerManagerBridge.
 class ServerManager(
     context: Context? = null,
     private val codexRpcClient: CodexRpcClient = CodexRpcClient(),

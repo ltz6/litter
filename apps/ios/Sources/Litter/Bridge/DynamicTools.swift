@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Dynamic Tool Spec (sent on thread/start)
 
-struct DynamicToolSpec: Encodable {
+struct DynamicToolSpecParams: Encodable {
     let name: String
     let description: String
     let inputSchema: AnyEncodable
@@ -12,9 +12,10 @@ struct DynamicToolSpec: Encodable {
     }
 }
 
-// MARK: - Dynamic Tool Call Request (server → client via item/tool/call)
+// MARK: - Dynamic Tool Call Helpers
 
-struct DynamicToolCallParams {
+/// Parsed dynamic tool call from raw JSON server request params.
+struct ParsedDynamicToolCall {
     let threadId: String
     let turnId: String
     let callId: String
@@ -36,9 +37,8 @@ struct DynamicToolCallParams {
     }
 }
 
-// MARK: - Dynamic Tool Call Response (client → server)
-
-struct DynamicToolCallResponse {
+/// Convenience builder for dynamic tool call responses sent back to the server.
+struct DynamicToolResult {
     let contentItems: [[String: Any]]
     let success: Bool
 
@@ -46,15 +46,15 @@ struct DynamicToolCallResponse {
         ["contentItems": contentItems, "success": success]
     }
 
-    static func text(_ text: String) -> DynamicToolCallResponse {
-        DynamicToolCallResponse(
+    static func text(_ text: String) -> DynamicToolResult {
+        DynamicToolResult(
             contentItems: [["type": "inputText", "text": text]],
             success: true
         )
     }
 
-    static func error(_ message: String) -> DynamicToolCallResponse {
-        DynamicToolCallResponse(
+    static func error(_ message: String) -> DynamicToolResult {
+        DynamicToolResult(
             contentItems: [["type": "inputText", "text": message]],
             success: false
         )

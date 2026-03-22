@@ -3,48 +3,67 @@ import Foundation
 enum CrossServerTools {
     static let listServersToolName = "list_servers"
     static let listSessionsToolName = "list_sessions"
+    static let readSessionToolName = "read_session"
     static let runOnServerToolName = "run_on_server"
 
-    static func buildDynamicToolSpecs() -> [DynamicToolSpec] {
+    /// Build the dynamic tool specs for cross-server operations.
+    static func buildDynamicToolSpecs() -> [DynamicToolSpecParams] {
         [
             listServersSpec(),
-            listSessionsSpec()
+            listSessionsSpec(),
+            readSessionSpec(),
+            runOnServerSpec()
         ]
     }
 
-    private static func listServersSpec() -> DynamicToolSpec {
-        DynamicToolSpec(
+    /// Returns true if the given tool name is a cross-server tool that
+    /// should be rendered with rich formatting in the conversation timeline.
+    static func isRichTool(_ toolName: String) -> Bool {
+        switch toolName {
+        case listServersToolName, listSessionsToolName, readSessionToolName, runOnServerToolName:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func listServersSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
             name: listServersToolName,
-            description: "List connected servers, including local and remote hosts.",
+            description: "List all connected servers and their status.",
             inputSchema: AnyEncodable(JSONSchema.object([:], required: []))
         )
     }
 
-    private static func listSessionsSpec() -> DynamicToolSpec {
-        DynamicToolSpec(
+    private static func listSessionsSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
             name: listSessionsToolName,
-            description: "List recent sessions across all connected servers or on a specific server.",
+            description: "List recent sessions/threads on a specific server or all connected servers.",
             inputSchema: AnyEncodable(JSONSchema.object([
-                "server": .string(description: "Optional server name or ID to filter by."),
-                "server_id": .string(description: "Optional server ID to filter by."),
-                "limit": .number(description: "Optional maximum number of sessions per server.")
+                "server": .string(description: "Server name to query. Omit to query all connected servers.")
             ], required: []))
         )
     }
 
-    private static func runOnServerSpec() -> DynamicToolSpec {
-        DynamicToolSpec(
-            name: runOnServerToolName,
-            description: "Run a prompt on a specific connected server and return the result.",
+    private static func readSessionSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
+            name: readSessionToolName,
+            description: "Read the full conversation history of a session on a specific server.",
             inputSchema: AnyEncodable(JSONSchema.object([
-                "server": .string(description: "Target server name or ID."),
-                "server_id": .string(description: "Target server ID."),
-                "prompt": .string(description: "Prompt to send."),
-                "thread_id": .string(description: "Optional existing thread ID to reuse."),
-                "model": .string(description: "Optional model override."),
-                "effort": .string(description: "Optional reasoning effort override."),
-                "service_tier": .string(description: "Optional service tier override.")
-            ], required: ["prompt"]))
+                "server": .string(description: "Server name where the session lives."),
+                "session_id": .string(description: "The session/thread ID to read.")
+            ], required: ["server", "session_id"]))
+        )
+    }
+
+    private static func runOnServerSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
+            name: runOnServerToolName,
+            description: "Run a prompt on a remote server. Creates or reuses a thread and waits for the turn to complete.",
+            inputSchema: AnyEncodable(JSONSchema.object([
+                "server": .string(description: "Server name to run the prompt on."),
+                "prompt": .string(description: "The prompt to send.")
+            ], required: ["server", "prompt"]))
         )
     }
 }

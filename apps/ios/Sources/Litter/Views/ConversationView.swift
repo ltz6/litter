@@ -1,7 +1,6 @@
 import SwiftUI
 import PhotosUI
 import UIKit
-import Inject
 import os
 
 private let conversationViewSignpostLog = OSLog(
@@ -10,7 +9,6 @@ private let conversationViewSignpostLog = OSLog(
 )
 
 struct ConversationView: View {
-    @ObserveInjection var inject
     @Environment(AppState.self) private var appState
     let connection: ServerConnection
     let activeThreadKey: ThreadKey
@@ -121,7 +119,6 @@ struct ConversationView: View {
             hasLoggedFirstRender = true
             os_signpost(.event, log: conversationViewSignpostLog, name: "ConversationFirstRender")
         }
-        .enableInjection()
     }
 
     private func sendMessage(_ text: String, attachmentImage: UIImage?, skillMentions: [SkillMentionSelection]) {
@@ -802,6 +799,7 @@ private struct ConversationTurnRow: View {
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 12) {
+            // Render items with inline handoff views interleaved after each handoff note.
             ConversationTurnTimeline(
                 items: turn.items,
                 isLive: turn.isLive,
@@ -1686,7 +1684,7 @@ private struct ConversationInputBar: View {
             let response = try await connection.listSkills(cwds: [workDir], forceReload: forceReload)
             let loadedSkills = response.data.flatMap(\.skills).sorted { $0.name.lowercased() < $1.name.lowercased() }
             skills = loadedSkills
-            let validPaths = Set(loadedSkills.map(\.path))
+            let validPaths = Set(loadedSkills.map(\.path.value))
             mentionSkillPathsByName = mentionSkillPathsByName.filter { _, path in validPaths.contains(path) }
         } catch {
             if showErrors {
@@ -1744,7 +1742,7 @@ private struct ConversationInputBar: View {
             replacement: replacement
         ) else { return }
         inputText = updated
-        mentionSkillPathsByName[skill.name.lowercased()] = skill.path
+        mentionSkillPathsByName[skill.name.lowercased()] = skill.path.value
         showSkillPopup = false
         activeDollarToken = nil
     }
@@ -1755,7 +1753,7 @@ private struct ConversationInputBar: View {
         guard !mentionNames.isEmpty else { return [] }
 
         let skillsByName = Dictionary(grouping: skills, by: { $0.name.lowercased() })
-        let skillsByPath = Dictionary(grouping: skills, by: \.path)
+        let skillsByPath = Dictionary(grouping: skills, by: \.path.value)
         var seenPaths = Set<String>()
         var resolved: [SkillMentionSelection] = []
 
@@ -1774,8 +1772,8 @@ private struct ConversationInputBar: View {
                 continue
             }
             let match = candidates[0]
-            guard seenPaths.insert(match.path).inserted else { continue }
-            resolved.append(SkillMentionSelection(name: match.name, path: match.path))
+            guard seenPaths.insert(match.path.value).inserted else { continue }
+            resolved.append(SkillMentionSelection(name: match.name, path: match.path.value))
         }
         return resolved
     }

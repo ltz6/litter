@@ -1,6 +1,5 @@
 import SwiftUI
 import Textual
-import Inject
 
 // MARK: - Reusable bubble components
 
@@ -180,7 +179,6 @@ struct StreamingAssistantBubble: View {
 // MARK: - Full message bubble (used in conversation)
 
 struct MessageBubbleView: View {
-    @ObserveInjection var inject
     private let renderCache = MessageRenderCache.shared
     let message: ChatMessage
     let serverId: String?
@@ -239,7 +237,6 @@ struct MessageBubbleView: View {
                 }
             }
         }
-        .enableInjection()
     }
 
     private var renderRevisionKey: MessageRenderCache.RevisionKey {
@@ -292,8 +289,9 @@ struct MessageBubbleView: View {
         } else {
             let parsed = assistantSegmentsForRendering
             let hasImages = parsed.contains { if case .image = $0.kind { return true } else { return false } }
+            let canUseSingleBubble = parsed.count == 1 && !hasImages
 
-            if !hasImages {
+            if canUseSingleBubble {
                 if let first = parsed.first,
                    case let .markdown(content, identity) = first.kind {
                     AssistantBubble(

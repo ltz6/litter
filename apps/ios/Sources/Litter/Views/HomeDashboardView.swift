@@ -184,108 +184,46 @@ struct HomeDashboardView: View {
     }
 
     private func recentSessionCard(_ thread: ThreadState) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: thread.hasTurnActive ? "sparkles" : "text.bubble")
-                .litterFont(size: 16, weight: .medium)
-                .foregroundColor(LitterTheme.accent)
-                .frame(width: 28, height: 28)
-                .background(LitterTheme.accent.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(thread.sessionTitle)
-                    .litterFont(.subheadline)
-                    .foregroundColor(LitterTheme.textPrimary)
-                    .lineLimit(1)
-
-                HStack(spacing: 6) {
-                    Text(thread.serverName)
-
-                    if let workspace = HomeDashboardSupport.workspaceLabel(for: thread) {
-                        metadataDivider
-                        Text(workspace)
-                    }
-
-                    metadataDivider
-                    Text(thread.updatedAt, style: .relative)
-                }
-                .litterFont(.caption)
-                .foregroundColor(LitterTheme.textMuted)
-                .lineLimit(1)
+        let subtitle: String = {
+            var parts = [thread.serverName]
+            if let workspace = HomeDashboardSupport.workspaceLabel(for: thread) {
+                parts.append(workspace)
             }
+            return parts.joined(separator: " · ")
+        }()
 
-            Spacer(minLength: 0)
+        let trailing: SessionServerCardRow.Trailing = {
+            if openingRecentSessionKey == thread.key { return .none }
+            if thread.hasTurnActive { return .badge("Thinking") }
+            return .chevron
+        }()
 
+        return ZStack {
+            SessionServerCardRow(
+                icon: thread.hasTurnActive ? "sparkles" : "text.bubble",
+                title: thread.sessionTitle,
+                subtitle: subtitle,
+                trailing: trailing
+            )
+            // Overlay loading spinner when opening.
             if openingRecentSessionKey == thread.key {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(LitterTheme.accent)
-            } else if thread.hasTurnActive {
-                statusBadge("Thinking")
-            } else {
-                Image(systemName: "chevron.right")
-                    .litterFont(size: 12, weight: .semibold)
-                    .foregroundColor(LitterTheme.textMuted)
+                HStack {
+                    Spacer()
+                    ProgressView().controlSize(.small).tint(LitterTheme.accent)
+                }
+                .padding(.trailing, 14)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(LitterTheme.surface.opacity(0.6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 14))
         .accessibilityIdentifier("home.recentSessionCard")
     }
 
     private func connectedServerRow(_ connection: ServerConnection) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: connection.server.source == .local ? "iphone" : "server.rack")
-                .litterFont(size: 16, weight: .medium)
-                .foregroundColor(LitterTheme.accent)
-                .frame(width: 28, height: 28)
-                .background(LitterTheme.accent.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(connection.server.name)
-                    .litterFont(.subheadline)
-                    .foregroundColor(LitterTheme.textPrimary)
-                    .lineLimit(1)
-
-                Text(HomeDashboardSupport.serverSubtitle(for: connection.server))
-                    .litterFont(.caption)
-                    .foregroundColor(LitterTheme.textMuted)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(LitterTheme.accent)
-                    .frame(width: 8, height: 8)
-
-                Text("Connected")
-                    .litterFont(.caption)
-                    .foregroundColor(LitterTheme.textMuted)
-
-                Image(systemName: "chevron.right")
-                    .litterFont(size: 12, weight: .semibold)
-                    .foregroundColor(LitterTheme.textMuted)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(LitterTheme.surface.opacity(0.6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(LitterTheme.border.opacity(0.7), lineWidth: 1)
+        SessionServerCardRow(
+            icon: connection.server.source == .local ? "iphone" : "server.rack",
+            title: connection.server.name,
+            subtitle: HomeDashboardSupport.serverSubtitle(for: connection.server),
+            trailing: .status(connected: connection.isConnected)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 14))
         .accessibilityIdentifier("home.connectedServerRow")
     }
 

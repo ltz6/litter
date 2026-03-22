@@ -18,7 +18,7 @@
 
 ## Repository layout
 
-- `apps/ios`: iOS app (`LitterRemote` and `Litter` schemes)
+- `apps/ios`: iOS app (`Litter` scheme)
 - `apps/android`: Android app
   - `app`: Compose UI shell, app state, server manager, SSH/auth flows
   - `core/bridge`: native bridge bootstrapping and core RPC client
@@ -29,17 +29,12 @@
 - `patches/codex`: local Codex patch set
 - `tools/scripts`: cross-platform helper scripts
 
-iOS supports:
-
-- `LitterRemote`: remote-only mode (default scheme; no bundled on-device Rust server)
-- `Litter`: includes the on-device Rust bridge (`codex_bridge.xcframework`)
-
 Generated iOS framework artifacts under `apps/ios/Frameworks/` are not stored in git.
-Bootstrap them locally before building:
+Build everything with:
 
 ```bash
-./apps/ios/scripts/download-ios-system.sh
-./apps/ios/scripts/build-rust.sh
+make ios        # full pipeline (rust + frameworks + xcode build)
+make ios-sim    # simulator only (faster)
 ```
 
 ## Prerequisites
@@ -147,15 +142,10 @@ Open in Xcode:
 open apps/ios/Litter.xcodeproj
 ```
 
-Schemes:
-
-- `LitterRemote` (default): no on-device Rust bridge
-- `Litter`: uses bundled `codex_bridge.xcframework`
-
 CLI build example:
 
 ```bash
-xcodebuild -project apps/ios/Litter.xcodeproj -scheme LitterRemote -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+xcodebuild -project apps/ios/Litter.xcodeproj -scheme Litter -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
 ## Build and run Android app
@@ -243,7 +233,7 @@ Notes:
 
 - `testflight-upload.sh` auto-increments build number from the latest App Store Connect build.
 - It archives, exports an IPA, uploads via `asc builds upload`, and assigns the build to `Internal Testers` by default.
-- Override `SCHEME` to `LitterRemote` if you are shipping the remote-only target.
+- Override `SCHEME` if needed (default is `Litter`).
 
 ## Important paths
 

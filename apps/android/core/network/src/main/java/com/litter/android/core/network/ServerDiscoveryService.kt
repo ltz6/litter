@@ -23,25 +23,6 @@ import java.util.concurrent.TimeUnit
 
 private val CODEX_DISCOVERY_PORTS = intArrayOf(8390, 9234, 4222)
 
-enum class DiscoverySource {
-    LOCAL,
-    BUNDLED,
-    BONJOUR,
-    SSH,
-    TAILSCALE,
-    MANUAL,
-    LAN,
-}
-
-data class DiscoveredServer(
-    val id: String,
-    val name: String,
-    val host: String,
-    val port: Int,
-    val source: DiscoverySource = DiscoverySource.LAN,
-    val hasCodexServer: Boolean = false,
-)
-
 private data class DiscoveryCandidate(
     val host: String,
     val name: String?,

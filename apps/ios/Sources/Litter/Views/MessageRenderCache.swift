@@ -23,8 +23,6 @@ final class MessageRenderCache {
     static let shared = MessageRenderCache()
 
     private static let decodedImageCache = NSCache<NSString, UIImage>()
-    private static let inlineImagePattern = "!\\[[^\\]]*\\]\\(data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)\\)|(?<![\\(])data:image/[^;]+;base64,([A-Za-z0-9+/=\\s]+)"
-    private static let inlineImageRegex = try? NSRegularExpression(pattern: inlineImagePattern, options: [])
 
     private let maxEntries = 1024
     private let trimTarget = 768
@@ -58,7 +56,7 @@ final class MessageRenderCache {
             return cached
         }
 
-        let parsed = extractInlineSegments(from: text, messageId: messageId, key: key)
+        let parsed = extractSegments(from: text, messageId: messageId, key: key)
         assistantCache[key] = parsed
         touch(&assistantAccessOrder, key: key)
         trimIfNeeded(&assistantCache, accessOrder: &assistantAccessOrder)
@@ -75,10 +73,8 @@ final class MessageRenderCache {
             return cached
         }
 
-        let parsed = ToolCallMessageParser.parse(
-            message: message,
-            resolveTargetLabel: resolveTargetLabel
-        )
+        let cards = MessageContentBridge.parseToolCalls(text: message.text)
+        let parsed: ToolCallParseResult = cards.first.map { .recognized($0) } ?? .unrecognized
         systemCache[key] = parsed
         touch(&systemAccessOrder, key: key)
         trimIfNeeded(&systemCache, accessOrder: &systemAccessOrder)
@@ -152,100 +148,64 @@ final class MessageRenderCache {
         }
     }
 
-    private func extractInlineSegments(
+    private func extractSegments(
         from text: String,
         messageId: String,
         key: RevisionKey
     ) -> [AssistantSegment] {
-        if !text.contains("data:image/") {
-            return [AssistantSegment(
-                id: "text-0-\(text.count)",
-                kind: .markdown(text, key.revisionToken)
-            )]
-        }
+        assistantSegments(
+            from: MessageContentBridge.segmentAssistantText(text),
+            messageId: messageId,
+            key: key
+        )
+    }
 
-        guard let regex = Self.inlineImageRegex else {
+    private func assistantSegments(
+        from parsedSegments: [MessageContentBridge.AssistantContentSegment],
+        messageId: String,
+        key: RevisionKey
+    ) -> [AssistantSegment] {
+        guard !parsedSegments.isEmpty else {
             return [AssistantSegment(
-                id: "text-0-\(text.count)",
-                kind: .markdown(text, key.revisionToken)
+                id: "text-0-\(messageId.count)",
+                kind: .markdown("", key.revisionToken)
             )]
         }
 
         var segments: [AssistantSegment] = []
-        var lastEnd = text.startIndex
-        let nsRange = NSRange(text.startIndex..., in: text)
-
-        for match in regex.matches(in: text, range: nsRange) {
-            guard let matchRange = Range(match.range, in: text) else { continue }
-            let matchLower = text.distance(from: text.startIndex, to: matchRange.lowerBound)
-            let matchUpper = text.distance(from: text.startIndex, to: matchRange.upperBound)
-
-            if lastEnd < matchRange.lowerBound {
-                let preceding = String(text[lastEnd..<matchRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !preceding.isEmpty {
-                    let fragmentId = "assistant-\(matchLower)-\(matchUpper)"
-                    segments.append(
-                        AssistantSegment(
-                            id: "text-\(text.distance(from: text.startIndex, to: lastEnd))-\(matchLower)",
-                            kind: .markdown(
-                                preceding,
-                                stableFragmentIdentity(key: key, fragmentId: fragmentId)
-                            )
-                        )
-                    )
-                }
-            }
-
-            let base64String: String?
-            if match.range(at: 1).location != NSNotFound, let range = Range(match.range(at: 1), in: text) {
-                base64String = String(text[range])
-            } else if match.range(at: 2).location != NSNotFound, let range = Range(match.range(at: 2), in: text) {
-                base64String = String(text[range])
-            } else {
-                base64String = nil
-            }
-
-            if let base64String,
-               let data = Data(
-                   base64Encoded: base64String.filter { !$0.isWhitespace },
-                   options: .ignoreUnknownCharacters
-               ),
-               let image = Self.decodedImage(
-                   from: data,
-                   cacheKey: "assistant-\(messageId)-\(matchLower)-\(matchUpper)"
-               ) {
+        for (index, segment) in parsedSegments.enumerated() {
+            switch segment {
+            case .markdown(let text):
+                guard !text.isEmpty else { continue }
+                let fragmentId = "assistant-segment-\(index)-text-\(text.count)"
                 segments.append(
                     AssistantSegment(
-                        id: "image-\(matchLower)-\(matchUpper)",
-                        kind: .image(image)
-                    )
-                )
-            }
-
-            lastEnd = matchRange.upperBound
-        }
-
-        if lastEnd < text.endIndex {
-            let remaining = String(text[lastEnd...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !remaining.isEmpty {
-                let startOffset = text.distance(from: text.startIndex, to: lastEnd)
-                let fragmentId = "assistant-tail-\(startOffset)-\(text.count)"
-                segments.append(
-                    AssistantSegment(
-                        id: "text-\(startOffset)-\(text.count)",
+                        id: "text-\(index)-\(text.count)",
                         kind: .markdown(
-                            remaining,
+                            text,
                             stableFragmentIdentity(key: key, fragmentId: fragmentId)
                         )
                     )
                 )
+            case .inlineImage(let data):
+                if let image = Self.decodedImage(
+                    from: data,
+                    cacheKey: "assistant-\(messageId)-segment-\(index)"
+                ) {
+                    segments.append(
+                        AssistantSegment(
+                            id: "image-\(index)-\(data.count)",
+                            kind: .image(image)
+                        )
+                    )
+                }
             }
         }
 
         return segments.isEmpty
             ? [AssistantSegment(
-                id: "text-0-\(text.count)",
-                kind: .markdown(text, key.revisionToken)
+                id: "text-0-\(messageId.count)",
+                kind: .markdown("", key.revisionToken)
             )]
             : segments
     }

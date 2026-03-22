@@ -4,9 +4,112 @@ import Observation
 import UIKit
 import UserNotifications
 
+// MARK: - ThreadResponseWithHydration convenience accessors
+
+extension ThreadResponseWithHydration {
+    /// Pre-hydrated conversation items decoded from the Rust hydration output.
+    var hydratedItems: [ConversationItem] {
+        RustConversationBridge.conversationItems(from: hydratedConversationItems)
+    }
+}
+
 struct SkillMentionSelection: Equatable {
     let name: String
     let path: String
+}
+
+private extension ThreadItem {
+    var threadItemId: String {
+        switch self {
+        case .userMessage(let id, _),
+             .agentMessage(let id, _, _),
+             .plan(let id, _),
+             .reasoning(let id, _, _),
+             .commandExecution(let id, _, _, _, _, _, _, _, _),
+             .fileChange(let id, _, _),
+             .mcpToolCall(let id, _, _, _, _, _, _, _),
+             .dynamicToolCall(let id, _, _, _, _, _, _),
+             .collabAgentToolCall(let id, _, _, _, _, _, _, _, _),
+             .webSearch(let id, _, _),
+             .imageView(let id, _),
+             .imageGeneration(let id, _, _, _),
+             .enteredReviewMode(let id, _),
+             .exitedReviewMode(let id, _),
+             .contextCompaction(let id):
+            return id
+        }
+    }
+
+    var isUserOrAgentMessage: Bool {
+        switch self {
+        case .userMessage, .agentMessage:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var liveActivityLabel: String? {
+        switch self {
+        case .commandExecution(_, let command, _, _, _, _, _, _, _):
+            return command
+        case .dynamicToolCall(_, let tool, _, _, _, _, _):
+            return tool
+        case .mcpToolCall(_, let server, let tool, _, _, _, _, _):
+            return server.isEmpty ? tool : "\(server).\(tool)"
+        case .collabAgentToolCall(_, let tool, _, _, _, _, _, _, _):
+            return tool.displayName
+        case .webSearch(_, let query, _):
+            return query.isEmpty ? "webSearch" : query
+        case .fileChange:
+            return "fileChange"
+        case .plan:
+            return "plan"
+        case .reasoning:
+            return "reasoning"
+        case .imageView:
+            return "imageView"
+        case .imageGeneration:
+            return "imageGeneration"
+        case .enteredReviewMode:
+            return "enteredReviewMode"
+        case .exitedReviewMode:
+            return "exitedReviewMode"
+        case .contextCompaction:
+            return "contextCompaction"
+        case .userMessage, .agentMessage:
+            return nil
+        }
+    }
+}
+
+private extension CollabAgentTool {
+    var displayName: String {
+        switch self {
+        case .spawnAgent:
+            return "spawnAgent"
+        case .sendInput:
+            return "sendInput"
+        case .resumeAgent:
+            return "resumeAgent"
+        case .wait:
+            return "wait"
+        case .closeAgent:
+            return "closeAgent"
+        }
+    }
+}
+
+private func extractString(_ dict: [String: Any], keys: [String]) -> String? {
+    for key in keys {
+        if let value = dict[key] as? String {
+            return value
+        }
+        if let value = dict[key] as? NSNumber {
+            return value.stringValue
+        }
+    }
+    return nil
 }
 
 enum AgentLabelFormatter {
@@ -51,8 +154,9 @@ enum AgentLabelFormatter {
 
 @MainActor
 @Observable
-final class ServerManager {
-    private static let localServerID = "local"
+final class ServerManager: VoiceActions {
+    static let shared = ServerManager()
+    static let localServerID = "local"
     private static let persistedLocalVoiceThreadIDKey = "litter.voice.local.thread_id"
 
     var connections: [String: ServerConnection] = [:]
@@ -63,6 +167,13 @@ final class ServerManager {
     var composerPrefillRequest: ComposerPrefillRequest?
     var activeVoiceSession: VoiceSessionState?
     private(set) var agentDirectoryVersion: Int = 0
+    private(set) var handoffThreadKeys: [String: ThreadKey] = [:]
+    @ObservationIgnored var handoffModel: String?
+    @ObservationIgnored var handoffEffort: String?
+    @ObservationIgnored var handoffFastMode: Bool = false
+    @ObservationIgnored private var voiceHandoffThreads: [String: ThreadKey] = [:]
+    @ObservationIgnored private lazy var handoffManager = RustHandoffManager(localServerId: Self.localServerID)
+    @ObservationIgnored private var handoffActionPollTask: Task<Void, Never>?
 
     @ObservationIgnored private let savedServersKey = "codex_saved_servers"
     @ObservationIgnored private var voiceHandoffThreads: [String: ThreadKey] = [:]
@@ -95,6 +206,7 @@ final class ServerManager {
     @ObservationIgnored private var deferredThreadMetadataRefreshTasks: [ThreadKey: Task<Void, Never>] = [:]
     @ObservationIgnored private var deferredThreadMetadataRefreshTokens: [ThreadKey: UUID] = [:]
     @ObservationIgnored private var deferredThreadMessageHydrationTasks: [ThreadKey: Task<Void, Never>] = [:]
+    @ObservationIgnored private var deferredSubagentIdentityHydrationTasks: [ThreadKey: Task<Void, Never>] = [:]
     @ObservationIgnored private let pushProxy = PushProxyClient()
     @ObservationIgnored private var pushProxyRegistrationId: String?
     @ObservationIgnored private var suppressNotifications = false
@@ -105,7 +217,8 @@ final class ServerManager {
     @ObservationIgnored private var voicePreviousActiveThreadKey: ThreadKey?
     @ObservationIgnored private var voiceStopRequestedThreadKey: ThreadKey?
     @ObservationIgnored private var lastHandledVoiceEndRequestToken: String?
-    @ObservationIgnored private let notificationDecodeQueue = DispatchQueue(label: "Litter.ServerManager.NotificationDecode", qos: .userInitiated)
+    @ObservationIgnored private var lastRealtimeTranscriptDelta: [ThreadKey: (speaker: String, delta: String, timestamp: CFAbsoluteTime)] = [:]
+    @ObservationIgnored private var pendingRealtimeMessageIDs: [ThreadKey: (user: String?, assistant: String?)] = [:]
     @ObservationIgnored private var notificationWorkTask: Task<Void, Never>?
     @ObservationIgnored private let networkMonitor = NetworkMonitor()
     @ObservationIgnored private let initialHydratedMessageCount = 48
@@ -272,15 +385,7 @@ final class ServerManager {
         setPersistedLocalVoiceThreadId(nil)
     }
 
-    private func makeLocalServer() throws -> DiscoveredServer {
-        guard OnDeviceCodexFeature.isEnabled else {
-            throw NSError(
-                domain: "Litter",
-                code: 3304,
-                userInfo: [NSLocalizedDescriptionKey: "Home-screen voice requires the local on-device Codex server"]
-            )
-        }
-
+    private func makeLocalServer() -> DiscoveredServer {
         return DiscoveredServer(
             id: Self.localServerID,
             name: UIDevice.current.name,
@@ -309,7 +414,7 @@ final class ServerManager {
             return existing
         }
 
-        let localServer = try makeLocalServer()
+        let localServer = makeLocalServer()
         await addServer(localServer, target: .local)
         guard let connection = connections[Self.localServerID], connection.isConnected else {
             throw NSError(
@@ -325,6 +430,8 @@ final class ServerManager {
         cancelThreadMetadataRefresh(for: key)
         deferredThreadMessageHydrationTasks[key]?.cancel()
         deferredThreadMessageHydrationTasks.removeValue(forKey: key)
+        deferredSubagentIdentityHydrationTasks[key]?.cancel()
+        deferredSubagentIdentityHydrationTasks.removeValue(forKey: key)
         threads.removeValue(forKey: key)
         threadTurnCounts.removeValue(forKey: key)
         liveItemMessageIndices.removeValue(forKey: key)
@@ -526,12 +633,13 @@ final class ServerManager {
         if conn.isConnected {
             await refreshSessions(for: server.id)
         }
+        registerServerWithHandoffManager(server: server, target: target, isConnected: conn.isConnected)
         return server.id
     }
 
     private func configureConnectionCallbacks(_ conn: ServerConnection, serverId: String) {
-        conn.onNotification = { [weak self] method, data in
-            self?.enqueueNotification(serverId: serverId, method: method, data: data)
+        conn.onTypedEvent = { [weak self] event in
+            self?.enqueueTypedEvent(serverId: serverId, event: event)
         }
         conn.onServerRequest = { [weak self] requestId, method, data in
             self?.handleServerRequest(
@@ -566,12 +674,1691 @@ final class ServerManager {
         }
     }
 
-    private func enqueueNotification(serverId: String, method: String, data: Data) {
+    private func enqueueTypedEvent(serverId: String, event: UiEvent) {
         let previousTask = notificationWorkTask
         notificationWorkTask = Task { [weak self] in
             _ = await previousTask?.result
             guard let self, !Task.isCancelled else { return }
-            await self.handleNotification(serverId: serverId, method: method, data: data)
+            self.handleTypedEvent(serverId: serverId, event: event)
+        }
+    }
+
+    private func handleTypedEvent(serverId: String, event: UiEvent) {
+        if suppressNotifications { return }
+        switch event {
+        case .turnStarted(let key, let turnId):
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            ensureThreadExistsByKey(serverId: serverId, threadId: key.threadId)
+            threads[threadKey]?.status = .thinking
+            threads[threadKey]?.activeTurnId = turnId
+            if threads[threadKey]?.isSubagent == true { threads[threadKey]?.agentStatus = .running }
+            removePendingRequests(serverId: serverId, threadId: key.threadId)
+
+        case .turnCompleted(let key, _):
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            threads[threadKey]?.status = .ready
+            threads[threadKey]?.updatedAt = Date()
+            threads[threadKey]?.activeTurnId = nil
+            if threads[threadKey]?.isSubagent == true { threads[threadKey]?.agentStatus = .completed }
+            removePendingRequests(serverId: serverId, threadId: key.threadId)
+            liveItemMessageIndices[threadKey] = nil
+            liveTurnDiffMessageIndices[threadKey] = nil
+            backgroundedTurnKeys.remove(threadKey)
+            if var session = activeVoiceSession, session.threadKey == threadKey, session.phase == .handoff {
+                session.phase = .listening
+                activeVoiceSession = session
+                syncVoiceCallActivity()
+            }
+            endLiveActivity(key: threadKey, phase: .completed)
+            postLocalNotificationIfNeeded(model: threads[threadKey]?.model ?? "", threadPreview: threads[threadKey]?.preview)
+            Task { await connections[serverId]?.fetchRateLimits() }
+
+        case .messageDelta(let key, _, let delta):
+            guard !delta.isEmpty else { return }
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            ensureThreadExistsByKey(serverId: serverId, threadId: key.threadId)
+            guard let thread = threads[threadKey] else { return }
+            if let last = thread.items.last, case .assistant(var data) = last.content {
+                data.text += delta
+                thread.items[thread.items.count - 1].content = .assistant(data)
+                thread.items[thread.items.count - 1].timestamp = Date()
+            } else {
+                thread.items.append(makeAssistantItem(text: delta, agentNickname: thread.agentNickname, agentRole: thread.agentRole, sourceTurnId: thread.activeTurnId, sourceTurnIndex: nil))
+            }
+            thread.updatedAt = Date()
+            updateLiveActivityOutput(key: threadKey, thread: thread)
+
+        case .reasoningDelta(let key, _, let delta):
+            guard !delta.isEmpty else { return }
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            guard let thread = threads[threadKey] else { return }
+            if let last = thread.items.last, case .reasoning(var data) = last.content {
+                if data.content.isEmpty { data.content.append(delta) } else { data.content[data.content.count - 1] += delta }
+                thread.items[thread.items.count - 1].content = .reasoning(data)
+            } else {
+                thread.items.append(ConversationItem(id: UUID().uuidString, content: .reasoning(ConversationReasoningData(summary: [], content: [delta])), sourceTurnId: thread.activeTurnId, sourceTurnIndex: nil, timestamp: Date()))
+            }
+            thread.updatedAt = Date()
+
+        case .planDelta(let key, let itemId, let delta):
+            guard !delta.isEmpty else { return }
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            guard let thread = threads[threadKey] else { return }
+            _ = appendProposedPlanDelta(delta, itemId: itemId, turnId: thread.activeTurnId, key: threadKey, thread: thread)
+
+        case .commandOutputDelta(let key, let itemId, let delta):
+            guard !delta.isEmpty else { return }
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            guard let thread = threads[threadKey] else { return }
+            _ = appendCommandOutputDelta(delta, itemId: itemId, key: threadKey, thread: thread)
+
+        case .itemStarted(_, let notification):
+            handleTypedItemNotification(
+                serverId: serverId,
+                item: notification.item,
+                threadId: notification.threadId,
+                turnId: notification.turnId,
+                isInProgressEvent: true
+            )
+
+        case .itemCompleted(_, let notification):
+            handleTypedItemNotification(
+                serverId: serverId,
+                item: notification.item,
+                threadId: notification.threadId,
+                turnId: notification.turnId,
+                isInProgressEvent: false
+            )
+
+        case .realtimeStarted(_, let notification):
+            handleRealtimeStarted(serverId: serverId, notification: notification)
+
+        case .realtimeItemAdded(_, let notification):
+            handleRealtimeItemAdded(serverId: serverId, notification: notification)
+
+        case .realtimeOutputAudioDelta(_, let notification):
+            handleRealtimeOutputAudioDelta(serverId: serverId, notification: notification)
+
+        case .realtimeError(_, let notification):
+            handleRealtimeError(serverId: serverId, notification: notification)
+
+        case .realtimeClosed(_, let notification):
+            handleRealtimeClosed(serverId: serverId, notification: notification)
+
+        case .accountLoginCompleted(let notification):
+            connections[serverId]?.handleAccountLoginCompleted(notification)
+
+        case .accountUpdated(let notification):
+            connections[serverId]?.handleAccountUpdated(notification)
+
+        case .accountRateLimitsUpdated(let notification):
+            connections[serverId]?.handleAccountRateLimitsUpdated(notification)
+
+        case .contextTokensUpdated(let key, let used, let limit):
+            let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+            threads[threadKey]?.contextTokensUsed = Int64(used)
+            threads[threadKey]?.modelContextWindow = Int64(limit)
+
+        case .error(let key, let message, _):
+            if let key {
+                let threadKey = ThreadKey(serverId: serverId, threadId: key.threadId)
+                if let thread = threads[threadKey] {
+                    thread.items.append(ConversationItem(id: UUID().uuidString, content: .error(ConversationSystemErrorData(title: "Error", message: message, details: nil)), timestamp: Date()))
+                    thread.status = .error(message)
+                    thread.updatedAt = Date()
+                    endLiveActivity(key: threadKey, phase: .failed)
+                }
+            }
+
+        case .rawNotification(let rawServerId, let method, let paramsJson):
+            let sid = rawServerId.isEmpty ? serverId : rawServerId
+            let parsed: Any
+            if let data = paramsJson.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) {
+                parsed = obj
+            } else {
+                parsed = [String: Any]()
+            }
+            handleRawNotification(serverId: sid, method: method, params: parsed)
+
+        case .approvalRequested, .connectionStateChanged:
+            break
+        }
+    }
+
+    /// Handle raw notification events that arrive via the `.rawNotification` typed event path.
+    /// `params` is the decoded params object (not the full JSON-RPC envelope).
+    private func handleRawNotification(serverId: String, method: String, params: Any) {
+        let paramsDict = params as? [String: Any] ?? [:]
+
+        switch method {
+        case "sessionConfigured":
+            handleSessionConfiguredFromParams(serverId: serverId, params: paramsDict)
+
+        case "thread/started":
+            handleThreadStartedFromParams(serverId: serverId, params: paramsDict)
+
+        case "thread/status/changed":
+            if let threadId = extractString(paramsDict, keys: ["threadId", "thread_id"]),
+               !threadId.isEmpty {
+                ensureThreadExistsByKey(serverId: serverId, threadId: threadId)
+            }
+
+        case "codex/event/error":
+            handleErrorNotificationFromParams(serverId: serverId, params: paramsDict)
+
+        case "codex/event/task_complete":
+            let threadId = extractString(paramsDict, keys: ["threadId", "thread_id", "conversationId", "conversation_id"])
+                ?? (paramsDict["turn"] as? [String: Any]).flatMap { extractString($0, keys: ["threadId", "thread_id"]) }
+            if let threadId {
+                let key = ThreadKey(serverId: serverId, threadId: threadId)
+                threads[key]?.status = .ready
+                threads[key]?.updatedAt = Date()
+                threads[key]?.activeTurnId = nil
+                if threads[key]?.isSubagent == true {
+                    threads[key]?.agentStatus = .completed
+                }
+                removePendingRequests(serverId: serverId, threadId: threadId)
+                liveItemMessageIndices[key] = nil
+                liveTurnDiffMessageIndices[key] = nil
+                backgroundedTurnKeys.remove(key)
+                endLiveActivity(key: key, phase: .completed)
+                postLocalNotificationIfNeeded(model: threads[key]?.model ?? "", threadPreview: threads[key]?.preview)
+            } else {
+                for (_, thread) in threads where thread.serverId == serverId && thread.hasTurnActive {
+                    thread.status = .ready
+                    thread.updatedAt = Date()
+                    thread.activeTurnId = nil
+                    removePendingRequests(serverId: serverId, threadId: thread.threadId)
+                    liveItemMessageIndices[thread.key] = nil
+                    liveTurnDiffMessageIndices[thread.key] = nil
+                    backgroundedTurnKeys.remove(thread.key)
+                }
+                endAllLiveActivities(phase: .completed)
+                postLocalNotificationIfNeeded(model: "", threadPreview: nil)
+            }
+            Task { await connections[serverId]?.fetchRateLimits() }
+
+        case "serverRequest/resolved":
+            removePendingRequests(
+                serverId: serverId,
+                threadId: extractString(paramsDict, keys: ["threadId", "thread_id"]),
+                requestId: extractString(paramsDict, keys: ["requestId", "request_id"])
+            )
+
+        case "turn/diff/updated":
+            handleTurnDiffFromParams(serverId: serverId, params: paramsDict)
+
+        case "turn/plan/updated":
+            handleTurnPlanUpdatedFromParams(serverId: serverId, params: paramsDict)
+
+        default:
+            if method.hasPrefix("item/") {
+                handleItemNotificationFromParams(serverId: serverId, method: method, params: paramsDict)
+            } else if method == "codex/event/turn_diff" {
+                handleLegacyCodexEventFromParams(serverId: serverId, method: method, params: paramsDict)
+            } else if method == "codex/event" || method.hasPrefix("codex/event/") {
+                ingestCodexEventAgentMetadataFromParams(serverId: serverId, method: method, params: paramsDict)
+                if !serversUsingItemNotifications.contains(serverId) {
+                    handleLegacyCodexEventFromParams(serverId: serverId, method: method, params: paramsDict)
+                }
+            }
+        }
+    }
+
+    // MARK: - Raw Notification Handlers (params-based)
+
+    private func handleSessionConfiguredFromParams(serverId: String, params: [String: Any]) {
+        guard let sessionId = extractString(params, keys: ["sessionId", "session_id", "threadId", "thread_id"]),
+              !sessionId.isEmpty else { return }
+
+        guard let conn = connections[serverId] else { return }
+        let key = ThreadKey(serverId: serverId, threadId: sessionId)
+        let thread = threads[key] ?? ThreadState(
+            serverId: serverId,
+            threadId: sessionId,
+            serverName: conn.server.name,
+            serverSource: conn.server.source
+        )
+        let parentId = extractString(
+            params,
+            keys: ["forkedFromId", "forked_from_id", "parentThreadId", "parent_thread_id"]
+        )
+        let rootId = extractString(params, keys: ["rootThreadId", "root_thread_id"])
+        let title = extractString(params, keys: ["threadName", "thread_name"])
+        let cwd = extractString(params, keys: ["cwd"])
+        let model = extractString(params, keys: ["model"])
+        let modelProvider = extractString(params, keys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"])
+        let reasoningEffort = extractString(params, keys: ["reasoningEffort", "reasoning_effort"])
+        let agentMetadata = extractAgentMetadata(params)
+
+        thread.parentThreadId = sanitizedLineageId(parentId) ?? thread.parentThreadId
+        thread.rootThreadId = sanitizedLineageId(rootId) ?? thread.rootThreadId
+        thread.agentNickname = agentMetadata.nickname ?? thread.agentNickname
+        thread.agentRole = agentMetadata.role ?? thread.agentRole
+        upsertAgentDirectory(
+            serverId: serverId,
+            threadId: sessionId,
+            agentId: agentMetadata.agentId,
+            nickname: thread.agentNickname,
+            role: thread.agentRole
+        )
+        if let title, !title.isEmpty {
+            thread.preview = title
+        }
+        if let cwd, !cwd.isEmpty {
+            thread.cwd = cwd
+        }
+        if let model, !model.isEmpty {
+            thread.model = model
+        }
+        if let modelProvider, !modelProvider.isEmpty {
+            thread.modelProvider = modelProvider
+        }
+        if let reasoningEffort, !reasoningEffort.isEmpty {
+            thread.reasoningEffort = reasoningEffort
+        }
+
+        threads[key] = thread
+        let currentCwd = thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !currentCwd.isEmpty {
+            scheduleThreadMetadataRefresh(for: key, cwd: currentCwd)
+        }
+    }
+
+    private func handleThreadStartedFromParams(serverId: String, params: [String: Any]) {
+        let threadObj = (params["thread"] as? [String: Any]) ?? params
+        guard let threadId = extractString(threadObj, keys: ["id", "threadId", "thread_id"]),
+              !threadId.isEmpty else { return }
+
+        let key = ThreadKey(serverId: serverId, threadId: threadId)
+        guard threads[key] == nil else { return }
+        guard let conn = connections[serverId] else { return }
+
+        let state = ThreadState(
+            serverId: serverId,
+            threadId: threadId,
+            serverName: conn.server.name,
+            serverSource: conn.server.source
+        )
+
+        if let preview = extractString(threadObj, keys: ["preview"]), !preview.isEmpty {
+            state.preview = preview
+        }
+        if let modelProvider = extractString(threadObj, keys: ["modelProvider", "model_provider"]), !modelProvider.isEmpty {
+            state.modelProvider = modelProvider
+        }
+        if let model = extractString(threadObj, keys: ["model"]), !model.isEmpty {
+            state.model = model
+        }
+        if let cwd = extractString(threadObj, keys: ["cwd"]), !cwd.isEmpty {
+            state.cwd = cwd
+        }
+        if let createdAt = (threadObj["createdAt"] as? TimeInterval) ?? (threadObj["created_at"] as? TimeInterval) {
+            state.updatedAt = Date(timeIntervalSince1970: createdAt)
+        }
+
+        let source = (threadObj["source"] as? [String: Any])
+            ?? (threadObj["sessionSource"] as? [String: Any])
+        if let source {
+            let threadSpawn = (source["thread_spawn"] as? [String: Any])
+                ?? (source["threadSpawn"] as? [String: Any])
+            if let threadSpawn {
+                state.parentThreadId = sanitizedLineageId(
+                    extractString(threadSpawn, keys: ["parent_thread_id", "parentThreadId"])
+                )
+                state.agentNickname = extractString(threadSpawn, keys: ["agent_nickname", "agentNickname"])
+                state.agentRole = extractString(threadSpawn, keys: ["agent_role", "agentRole"])
+
+                upsertAgentDirectory(
+                    serverId: serverId,
+                    threadId: threadId,
+                    agentId: nil,
+                    nickname: state.agentNickname,
+                    role: state.agentRole
+                )
+            }
+        }
+
+        let agentMetadata = extractAgentMetadata(threadObj)
+        if state.agentNickname == nil { state.agentNickname = agentMetadata.nickname }
+        if state.agentRole == nil { state.agentRole = agentMetadata.role }
+        if state.parentThreadId == nil {
+            state.parentThreadId = sanitizedLineageId(
+                extractString(threadObj, keys: ["parentThreadId", "parent_thread_id"])
+            )
+        }
+
+        state.requiresOpenHydration = true
+        threads[key] = state
+        threadTurnCounts[key] = 0
+    }
+
+    private func handleRealtimeStarted(serverId: String, notification: ThreadRealtimeStartedNotification) {
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
+        guard var session = activeVoiceSession, session.threadKey == key else { return }
+
+        appendVoiceSessionDebug(
+            "<- thread/realtime/started threadId=\(notification.threadId) sessionId=\(notification.sessionId ?? "nil")",
+            to: &session
+        )
+        session.sessionId = notification.sessionId
+        session.phase = .listening
+        session.isListening = true
+        activeVoiceSession = session
+        syncVoiceCallActivity()
+
+        do {
+            try voiceSessionCoordinator.start { [weak self] chunk in
+                guard let self else { return }
+                await self.appendRealtimeAudioChunk(chunk, for: key)
+            }
+        } catch {
+            appendVoiceSessionSystemMessage(
+                "Failed to start microphone capture: \(error.localizedDescription)",
+                to: key
+            )
+            failVoiceSession(error.localizedDescription)
+        }
+    }
+
+    private func appendFinalRealtimeMessage(
+        role: String,
+        text: String,
+        itemId: String,
+        to session: inout VoiceSessionState
+    ) {
+        guard !text.isEmpty else { return }
+        let speaker = role == "user" ? "You" : "Codex"
+        let messageId = "rtv-\(itemId)"
+        let item = VoiceSessionTranscriptEntry(
+            id: messageId,
+            speaker: speaker,
+            text: text,
+            timestamp: Date()
+        )
+
+        if let existingIndex = session.transcriptHistory.firstIndex(where: { $0.id == messageId }) {
+            session.transcriptHistory[existingIndex] = item
+        } else {
+            session.transcriptHistory.append(item)
+        }
+    }
+
+    private func reserveRealtimeTranscriptMessage(
+        role: String,
+        itemId: String,
+        to session: inout VoiceSessionState
+    ) {
+        let speaker = role == "user" ? "You" : "Codex"
+        let messageId = "rtv-\(itemId)"
+        guard !session.transcriptHistory.contains(where: { $0.id == messageId }) else { return }
+
+        session.transcriptHistory.append(
+            VoiceSessionTranscriptEntry(
+                id: messageId,
+                speaker: speaker,
+                text: "",
+                timestamp: Date()
+            )
+        )
+    }
+
+    private func isProvisionalRealtimeMessageID(_ itemId: String?) -> Bool {
+        guard let itemId, !itemId.isEmpty else { return false }
+        return !itemId.hasPrefix("item_")
+    }
+
+    private func rekeyRealtimeTranscriptMessage(
+        from oldItemId: String?,
+        to newItemId: String,
+        speaker: String,
+        session: inout VoiceSessionState
+    ) {
+        guard let oldItemId, oldItemId != newItemId else { return }
+
+        let oldMessageId = "rtv-\(oldItemId)"
+        let newMessageId = "rtv-\(newItemId)"
+        guard oldMessageId != newMessageId else { return }
+
+        if let oldIndex = session.transcriptHistory.firstIndex(where: { $0.id == oldMessageId }) {
+            let oldEntry = session.transcriptHistory[oldIndex]
+            let mergedEntry = VoiceSessionTranscriptEntry(
+                id: newMessageId,
+                speaker: speaker,
+                text: oldEntry.text,
+                timestamp: oldEntry.timestamp
+            )
+
+            if let existingNewIndex = session.transcriptHistory.firstIndex(where: { $0.id == newMessageId }) {
+                let existingNew = session.transcriptHistory[existingNewIndex]
+                let preferredText = existingNew.text.count >= mergedEntry.text.count ? existingNew.text : mergedEntry.text
+                let preferredTimestamp = oldIndex <= existingNewIndex ? oldEntry.timestamp : existingNew.timestamp
+                let replacement = VoiceSessionTranscriptEntry(
+                    id: newMessageId,
+                    speaker: speaker,
+                    text: preferredText,
+                    timestamp: preferredTimestamp
+                )
+
+                if oldIndex < existingNewIndex {
+                    session.transcriptHistory[oldIndex] = replacement
+                    session.transcriptHistory.remove(at: existingNewIndex)
+                } else {
+                    session.transcriptHistory[existingNewIndex] = replacement
+                    session.transcriptHistory.remove(at: oldIndex)
+                }
+            } else {
+                session.transcriptHistory[oldIndex] = mergedEntry
+            }
+        }
+
+        if session.transcriptLiveMessageID == oldMessageId {
+            session.transcriptLiveMessageID = newMessageId
+        }
+    }
+
+    private func flushRealtimeTranscriptIfNeeded(
+        for key: ThreadKey,
+        session: inout VoiceSessionState,
+        speaker: String? = nil
+    ) {
+        let resolvedSpeaker = speaker ?? session.transcriptSpeaker
+        guard let resolvedSpeaker,
+              let text = session.transcriptText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            return
+        }
+
+        let role: String
+        switch resolvedSpeaker {
+        case "You":
+            role = "user"
+        case "Codex":
+            role = "assistant"
+        default:
+            return
+        }
+
+        let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
+        let itemId = (role == "user" ? pending.user : pending.assistant) ?? UUID().uuidString
+        appendFinalRealtimeMessage(role: role, text: text, itemId: itemId, to: &session)
+
+        if session.transcriptSpeaker == resolvedSpeaker {
+            session.transcriptText = nil
+            session.transcriptSpeaker = nil
+            session.transcriptLiveMessageID = nil
+        }
+    }
+
+    private func shouldSkipRealtimeTranscriptDelta(
+        _ delta: String,
+        speaker: String,
+        for key: ThreadKey
+    ) -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let previous = lastRealtimeTranscriptDelta[key],
+           previous.speaker == speaker,
+           previous.delta == delta,
+           now - previous.timestamp < 0.5 {
+            return true
+        }
+        lastRealtimeTranscriptDelta[key] = (speaker: speaker, delta: delta, timestamp: now)
+        return false
+    }
+
+    private func applyRealtimeTranscriptDelta(
+        _ delta: String,
+        speaker: String,
+        phase: VoiceSessionPhase,
+        key: ThreadKey,
+        session: inout VoiceSessionState
+    ) {
+        guard !delta.isEmpty else { return }
+        guard !shouldSkipRealtimeTranscriptDelta(delta, speaker: speaker, for: key) else { return }
+
+        let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
+        let pendingItemID: String
+        if speaker == "You" {
+            pendingItemID = pending.user ?? UUID().uuidString
+            if pending.user == nil {
+                pendingRealtimeMessageIDs[key] = (pendingItemID, pending.assistant)
+            }
+        } else {
+            let existingAssistantId = pending.assistant
+            let shouldRotateAssistantRow: Bool = {
+                guard let existingAssistantId else { return true }
+                if isProvisionalRealtimeMessageID(existingAssistantId) {
+                    return false
+                }
+                let existingMessageId = "rtv-\(existingAssistantId)"
+                let hasPersistedText = session.transcriptHistory.contains(where: {
+                    $0.id == existingMessageId && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                })
+                let isCurrentLive = session.transcriptLiveMessageID == existingMessageId
+                return hasPersistedText && !isCurrentLive
+            }()
+
+            if shouldRotateAssistantRow {
+                pendingItemID = UUID().uuidString
+                pendingRealtimeMessageIDs[key] = (pending.user, pendingItemID)
+            } else {
+                pendingItemID = existingAssistantId ?? UUID().uuidString
+                if existingAssistantId == nil {
+                    pendingRealtimeMessageIDs[key] = (pending.user, pendingItemID)
+                }
+            }
+        }
+
+        let messageId = "rtv-\(pendingItemID)"
+        let existingHistoryText = session.transcriptHistory.first(where: { $0.id == messageId })?.text
+        let liveTextForSpeaker: String? = (
+            session.transcriptSpeaker == speaker && session.transcriptLiveMessageID == messageId
+        ) ? session.transcriptText : nil
+        let existing = liveTextForSpeaker ?? existingHistoryText ?? ""
+
+        let mergedText: String
+        if existing == delta || existing.hasSuffix(delta) {
+            mergedText = existing
+        } else if delta.hasPrefix(existing) {
+            mergedText = delta
+        } else if existing.hasPrefix(delta) {
+            mergedText = existing
+        } else {
+            mergedText = existing + delta
+        }
+
+        appendFinalRealtimeMessage(
+            role: speaker == "You" ? "user" : "assistant",
+            text: mergedText,
+            itemId: pendingItemID,
+            to: &session
+        )
+
+        let shouldPromoteToLive: Bool
+        if session.transcriptSpeaker == nil || session.transcriptSpeaker == speaker {
+            shouldPromoteToLive = true
+        } else {
+            shouldPromoteToLive = existingHistoryText == nil
+        }
+
+        if shouldPromoteToLive {
+            session.transcriptText = mergedText
+            session.transcriptSpeaker = speaker
+            session.transcriptLiveMessageID = messageId
+            session.phase = phase
+        }
+
+        activeVoiceSession = session
+        syncVoiceCallActivity()
+    }
+
+    private func handleRealtimeItemAdded(serverId: String, notification: ThreadRealtimeItemAddedNotification) {
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
+        guard var session = activeVoiceSession,
+              session.threadKey == key,
+              let item = notification.item.objectValue else {
+            return
+        }
+
+        let itemType = extractString(item, keys: ["type"]) ?? ""
+
+        switch itemType {
+        case "handoff_request":
+            flushRealtimeTranscriptIfNeeded(for: key, session: &session)
+
+            let handoffId = extractString(item, keys: ["handoff_id", "handoffId", "id"]) ?? UUID().uuidString
+            let inputTranscript = extractString(item, keys: ["input_transcript", "inputTranscript"]) ?? ""
+            let transcriptEntries = (item["active_transcript"] as? [[String: Any]]) ?? []
+            let activeTranscript = transcriptEntries
+                .compactMap { entry -> String? in
+                    guard let role = entry["role"] as? String,
+                          let text = entry["text"] as? String else {
+                        return nil
+                    }
+                    return "\(role): \(text)"
+                }
+                .joined(separator: "\n")
+            let resolvedActiveTranscript = activeTranscript.isEmpty
+                ? (extractString(item, keys: ["active_transcript", "activeTranscript"]) ?? "")
+                : activeTranscript
+            let serverHint = extractString(item, keys: ["server_hint", "serverHint", "server"])
+            let fallbackTranscript = extractString(item, keys: ["fallback_transcript", "fallbackTranscript"])
+
+            appendVoiceSessionDebug(
+                "<- thread/realtime/itemAdded type=handoff_request id=\(handoffId) server=\(serverHint ?? "nil")",
+                to: &session
+            )
+            session.phase = .handoff
+            session.transcriptText = nil
+            session.transcriptSpeaker = nil
+            session.transcriptLiveMessageID = nil
+            activeVoiceSession = session
+            syncVoiceCallActivity()
+
+            syncHandoffTurnConfig()
+            handoffManager.handleHandoffRequest(
+                handoffId: handoffId,
+                voiceServerId: serverId,
+                voiceThreadId: notification.threadId,
+                inputTranscript: inputTranscript,
+                activeTranscript: resolvedActiveTranscript,
+                serverHint: serverHint,
+                fallbackTranscript: fallbackTranscript
+            )
+            processHandoffActions()
+
+        case "message":
+            let role = extractString(item, keys: ["role"]) ?? "assistant"
+            let itemId = extractString(item, keys: ["id"]) ?? UUID().uuidString
+            let content = item["content"] as? [[String: Any]] ?? []
+
+            if role == "user" {
+                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "Codex")
+                voiceSessionCoordinator.flushPlayback()
+                let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
+                if let pendingUserId = pending.user,
+                   isProvisionalRealtimeMessageID(pendingUserId),
+                   (session.transcriptHistory.contains(where: { $0.id == "rtv-\(pendingUserId)" }) ||
+                    session.transcriptLiveMessageID == "rtv-\(pendingUserId)") {
+                    rekeyRealtimeTranscriptMessage(
+                        from: pendingUserId,
+                        to: itemId,
+                        speaker: "You",
+                        session: &session
+                    )
+                }
+                pendingRealtimeMessageIDs[key] = (itemId, pending.assistant)
+                reserveRealtimeTranscriptMessage(role: role, itemId: itemId, to: &session)
+            } else {
+                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "You")
+                let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
+                if let pendingAssistantId = pending.assistant,
+                   isProvisionalRealtimeMessageID(pendingAssistantId),
+                   (session.transcriptHistory.contains(where: { $0.id == "rtv-\(pendingAssistantId)" }) ||
+                    session.transcriptLiveMessageID == "rtv-\(pendingAssistantId)") {
+                    rekeyRealtimeTranscriptMessage(
+                        from: pendingAssistantId,
+                        to: itemId,
+                        speaker: "Codex",
+                        session: &session
+                    )
+                }
+                pendingRealtimeMessageIDs[key] = (pending.user, itemId)
+                reserveRealtimeTranscriptMessage(role: role, itemId: itemId, to: &session)
+            }
+
+            let text = content.compactMap { part -> String? in
+                guard (extractString(part, keys: ["type"]) ?? "") == "text" else { return nil }
+                return extractString(part, keys: ["text"])
+            }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if text.isEmpty {
+                if role == "user", session.transcriptSpeaker == "You" {
+                    session.transcriptLiveMessageID = "rtv-\(itemId)"
+                } else if role == "assistant", session.transcriptSpeaker == "Codex" {
+                    session.transcriptLiveMessageID = "rtv-\(itemId)"
+                }
+                activeVoiceSession = session
+                return
+            }
+
+            appendVoiceSessionDebug("<- thread/realtime/itemAdded role=\(role) text=\(text)", to: &session)
+            appendFinalRealtimeMessage(role: role, text: text, itemId: itemId, to: &session)
+
+            session.transcriptText = nil
+            session.transcriptSpeaker = nil
+            session.transcriptLiveMessageID = nil
+            if role == "assistant", !session.isSpeaking {
+                session.phase = .thinking
+            }
+            activeVoiceSession = session
+            syncVoiceCallActivity()
+
+        case "input_transcript_delta", "output_transcript_delta":
+            let delta = extractString(item, keys: ["delta"]) ?? ""
+            guard !delta.isEmpty else { return }
+            let speaker = itemType == "input_transcript_delta" ? "You" : "Codex"
+            let phase: VoiceSessionPhase = itemType == "input_transcript_delta" ? .listening : .speaking
+            applyRealtimeTranscriptDelta(
+                delta,
+                speaker: speaker,
+                phase: phase,
+                key: key,
+                session: &session
+            )
+
+        case "speech_started":
+            voiceSessionCoordinator.flushPlayback()
+            let pending = pendingRealtimeMessageIDs[key] ?? (nil, nil)
+            pendingRealtimeMessageIDs[key] = (nil, pending.assistant)
+            if session.transcriptSpeaker == "Codex" {
+                flushRealtimeTranscriptIfNeeded(for: key, session: &session, speaker: "Codex")
+            } else if session.transcriptSpeaker != "You" {
+                session.transcriptText = nil
+                session.transcriptSpeaker = nil
+                session.transcriptLiveMessageID = nil
+            }
+            activeVoiceSession = session
+
+        default:
+            appendVoiceSessionDebug(
+                "<- thread/realtime/itemAdded unknown type=\(itemType)",
+                to: &session
+            )
+            activeVoiceSession = session
+        }
+    }
+
+    // MARK: - Cross-Server Handoff (Rust-backed)
+
+    private func registerServerWithHandoffManager(server: DiscoveredServer, target: ConnectionTarget, isConnected: Bool) {
+        handoffManager.registerServer(
+            serverId: server.id,
+            name: server.name,
+            hostname: server.hostname,
+            isLocal: target == .local,
+            isConnected: isConnected
+        )
+    }
+
+    private func syncHandoffTurnConfig() {
+        handoffManager.setTurnConfig(model: handoffModel, effort: handoffEffort, fastMode: handoffFastMode)
+    }
+
+    private func processHandoffActions() {
+        let actions = handoffManager.drainActions()
+        for action in actions { dispatchSingleHandoffAction(action) }
+    }
+
+    private func executeHandoffStartThread(handoffId: String, serverId: String, cwd: String) async {
+        do {
+            let key = try await startThread(serverId: serverId, cwd: cwd)
+            handoffManager.reportThreadCreated(handoffId: handoffId, serverId: serverId, threadId: key.threadId)
+            handoffThreadKeys[handoffId] = key
+            voiceHandoffThreads[handoffId] = key
+            if var session = activeVoiceSession {
+                session.handoffRemoteThreadKey = key
+                activeVoiceSession = session
+            }
+            processHandoffActions()
+        } catch {
+            handoffManager.reportThreadFailed(handoffId: handoffId, error: error.localizedDescription)
+            processHandoffActions()
+        }
+    }
+
+    private func executeHandoffSendTurn(handoffId: String, serverId: String, threadId: String, transcript: String, model: String?, effort: String?, fastMode: Bool) async {
+        guard let conn = connections[serverId] else {
+            handoffManager.reportTurnFailed(handoffId: handoffId, error: "No connection for server \(serverId)")
+            processHandoffActions()
+            return
+        }
+        let key = ThreadKey(serverId: serverId, threadId: threadId)
+        ensureThreadExistsByKey(serverId: serverId, threadId: threadId)
+        let baseItemCount = threads[key]?.items.count ?? 0
+        do {
+            let _ = try await conn.sendTurn(threadId: threadId, text: transcript, model: model, effort: effort)
+            handoffManager.reportTurnSent(handoffId: handoffId, baseItemCount: baseItemCount)
+            startHandoffStreamPolling(handoffId: handoffId, serverId: serverId, threadId: threadId)
+            processHandoffActions()
+        } catch {
+            handoffManager.reportTurnFailed(handoffId: handoffId, error: error.localizedDescription)
+            processHandoffActions()
+        }
+    }
+
+    private func executeHandoffResolve(handoffId: String, voiceServerId: String, voiceThreadId: String, text: String) async {
+        guard let conn = connections[voiceServerId] else { return }
+        let voiceKey = ThreadKey(serverId: voiceServerId, threadId: voiceThreadId)
+        recordVoiceSessionDebug("-> resolveHandoff id=\(handoffId) text=\(text.prefix(80))", for: voiceKey)
+        do {
+            try await conn.resolveRealtimeHandoff(threadId: voiceThreadId, handoffId: handoffId, outputText: text)
+            recordVoiceSessionDebug("<- resolveHandoff id=\(handoffId) ok", for: voiceKey)
+        } catch {
+            recordVoiceSessionDebug("<- resolveHandoff id=\(handoffId) error=\(error.localizedDescription)", for: voiceKey)
+        }
+    }
+
+    private func executeHandoffFinalize(handoffId: String, voiceServerId: String, voiceThreadId: String) async {
+        guard let conn = connections[voiceServerId] else { return }
+        let voiceKey = ThreadKey(serverId: voiceServerId, threadId: voiceThreadId)
+        recordVoiceSessionDebug("-> finalizeHandoff id=\(handoffId)", for: voiceKey)
+        do {
+            try await conn.finalizeRealtimeHandoff(threadId: voiceThreadId, handoffId: handoffId)
+            handoffManager.reportFinalized(handoffId: handoffId)
+            processHandoffActions()
+        } catch {
+            recordVoiceSessionDebug("<- finalizeHandoff id=\(handoffId) error=\(error.localizedDescription)", for: voiceKey)
+        }
+        if var session = activeVoiceSession {
+            session.phase = .listening
+            session.handoffRemoteThreadKey = nil
+            activeVoiceSession = session
+            syncVoiceCallActivity()
+        }
+        handoffThreadKeys.removeValue(forKey: handoffId)
+        voiceHandoffThreads.removeValue(forKey: handoffId)
+    }
+
+    private func startHandoffStreamPolling(handoffId: String, serverId: String, threadId: String) {
+        handoffActionPollTask?.cancel()
+        handoffActionPollTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let key = ThreadKey(serverId: serverId, threadId: threadId)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled, let thread = self.threads[key] else { break }
+                let turnActive = thread.status == .thinking
+                let items: [(id: String, text: String)] = thread.items.suffix(20).compactMap { item in
+                    switch item.content {
+                    case .assistant(let data): return (id: item.id, text: data.text)
+                    case .commandExecution(let data): return (id: item.id, text: "[cmd] \(data.command.prefix(80)) \(data.status)")
+                    case .mcpToolCall(let data): return (id: item.id, text: "[\(data.tool)] \(data.status)")
+                    default: return nil
+                    }
+                }
+                self.handoffManager.pollStreamProgress(handoffId: handoffId, items: items, turnActive: turnActive)
+                for action in self.handoffManager.drainActions() { self.dispatchSingleHandoffAction(action) }
+                if !turnActive { break }
+            }
+        }
+    }
+
+    private func dispatchSingleHandoffAction(_ action: HandoffAction) {
+        switch action {
+        case .startThread(let hid, let sid, _, let cwd):
+            Task { @MainActor in await self.executeHandoffStartThread(handoffId: hid, serverId: sid, cwd: cwd) }
+        case .sendTurn(let hid, let sid, let tid, let transcript, let config):
+            Task { @MainActor in await self.executeHandoffSendTurn(handoffId: hid, serverId: sid, threadId: tid, transcript: transcript, model: config.model, effort: config.effort, fastMode: config.fastMode) }
+        case .resolveHandoff(let hid, let vtk, let text):
+            Task { @MainActor in await self.executeHandoffResolve(handoffId: hid, voiceServerId: vtk.serverId, voiceThreadId: vtk.threadId, text: text) }
+        case .finalizeHandoff(let hid, let vtk):
+            Task { @MainActor in await self.executeHandoffFinalize(handoffId: hid, voiceServerId: vtk.serverId, voiceThreadId: vtk.threadId) }
+        case .updateHandoffItem(let hid, let vtk, let rtk):
+            updateHandoffConversationItem(handoffId: hid, voiceServerId: vtk.serverId, voiceThreadId: vtk.threadId, remoteServerId: rtk.serverId, remoteThreadId: rtk.threadId)
+        case .completeHandoffItem(let hid, let vtk):
+            completeHandoffConversationItem(handoffId: hid, voiceServerId: vtk.serverId, voiceThreadId: vtk.threadId)
+        case .setVoicePhase(let phase):
+            if var session = activeVoiceSession {
+                switch phase {
+                case "listening": session.phase = .listening
+                case "thinking": session.phase = .thinking
+                case "handoff": session.phase = .handoff
+                default: break
+                }
+                activeVoiceSession = session
+                syncVoiceCallActivity()
+            }
+        case .error(let hid, let msg):
+            NSLog("[handoff] error id=%@ message=%@", hid, msg)
+            if let vk = activeVoiceSession?.threadKey { recordVoiceSessionDebug("handoff error id=\(hid): \(msg)", for: vk) }
+        }
+    }
+
+    private func updateHandoffConversationItem(handoffId: String, voiceServerId: String, voiceThreadId: String, remoteServerId: String, remoteThreadId: String) {
+        let voiceKey = ThreadKey(serverId: voiceServerId, threadId: voiceThreadId)
+        guard let thread = threads[voiceKey] else { return }
+        let name = connections[remoteServerId]?.server.name ?? remoteServerId
+        let item = ConversationItem(id: "handoff-\(handoffId)", content: .note(ConversationNoteData(title: "Handoff", body: "Executing on \(name)...")), timestamp: Date())
+        if let idx = thread.items.firstIndex(where: { $0.id == "handoff-\(handoffId)" }) {
+            thread.items[idx] = item
+        } else {
+            thread.items.append(item)
+        }
+        thread.updatedAt = Date()
+    }
+
+    private func completeHandoffConversationItem(handoffId: String, voiceServerId: String, voiceThreadId: String) {
+        let voiceKey = ThreadKey(serverId: voiceServerId, threadId: voiceThreadId)
+        guard let thread = threads[voiceKey] else { return }
+        let itemId = "handoff-\(handoffId)"
+        if let idx = thread.items.firstIndex(where: { $0.id == itemId }),
+           case .note(var data) = thread.items[idx].content {
+            data.body = data.body.replacingOccurrences(of: "...", with: " (completed)")
+            thread.items[idx].content = .note(data)
+            thread.items[idx].timestamp = Date()
+        }
+        thread.updatedAt = Date()
+    }
+
+    private func handleRealtimeOutputAudioDelta(serverId: String, notification: ThreadRealtimeOutputAudioDeltaNotification) {
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
+        guard activeVoiceSession?.threadKey == key else { return }
+        if let session = activeVoiceSession,
+           session.debugEntries.filter({ $0.line.contains("thread/realtime/outputAudio/delta") }).count < 3 {
+            recordVoiceSessionDebug(
+                "<- thread/realtime/outputAudio/delta bytes=\(notification.audio.data.count) rate=\(notification.audio.sampleRate)",
+                for: key
+            )
+        }
+        voiceSessionCoordinator.enqueueOutputAudio(notification.audio)
+    }
+
+    private func handleRealtimeError(serverId: String, notification: ThreadRealtimeErrorNotification) {
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
+        guard activeVoiceSession?.threadKey == key else { return }
+        recordVoiceSessionDebug(
+            "<- thread/realtime/error threadId=\(notification.threadId) message=\(notification.message)",
+            for: key
+        )
+        if notification.message.contains("active response in progress") {
+            return
+        }
+        appendVoiceSessionSystemMessage("Realtime voice error: \(notification.message)", to: key)
+        failVoiceSession(notification.message)
+    }
+
+    private func handleRealtimeClosed(serverId: String, notification: ThreadRealtimeClosedNotification) {
+        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
+        guard activeVoiceSession?.threadKey == key else { return }
+
+        if var session = activeVoiceSession, session.threadKey == key {
+            flushRealtimeTranscriptIfNeeded(for: key, session: &session)
+            activeVoiceSession = session
+        }
+
+        recordVoiceSessionDebug(
+            "<- thread/realtime/closed threadId=\(notification.threadId) reason=\(notification.reason ?? "nil")",
+            for: key
+        )
+        let reason = notification.reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if voiceStopRequestedThreadKey == key || reason == "requested" {
+            voiceStopRequestedThreadKey = nil
+            endVoiceSessionImmediately()
+            return
+        }
+        if !reason.isEmpty, reason != "requested" {
+            appendVoiceSessionSystemMessage("Realtime voice closed: \(reason)", to: key)
+        }
+        failVoiceSession(reason.isEmpty ? "Voice session closed" : reason)
+    }
+
+    private func handleAgentMessageDeltaFromParams(serverId: String, params: [String: Any]) {
+        let delta = (params["delta"] as? String) ?? ""
+        guard !delta.isEmpty else { return }
+
+        let source = params["source"]
+        func extractSourceField(_ source: Any?, keys: [String]) -> String? {
+            guard let sourceDict = source as? [String: Any] else { return nil }
+            let subAgent = (sourceDict["subAgent"] as? [String: Any]) ?? (sourceDict["sub_agent"] as? [String: Any])
+            guard let subAgent else { return nil }
+            let threadSpawn = (subAgent["thread_spawn"] as? [String: Any]) ?? (subAgent["threadSpawn"] as? [String: Any])
+
+            func extract(from dict: [String: Any]?) -> String? {
+                guard let dict else { return nil }
+                for key in keys {
+                    if let value = dict[key] as? String {
+                        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty { return trimmed }
+                    } else if let value = dict[key] as? NSNumber {
+                        return value.stringValue
+                    }
+                }
+                return nil
+            }
+            return extract(from: threadSpawn) ?? extract(from: subAgent)
+        }
+
+        let explicitThreadId = sanitizedLineageId(
+            extractString(params, keys: ["threadId", "thread_id"])
+            ?? extractSourceField(source, keys: ["thread_id", "threadId"])
+        )
+        let agentId = sanitizedLineageId(
+            extractString(params, keys: ["agentId", "agent_id", "id"])
+            ?? extractSourceField(source, keys: ["agent_id", "agentId", "id"])
+        )
+        let agentNicknameRaw = sanitizedLineageId(
+            extractString(params, keys: ["agentNickname", "agent_nickname", "nickname", "name"])
+            ?? extractSourceField(source, keys: ["agent_nickname", "agentNickname", "nickname", "name"])
+        )
+        let agentRoleRaw = sanitizedLineageId(
+            extractString(params, keys: ["agentRole", "agent_role", "agentType", "agent_type", "role", "type"])
+            ?? extractSourceField(source, keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"])
+        )
+
+        let key = resolveThreadKey(serverId: serverId, threadId: explicitThreadId)
+        guard let thread = threads[key] else { return }
+        let agentNickname = agentNicknameRaw ?? thread.agentNickname
+        let agentRole = agentRoleRaw ?? thread.agentRole
+        debugAgentDirectoryLog(
+            "delta parsed threadId=\(explicitThreadId ?? "<nil>") agentId=\(agentId ?? "<nil>") nickname=\(agentNickname ?? "<nil>") role=\(agentRole ?? "<nil>")"
+        )
+        if let last = thread.items.last,
+           case .assistant(var data) = last.content {
+            data.text += delta
+            if data.agentNickname == nil {
+                data.agentNickname = agentNickname
+            }
+            if data.agentRole == nil {
+                data.agentRole = agentRole
+            }
+            thread.items[thread.items.count - 1].content = .assistant(data)
+            thread.items[thread.items.count - 1].timestamp = Date()
+        } else {
+            thread.items.append(
+                makeAssistantItem(
+                    text: delta,
+                    agentNickname: agentNickname,
+                    agentRole: agentRole,
+                    sourceTurnId: thread.activeTurnId,
+                    sourceTurnIndex: nil
+                )
+            )
+        }
+        if explicitThreadId != nil || agentId == nil {
+            thread.agentNickname = agentNickname
+            thread.agentRole = agentRole
+        }
+        upsertAgentDirectory(
+            serverId: serverId,
+            threadId: explicitThreadId ?? (agentId == nil ? key.threadId : nil),
+            agentId: agentId,
+            nickname: agentNickname,
+            role: agentRole
+        )
+        thread.updatedAt = Date()
+        updateLiveActivityOutput(key: key, thread: thread)
+    }
+
+    private func handleErrorNotificationFromParams(serverId: String, params: [String: Any]) {
+        let errorDict = params["error"] as? [String: Any]
+        let message = (errorDict?["message"] as? String)
+            ?? (params["message"] as? String)
+            ?? "Unknown error"
+
+        let threadId = extractString(params, keys: ["threadId", "thread_id"])
+        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
+        guard let thread = threads[key] else { return }
+
+        thread.items.append(
+            ConversationItem(
+                id: UUID().uuidString,
+                content: .error(ConversationSystemErrorData(title: "Error", message: message, details: nil)),
+                timestamp: Date()
+            )
+        )
+        thread.status = .error(message)
+        thread.updatedAt = Date()
+        endLiveActivity(key: key, phase: .failed)
+    }
+
+    private func handleTurnDiffFromParams(serverId: String, params: [String: Any]) {
+        let threadId = extractString(params, keys: ["threadId", "thread_id"])
+        let turnId = extractString(params, keys: ["turnId", "turn_id"])
+        guard let diff = extractString(params, keys: ["diff"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !diff.isEmpty else { return }
+
+        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
+
+        let diffHeaders = diff.components(separatedBy: "diff --git ").count - 1
+        let fileChangeCount = max(diffHeaders, 1)
+        liveActivityFileChangeCounts[key] = fileChangeCount
+
+        guard let thread = threads[key] else { return }
+        let msg = ConversationItem(
+            id: turnId ?? UUID().uuidString,
+            content: .turnDiff(ConversationTurnDiffData(diff: diff)),
+            sourceTurnId: turnId,
+            sourceTurnIndex: nil,
+            timestamp: Date()
+        )
+
+        if let turnId, !turnId.isEmpty {
+            upsertLiveTurnDiffMessage(msg, turnId: turnId, key: key, thread: thread)
+        } else {
+            thread.items.append(msg)
+        }
+        thread.updatedAt = Date()
+    }
+
+    private func handleTurnPlanUpdatedFromParams(serverId: String, params: [String: Any]) {
+        guard let turnId = extractString(params, keys: ["turnId", "turn_id"]),
+              !turnId.isEmpty else {
+            return
+        }
+
+        let threadId = extractString(params, keys: ["threadId", "thread_id"])
+        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
+        guard let thread = threads[key] else { return }
+
+        upsertTurnTodoList(turnId: turnId, steps: planSteps(from: params["plan"]), thread: thread)
+        thread.updatedAt = Date()
+    }
+
+    private func handleTypedItemNotification(
+        serverId: String,
+        item: ThreadItem,
+        threadId: String,
+        turnId: String,
+        isInProgressEvent: Bool
+    ) {
+        serversUsingItemNotifications.insert(serverId)
+        ensureThreadExistsByKey(serverId: serverId, threadId: threadId)
+        let key = ThreadKey(serverId: serverId, threadId: threadId)
+        guard let thread = threads[key] else { return }
+
+        if item.isUserOrAgentMessage {
+            return
+        }
+
+        if case .dynamicToolCall(let itemId, let toolName, let arguments, _, _, _, _) = item {
+            if toolName == GenerativeUITools.showWidgetToolName {
+                if !isInProgressEvent {
+                    if let index = liveItemMessageIndices[key]?[itemId],
+                       thread.items.indices.contains(index),
+                       case .widget(var data) = thread.items[index].content {
+                        data.widgetState.isFinalized = true
+                        data.status = "completed"
+                        thread.items[index].content = .widget(data)
+                    }
+                    liveItemMessageIndices[key]?[itemId] = nil
+                    thread.updatedAt = Date()
+                    return
+                }
+
+                let args = arguments.objectValue ?? [:]
+                let widget = WidgetState.fromArguments(args, callId: itemId)
+                let msg = ConversationItem(
+                    id: itemId,
+                    content: .widget(ConversationWidgetData(widgetState: widget, status: "inProgress")),
+                    timestamp: Date()
+                )
+                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+                thread.updatedAt = Date()
+                return
+            }
+
+            if toolName == GenerativeUITools.readMeToolName {
+                return
+            }
+        }
+
+        if isInProgressEvent, let toolName = item.liveActivityLabel {
+            updateLiveActivity(key: key, phase: .toolCall, toolName: toolName)
+        }
+
+        guard let msg = RustConversationBridge.hydrateItem(
+            item: item,
+            turnId: turnId,
+            defaultAgentNickname: thread.agentNickname,
+            defaultAgentRole: thread.agentRole,
+            isInProgressEvent: isInProgressEvent
+        ) else {
+            return
+        }
+
+        let itemId = item.threadItemId
+        if isInProgressEvent {
+            upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+        } else {
+            completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+        }
+        thread.updatedAt = Date()
+        scheduleSubagentIdentityHydrationIfNeeded(serverId: serverId, item: item)
+    }
+
+    private func handleItemNotificationFromParams(serverId: String, method: String, params: [String: Any]) {
+        serversUsingItemNotifications.insert(serverId)
+
+        let threadId = extractString(params, keys: ["threadId", "thread_id"])
+        if let threadId { ensureThreadExistsByKey(serverId: serverId, threadId: threadId) }
+        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
+        guard let thread = threads[key] else { return }
+
+        switch method {
+        case "item/mcpToolCall/progress":
+            guard let progress = extractString(params, keys: ["message"]), !progress.isEmpty else { return }
+            if let itemId = extractString(params, keys: ["itemId", "item_id"]),
+               appendMcpProgress(progress, itemId: itemId, key: key, thread: thread) {
+                thread.updatedAt = Date()
+                return
+            }
+            thread.items.append(
+                ConversationItem(
+                    id: UUID().uuidString,
+                    content: .note(ConversationNoteData(title: "MCP Tool Progress", body: progress)),
+                    timestamp: Date()
+                )
+            )
+            thread.updatedAt = Date()
+
+        default:
+            break
+        }
+    }
+
+    private func handleLegacyCodexEventFromParams(serverId: String, method: String, params: [String: Any]) {
+        let eventPayload: [String: Any]
+        let eventType: String
+
+        if method == "codex/event" {
+            guard let msg = params["msg"] as? [String: Any] else { return }
+            eventPayload = msg
+            eventType = extractString(msg, keys: ["type"]) ?? ""
+        } else {
+            eventPayload = (params["msg"] as? [String: Any]) ?? params
+            eventType = String(method.dropFirst("codex/event/".count))
+        }
+
+        guard !eventType.isEmpty else { return }
+
+        let threadId = extractString(params, keys: ["threadId", "thread_id", "conversationId", "conversation_id"])
+            ?? extractString(eventPayload, keys: ["threadId", "thread_id", "conversationId", "conversation_id"])
+        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
+        guard let thread = threads[key] else { return }
+
+        switch eventType {
+        case "exec_command_begin":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let command = extractCommandText(eventPayload)
+            let cwd = extractString(eventPayload, keys: ["cwd"]) ?? ""
+
+            updateLiveActivity(key: key, phase: .toolCall, toolName: command.isEmpty ? "shell" : command)
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .commandExecution(
+                    ConversationCommandExecutionData(
+                        command: command,
+                        cwd: cwd,
+                        status: "inProgress",
+                        output: nil,
+                        exitCode: nil,
+                        durationMs: nil,
+                        processId: nil,
+                        actions: []
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "exec_command_output_delta":
+            guard let delta = extractString(eventPayload, keys: ["chunk"]), !delta.isEmpty else { return }
+            if let itemId = extractString(eventPayload, keys: ["call_id", "callId"]),
+               appendCommandOutputDelta(delta, itemId: itemId, key: key, thread: thread) {
+                thread.updatedAt = Date()
+                return
+            }
+            thread.items.append(
+                ConversationItem(
+                    id: UUID().uuidString,
+                    content: .note(ConversationNoteData(title: "Command Output", body: delta)),
+                    timestamp: Date()
+                )
+            )
+            thread.updatedAt = Date()
+
+        case "exec_command_end":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let command = extractCommandText(eventPayload)
+            let cwd = extractString(eventPayload, keys: ["cwd"]) ?? ""
+            let status = extractString(eventPayload, keys: ["status"]) ?? "completed"
+            let exitCode = extractString(eventPayload, keys: ["exit_code", "exitCode"])
+            let durationMs = durationMillis(from: eventPayload["duration"])
+
+            let output = extractCommandOutput(eventPayload)
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .commandExecution(
+                    ConversationCommandExecutionData(
+                        command: command,
+                        cwd: cwd,
+                        status: status,
+                        output: output.isEmpty ? nil : output,
+                        exitCode: exitCode.flatMap(Int.init),
+                        durationMs: durationMs,
+                        processId: nil,
+                        actions: []
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "mcp_tool_call_begin":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let invocation = eventPayload["invocation"] as? [String: Any]
+            let server = invocation.flatMap { extractString($0, keys: ["server"]) } ?? ""
+            let tool = invocation.flatMap { extractString($0, keys: ["tool"]) } ?? ""
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .mcpToolCall(
+                    ConversationMcpToolCallData(
+                        server: server,
+                        tool: tool,
+                        status: "inProgress",
+                        durationMs: nil,
+                        argumentsJSON: invocation.flatMap { $0["arguments"] }.flatMap(prettyJSON),
+                        contentSummary: nil,
+                        structuredContentJSON: nil,
+                        rawOutputJSON: nil,
+                        errorMessage: nil,
+                        progressMessages: []
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "mcp_tool_call_end":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let invocation = eventPayload["invocation"] as? [String: Any]
+            let server = invocation.flatMap { extractString($0, keys: ["server"]) } ?? ""
+            let tool = invocation.flatMap { extractString($0, keys: ["tool"]) } ?? ""
+            let durationMs = durationMillis(from: eventPayload["duration"])
+            let result = eventPayload["result"]
+
+            var status = "completed"
+            if let resultDict = result as? [String: Any], resultDict["Err"] != nil {
+                status = "failed"
+            }
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .mcpToolCall(
+                    ConversationMcpToolCallData(
+                        server: server,
+                        tool: tool,
+                        status: status,
+                        durationMs: durationMs,
+                        argumentsJSON: invocation.flatMap { $0["arguments"] }.flatMap(prettyJSON),
+                        contentSummary: result.map(stringifyValue),
+                        structuredContentJSON: nil,
+                        rawOutputJSON: result.flatMap(prettyJSON),
+                        errorMessage: status == "failed" ? stringifyValue(result ?? "") : nil,
+                        progressMessages: []
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "web_search_begin":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId", "item_id", "itemId"])
+            let query = extractString(eventPayload, keys: ["query"]) ?? ""
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .webSearch(
+                    ConversationWebSearchData(
+                        query: query,
+                        actionJSON: nil,
+                        isInProgress: true
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "web_search_end":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId", "item_id", "itemId"])
+            let query = extractString(eventPayload, keys: ["query"]) ?? ""
+            let status = extractString(eventPayload, keys: ["status"]) ?? "completed"
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .webSearch(
+                    ConversationWebSearchData(
+                        query: query,
+                        actionJSON: eventPayload["action"].flatMap(prettyJSON),
+                        isInProgress: status.lowercased().contains("progress")
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "patch_apply_begin":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let autoApproved = (eventPayload["auto_approved"] as? Bool) == true
+
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .fileChange(
+                    ConversationFileChangeData(
+                        status: "inProgress",
+                        changes: legacyPatchChanges(from: eventPayload["changes"]),
+                        outputDelta: autoApproved ? "Approval: auto" : "Approval: requested"
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "patch_apply_end":
+            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
+            let status = extractString(eventPayload, keys: ["status"]) ?? ((eventPayload["success"] as? Bool) == true ? "completed" : "failed")
+            let stdout = extractString(eventPayload, keys: ["stdout"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let stderr = extractString(eventPayload, keys: ["stderr"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            let outputDelta = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            let msg = ConversationItem(
+                id: itemId ?? UUID().uuidString,
+                content: .fileChange(
+                    ConversationFileChangeData(
+                        status: status,
+                        changes: legacyPatchChanges(from: eventPayload["changes"]),
+                        outputDelta: outputDelta.isEmpty ? nil : outputDelta
+                    )
+                ),
+                timestamp: Date()
+            )
+            if let itemId {
+                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        case "turn_diff":
+            let turnId = extractString(params, keys: ["id", "turnId", "turn_id"])
+                ?? extractString(eventPayload, keys: ["id", "turnId", "turn_id"])
+            guard let diff = extractString(eventPayload, keys: ["unified_diff"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !diff.isEmpty else { return }
+            let msg = ConversationItem(
+                id: turnId ?? UUID().uuidString,
+                content: .turnDiff(ConversationTurnDiffData(diff: diff)),
+                sourceTurnId: turnId,
+                sourceTurnIndex: nil,
+                timestamp: Date()
+            )
+
+            if let turnId, !turnId.isEmpty {
+                upsertLiveTurnDiffMessage(msg, turnId: turnId, key: key, thread: thread)
+            } else {
+                thread.items.append(msg)
+            }
+            thread.updatedAt = Date()
+
+        default:
+            break
+        }
+    }
+
+    private func ingestCodexEventAgentMetadataFromParams(serverId: String, method: String, params: [String: Any]) {
+        let eventPayload: [String: Any]
+        let eventType: String
+        if method == "codex/event" {
+            eventPayload = (params["msg"] as? [String: Any]) ?? params
+            eventType = extractString(eventPayload, keys: ["type"]) ?? "codex/event"
+        } else {
+            eventPayload = (params["msg"] as? [String: Any]) ?? params
+            eventType = String(method.dropFirst("codex/event/".count))
+        }
+
+        func upsertIdentity(
+            threadId: String?,
+            agentId: String?,
+            nickname: String?,
+            role: String?,
+            source: String
+        ) {
+            let normalizedThreadId = sanitizedLineageId(threadId)
+            let normalizedAgentId = sanitizedLineageId(agentId)
+            let normalizedNickname = sanitizedLineageId(nickname)
+            let normalizedRole = sanitizedLineageId(role)
+            guard normalizedThreadId != nil || normalizedAgentId != nil || normalizedNickname != nil || normalizedRole != nil else {
+                return
+            }
+            upsertAgentDirectory(
+                serverId: serverId,
+                threadId: normalizedThreadId,
+                agentId: normalizedAgentId,
+                nickname: normalizedNickname,
+                role: normalizedRole
+            )
+            debugAgentDirectoryLog(
+                "codex-event metadata server=\(serverId) event=\(eventType) source=\(source) threadId=\(normalizedThreadId ?? "<nil>") agentId=\(normalizedAgentId ?? "<nil>") nickname=\(normalizedNickname ?? "<nil>") role=\(normalizedRole ?? "<nil>")"
+            )
+        }
+
+        var senderMetadata = extractAgentMetadata(eventPayload)
+        senderMetadata.threadId = senderMetadata.threadId
+            ?? sanitizedLineageId(
+                extractString(
+                    eventPayload,
+                    keys: ["sender_thread_id", "senderThreadId", "thread_id", "threadId", "conversation_id", "conversationId"]
+                )
+            )
+            ?? sanitizedLineageId(
+                extractString(
+                    params,
+                    keys: ["thread_id", "threadId", "conversation_id", "conversationId"]
+                )
+            )
+        senderMetadata.agentId = senderMetadata.agentId
+            ?? sanitizedLineageId(extractString(eventPayload, keys: ["sender_agent_id", "senderAgentId"]))
+        upsertIdentity(
+            threadId: senderMetadata.threadId,
+            agentId: senderMetadata.agentId,
+            nickname: senderMetadata.nickname,
+            role: senderMetadata.role,
+            source: "sender"
+        )
+
+        upsertIdentity(
+            threadId: extractString(eventPayload, keys: ["new_thread_id", "newThreadId"]),
+            agentId: extractString(eventPayload, keys: ["new_agent_id", "newAgentId"]),
+            nickname: extractString(eventPayload, keys: ["new_agent_nickname", "newAgentNickname"]),
+            role: extractString(eventPayload, keys: ["new_agent_role", "newAgentRole"]),
+            source: "spawn-end"
+        )
+
+        upsertIdentity(
+            threadId: extractString(eventPayload, keys: ["receiver_thread_id", "receiverThreadId"]),
+            agentId: extractString(eventPayload, keys: ["receiver_agent_id", "receiverAgentId"]),
+            nickname: extractString(eventPayload, keys: ["receiver_agent_nickname", "receiverAgentNickname"]),
+            role: extractString(eventPayload, keys: ["receiver_agent_role", "receiverAgentRole"]),
+            source: "receiver-single"
+        )
+
+        let receiverThreadIds = extractStringArray(
+            eventPayload,
+            keys: ["receiver_thread_ids", "receiverThreadIds"]
+        )
+        let receiverAgentsAny = (eventPayload["receiver_agents"] as? [Any]) ?? (eventPayload["receiverAgents"] as? [Any]) ?? []
+
+        for (index, threadId) in receiverThreadIds.enumerated() {
+            let alignedAgent = index < receiverAgentsAny.count ? (receiverAgentsAny[index] as? [String: Any]) : nil
+            let alignedIdentity = alignedAgent.map { extractAgentMetadata($0) }
+            upsertIdentity(
+                threadId: threadId,
+                agentId: alignedIdentity?.agentId ?? alignedAgent.flatMap { extractString($0, keys: ["agent_id", "agentId", "id"]) },
+                nickname: alignedIdentity?.nickname ?? alignedAgent.flatMap { extractString($0, keys: ["agent_nickname", "agentNickname", "nickname", "name"]) },
+                role: alignedIdentity?.role ?? alignedAgent.flatMap { extractString($0, keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"]) },
+                source: "receiver-thread-ids[\(index)]"
+            )
+        }
+
+        for (index, rawReceiver) in receiverAgentsAny.enumerated() {
+            if let receiver = rawReceiver as? [String: Any] {
+                let metadata = extractAgentMetadata(receiver)
+                let threadId = metadata.threadId
+                    ?? extractString(receiver, keys: ["thread_id", "threadId", "receiver_thread_id", "receiverThreadId"])
+                upsertIdentity(
+                    threadId: threadId,
+                    agentId: metadata.agentId,
+                    nickname: metadata.nickname ?? extractString(receiver, keys: ["receiver_agent_nickname", "receiverAgentNickname"]),
+                    role: metadata.role ?? extractString(receiver, keys: ["receiver_agent_role", "receiverAgentRole"]),
+                    source: "receiver-agents[\(index)]"
+                )
+            } else {
+                upsertIdentity(
+                    threadId: extractStringValue(rawReceiver),
+                    agentId: nil,
+                    nickname: nil,
+                    role: nil,
+                    source: "receiver-agents[\(index)]-scalar"
+                )
+            }
+        }
+
+        if let statuses = eventPayload["statuses"] as? [String: Any] {
+            for (threadId, rawStatus) in statuses {
+                let statusDict = rawStatus as? [String: Any]
+                upsertIdentity(
+                    threadId: threadId,
+                    agentId: statusDict.flatMap { extractString($0, keys: ["agent_id", "agentId"]) },
+                    nickname: statusDict.flatMap { extractString($0, keys: ["agent_nickname", "agentNickname", "receiver_agent_nickname", "receiverAgentNickname"]) },
+                    role: statusDict.flatMap { extractString($0, keys: ["agent_role", "agentRole", "receiver_agent_role", "receiverAgentRole", "agent_type", "agentType"]) },
+                    source: "statuses"
+                )
+            }
+        }
+
+        if let statusEntries = eventPayload["agent_statuses"] as? [Any] {
+            for (index, rawEntry) in statusEntries.enumerated() {
+                guard let entry = rawEntry as? [String: Any] else { continue }
+                upsertIdentity(
+                    threadId: extractString(entry, keys: ["thread_id", "threadId", "receiver_thread_id", "receiverThreadId"]),
+                    agentId: extractString(entry, keys: ["agent_id", "agentId"]),
+                    nickname: extractString(entry, keys: ["agent_nickname", "agentNickname", "receiver_agent_nickname", "receiverAgentNickname"]),
+                    role: extractString(entry, keys: ["agent_role", "agentRole", "receiver_agent_role", "receiverAgentRole", "agent_type", "agentType"]),
+                    source: "agent-statuses[\(index)]"
+                )
+            }
         }
     }
 
@@ -582,15 +2369,9 @@ final class ServerManager {
         if id == Self.localServerID {
             setPersistedLocalVoiceThreadId(nil)
         }
-        if let conn = connections[id] {
-            if conn.target == .local {
-                Task { await CodexBridge.shared.stop() }
-            } else if conn.server.source == .ssh {
-                Task { await SSHSessionManager.shared.stopRemoteServer() }
-            }
-        }
         connections[id]?.disconnect()
         connections.removeValue(forKey: id)
+        handoffManager.unregisterServer(serverId: id)
         removePendingApprovals(forServerId: id)
         removePendingUserInputRequests(forServerId: id)
         for key in threads.keys where key.serverId == id {
@@ -623,9 +2404,6 @@ final class ServerManager {
         await withTaskGroup(of: Void.self) { group in
             for s in saved {
                 let server = s.toDiscoveredServer()
-                if server.source == .local && !OnDeviceCodexFeature.isEnabled {
-                    continue
-                }
                 guard let target = server.connectionTarget else { continue }
                 group.addTask { @MainActor in
                     await self.addServer(server, target: target)
@@ -664,54 +2442,35 @@ final class ServerManager {
         model: String? = nil,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil,
-        dynamicTools: [DynamicToolSpec]? = nil,
-        activate: Bool = true
+        dynamicTools: [DynamicToolSpecParams]? = nil
     ) async throws -> ThreadKey {
         guard let conn = connections[serverId] else {
             throw NSError(domain: "Litter", code: 1, userInfo: [NSLocalizedDescriptionKey: "No connection for server"])
         }
-        let resp = try await conn.startThread(
+        let key = try await conn.startThread(
             cwd: cwd,
             model: model,
             approvalPolicy: approvalPolicy,
             sandboxMode: sandboxMode,
             dynamicTools: dynamicTools ?? (ExperimentalFeatures.shared.isEnabled(.generativeUI) ? GenerativeUITools.buildDynamicToolSpecs() : nil)
         )
-        let threadId = resp.thread.id
-        let key = ThreadKey(serverId: serverId, threadId: threadId)
         let state = ThreadState(
-            serverId: serverId,
-            threadId: threadId,
+            serverId: key.serverId,
+            threadId: key.threadId,
             serverName: conn.server.name,
             serverSource: conn.server.source
         )
-        state.cwd = resp.cwd
-        state.model = resp.model
-        state.modelProvider = resp.modelProvider ?? resp.model
-        state.reasoningEffort = resp.reasoningEffort
-        state.rolloutPath = resp.thread.path
-        state.parentThreadId = sanitizedLineageId(resp.thread.parentThreadId)
-        state.rootThreadId = sanitizedLineageId(resp.thread.rootThreadId)
-        state.agentNickname = sanitizedLineageId(resp.thread.agentNickname)
-        state.agentRole = sanitizedLineageId(resp.thread.agentRole)
+        state.cwd = cwd
+        state.model = model ?? ""
         state.requiresOpenHydration = false
-        upsertAgentDirectory(
-            serverId: serverId,
-            threadId: threadId,
-            agentId: resp.thread.agentId,
-            nickname: state.agentNickname,
-            role: state.agentRole
-        )
         state.updatedAt = Date()
         threads[key] = state
         threadTurnCounts[key] = 0
         liveItemMessageIndices[key] = nil
         liveTurnDiffMessageIndices[key] = nil
-        if activate {
-            activeThreadKey = key
-        }
-        _ = RecentDirectoryStore.shared.record(path: resp.cwd, for: serverId)
-        scheduleThreadMetadataRefresh(for: key, cwd: resp.cwd)
+        activeThreadKey = key
+        _ = RecentDirectoryStore.shared.record(path: cwd, for: serverId)
+        scheduleThreadMetadataRefresh(for: key, cwd: cwd)
         return key
     }
 
@@ -874,7 +2633,7 @@ final class ServerManager {
             }
             if candidate == activeVoiceSession?.threadKey {
                 recordVoiceSessionDebug(
-                    "-> thread/realtime/stop cleanup \(debugJSONString(ThreadRealtimeStopParams(threadId: candidate.threadId)))",
+                    "-> thread/realtime/stop cleanup \(debugJSONString(["threadId": candidate.threadId]))",
                     for: candidate
                 )
             }
@@ -911,6 +2670,16 @@ final class ServerManager {
         appendVoiceSessionDebug("phase stopping", to: &session)
         activeVoiceSession = session
         syncVoiceCallActivity()
+    }
+
+    func startVoiceOnThread(_ key: ThreadKey) async throws {
+        if let existing = activeVoiceSession, existing.phase != .error { return }
+        if activeVoiceSession != nil { endVoiceSessionImmediately() }
+        guard key.serverId == Self.localServerID else {
+            throw NSError(domain: "Litter", code: 3310,
+                          userInfo: [NSLocalizedDescriptionKey: "Voice is only available on the local server"])
+        }
+        try await startRealtimeVoiceSession(for: key, previousActiveThreadKey: activeThreadKey)
     }
 
     func startPinnedLocalVoiceCall(
@@ -956,13 +2725,18 @@ final class ServerManager {
             )
         }
 
-        let features = try await connection.listExperimentalFeatures(limit: 200)
-        guard Self.isRealtimeConversationEnabled(features.data) else {
-            throw NSError(
-                domain: "Litter",
-                code: 3303,
-                userInfo: [NSLocalizedDescriptionKey: "This app-server does not have realtime conversation enabled"]
-            )
+        if case .local = connection.target {
+            // The in-process server is started with local realtime overrides,
+            // so the local path does not need a config roundtrip here.
+        } else {
+            let features = try await connection.listExperimentalFeatures(limit: 200)
+            guard Self.isRealtimeConversationEnabled(features.data) else {
+                throw NSError(
+                    domain: "Litter",
+                    code: 3303,
+                    userInfo: [NSLocalizedDescriptionKey: "This app-server does not have realtime conversation enabled"]
+                )
+            }
         }
 
         await cleanupKnownRealtimeVoiceSessions(beforeStartingOn: key)
@@ -975,13 +2749,21 @@ final class ServerManager {
             threadTitle: thread.preview,
             model: thread.model.isEmpty ? (model ?? thread.modelProvider) : thread.model
         )
+        pendingRealtimeMessageIDs[key] = (nil, nil)
+        lastRealtimeTranscriptDelta.removeValue(forKey: key)
         let authSnapshot = await connection.getAuthToken()
         recordVoiceSessionDebug(
             "phase connection=\(connection.connectionPhase) auth=\(debugAuthStatus(connection.authStatus)) authMethod=\(authSnapshot.method ?? "nil") tokenPresent=\(authSnapshot.token != nil)",
             for: key
         )
+        let startRealtimePayload = debugJSONString([
+            "threadId": key.threadId,
+            "prompt": VoiceSessionControl.defaultPrompt,
+            "sessionId": runtimeSessionId as Any,
+            "clientControlledHandoff": true,
+        ])
         recordVoiceSessionDebug(
-            "-> thread/realtime/start \(debugJSONString(ThreadRealtimeStartParams(threadId: key.threadId, prompt: VoiceSessionControl.defaultPrompt, sessionId: runtimeSessionId)))",
+            "-> thread/realtime/start \(startRealtimePayload)",
             for: key
         )
         syncVoiceCallActivity()
@@ -990,7 +2772,8 @@ final class ServerManager {
             try await connection.startRealtimeConversation(
                 threadId: key.threadId,
                 prompt: VoiceSessionControl.defaultPrompt,
-                sessionId: runtimeSessionId
+                sessionId: runtimeSessionId,
+                clientControlledHandoff: true
             )
             recordVoiceSessionDebug("<- thread/realtime/start {}", for: key)
         } catch {
@@ -1009,7 +2792,7 @@ final class ServerManager {
         voiceStopRequestedThreadKey = key
         updateVoiceSessionForPendingStop(key)
         recordVoiceSessionDebug(
-            "-> thread/realtime/stop \(debugJSONString(ThreadRealtimeStopParams(threadId: key.threadId)))",
+            "-> thread/realtime/stop \(debugJSONString(["threadId": key.threadId]))",
             for: key
         )
 
@@ -1099,45 +2882,40 @@ final class ServerManager {
             approvalPolicy: approvalPolicy,
             sandboxMode: sandboxMode
         )
-        let forkKey = ThreadKey(serverId: sourceKey.serverId, threadId: response.thread.id)
+        let forkKey = ThreadKey(serverId: sourceKey.serverId, threadId: response.threadId)
         let forkedState = threads[forkKey] ?? ThreadState(
             serverId: sourceKey.serverId,
-            threadId: response.thread.id,
+            threadId: response.threadId,
             serverName: conn.server.name,
             serverSource: conn.server.source
         )
         installRestoredMessages(
-            restoredMessages(
-            from: response.thread.turns,
-            serverId: sourceKey.serverId,
-            defaultAgentNickname: response.thread.agentNickname,
-            defaultAgentRole: response.thread.agentRole
-            ),
+            response.hydratedItems,
             on: forkedState,
             key: forkKey,
             staged: false
         )
-        threadTurnCounts[forkKey] = response.thread.turns.count
+        threadTurnCounts[forkKey] = Int(response.turnCount)
         liveItemMessageIndices[forkKey] = nil
         liveTurnDiffMessageIndices[forkKey] = nil
-        forkedState.cwd = response.cwd
+        forkedState.cwd = response.cwd ?? forkedState.cwd
         forkedState.preview = sourceThread.preview
-        forkedState.model = response.model
-        forkedState.modelProvider = response.modelProvider ?? response.model
+        forkedState.model = response.model ?? forkedState.model
+        forkedState.modelProvider = response.modelProvider ?? response.model ?? forkedState.modelProvider
         forkedState.reasoningEffort = response.reasoningEffort
-        forkedState.rolloutPath = response.thread.path
-        forkedState.parentThreadId = sanitizedLineageId(response.thread.parentThreadId) ?? sourceKey.threadId
-        forkedState.rootThreadId = sanitizedLineageId(response.thread.rootThreadId)
+        forkedState.rolloutPath = response.threadPath
+        forkedState.parentThreadId = sanitizedLineageId(response.parentThreadId) ?? sourceKey.threadId
+        forkedState.rootThreadId = sanitizedLineageId(response.rootThreadId)
             ?? sourceThread.rootThreadId
             ?? sourceThread.parentThreadId
             ?? sourceKey.threadId
-        forkedState.agentNickname = sanitizedLineageId(response.thread.agentNickname)
-        forkedState.agentRole = sanitizedLineageId(response.thread.agentRole)
+        forkedState.agentNickname = sanitizedLineageId(response.agentNickname)
+        forkedState.agentRole = sanitizedLineageId(response.agentRole)
         forkedState.requiresOpenHydration = false
         upsertAgentDirectory(
             serverId: sourceKey.serverId,
-            threadId: response.thread.id,
-            agentId: response.thread.agentId,
+            threadId: response.threadId,
+            agentId: response.agentId,
             nickname: forkedState.agentNickname,
             role: forkedState.agentRole
         )
@@ -1145,7 +2923,7 @@ final class ServerManager {
         forkedState.updatedAt = Date()
         threads[forkKey] = forkedState
         activeThreadKey = forkKey
-        scheduleThreadMetadataRefresh(for: forkKey, cwd: response.cwd)
+        scheduleThreadMetadataRefresh(for: forkKey, cwd: response.cwd ?? forkedState.cwd)
         return forkKey
     }
 
@@ -1196,17 +2974,12 @@ final class ServerManager {
 
         let rollbackResponse = try await forkConn.rollbackThread(threadId: forkKey.threadId, numTurns: rollbackDepth)
         installRestoredMessages(
-            restoredMessages(
-            from: rollbackResponse.thread.turns,
-            serverId: forkKey.serverId,
-            defaultAgentNickname: rollbackResponse.thread.agentNickname ?? forkThreadState.agentNickname,
-            defaultAgentRole: rollbackResponse.thread.agentRole ?? forkThreadState.agentRole
-            ),
+            rollbackResponse.hydratedItems,
             on: forkThreadState,
             key: forkKey,
             staged: false
         )
-        threadTurnCounts[forkKey] = rollbackResponse.thread.turns.count
+        threadTurnCounts[forkKey] = Int(rollbackResponse.turnCount)
         forkThreadState.status = .ready
         forkThreadState.updatedAt = Date()
         liveItemMessageIndices[forkKey] = nil
@@ -1231,17 +3004,12 @@ final class ServerManager {
         if rollbackDepth > 0 {
             let response = try await conn.rollbackThread(threadId: key.threadId, numTurns: rollbackDepth)
             installRestoredMessages(
-                restoredMessages(
-                from: response.thread.turns,
-                serverId: key.serverId,
-                defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
-                defaultAgentRole: response.thread.agentRole ?? thread.agentRole
-                ),
+                response.hydratedItems,
                 on: thread,
                 key: key,
                 staged: false
             )
-            threadTurnCounts[key] = response.thread.turns.count
+            threadTurnCounts[key] = Int(response.turnCount)
             thread.status = .ready
             thread.updatedAt = Date()
             liveItemMessageIndices[key] = nil
@@ -1453,7 +3221,7 @@ final class ServerManager {
     }
 
     private func handleDynamicToolCall(serverId: String, requestId: String, params: [String: Any]) -> Bool {
-        guard let toolCallParams = DynamicToolCallParams(from: params) else {
+        guard let toolCallParams = ParsedDynamicToolCall(from: params) else {
             return false
         }
 
@@ -1493,66 +3261,27 @@ final class ServerManager {
         default:
             connections[serverId]?.respondToServerRequest(
                 id: requestId,
-                result: DynamicToolCallResponse.error("Unknown dynamic tool: \(toolCallParams.tool)").asDictionary
+                result: DynamicToolResult.error("Unknown dynamic tool: \(toolCallParams.tool)").asDictionary
             )
             return true
         }
     }
 
-    private func respondToDynamicToolCall(serverId: String, requestId: String, result: Result<String, Error>) {
-        switch result {
-        case .success(let text):
-            connections[serverId]?.respondToServerRequest(
-                id: requestId,
-                result: DynamicToolCallResponse.text(text).asDictionary
-            )
-        case .failure(let error):
-            connections[serverId]?.respondToServerRequest(
-                id: requestId,
-                result: DynamicToolCallResponse.error(error.localizedDescription).asDictionary
-            )
-        }
-    }
-
-    private func dynamicToolResult(
-        for tool: String,
-        arguments: [String: Any]
-    ) async -> Result<String, Error> {
-        do {
-            switch tool {
-            case CrossServerTools.listServersToolName:
-                return .success(listServersToolResult())
-            case CrossServerTools.listSessionsToolName:
-                return .success(try await listSessionsToolResult(arguments: arguments))
-            case CrossServerTools.runOnServerToolName:
-                return .success(try await runOnServerToolResult(arguments: arguments))
-            default:
-                return .failure(NSError(
-                    domain: "Litter",
-                    code: 3300,
-                    userInfo: [NSLocalizedDescriptionKey: "Unknown dynamic tool: \(tool)"]
-                ))
-            }
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    private func handleReadMeToolCall(serverId: String, requestId: String, params: DynamicToolCallParams) {
+    private func handleReadMeToolCall(serverId: String, requestId: String, params: ParsedDynamicToolCall) {
         let modulesArg = params.arguments["modules"] as? [String] ?? []
         let modules = modulesArg.compactMap { WidgetGuidelineModule(rawValue: $0) }
         let guidelines = WidgetGuidelines.getGuidelines(modules: modules.isEmpty ? [.interactive] : modules)
         connections[serverId]?.respondToServerRequest(
             id: requestId,
-            result: DynamicToolCallResponse.text(guidelines).asDictionary
+            result: DynamicToolResult.text(guidelines).asDictionary
         )
     }
 
-    private func handleShowWidgetToolCall(serverId: String, requestId: String, key: ThreadKey, params: DynamicToolCallParams) {
+    private func handleShowWidgetToolCall(serverId: String, requestId: String, key: ThreadKey, params: ParsedDynamicToolCall) {
         guard let thread = threads[key] else {
             connections[serverId]?.respondToServerRequest(
                 id: requestId,
-                result: DynamicToolCallResponse.error("Thread not found").asDictionary
+                result: DynamicToolResult.error("Thread not found").asDictionary
             )
             return
         }
@@ -1578,7 +3307,7 @@ final class ServerManager {
 
         connections[serverId]?.respondToServerRequest(
             id: requestId,
-            result: DynamicToolCallResponse.text("Widget \"\(widget.title)\" rendered and shown to the user (\(Int(widget.width))x\(Int(widget.height))).").asDictionary
+            result: DynamicToolResult.text("Widget \"\(widget.title)\" rendered and shown to the user (\(Int(widget.width))x\(Int(widget.height))).").asDictionary
         )
     }
 
@@ -2044,12 +3773,12 @@ final class ServerManager {
         )
         do {
             var additionalInputs = skillMentions.map { mention in
-                UserInput(type: "skill", path: mention.path, name: mention.name)
+                UserInput.skill(name: mention.name, path: AbsolutePath(value: mention.path))
             }
             if let preparedAttachment {
                 additionalInputs.append(preparedAttachment.userInput)
             }
-            let resp = try await conn.sendTurn(
+            try await conn.sendTurn(
                 threadId: key.threadId,
                 text: text,
                 approvalPolicy: approvalPolicy,
@@ -2059,8 +3788,7 @@ final class ServerManager {
                 serviceTier: serviceTier,
                 additionalInput: additionalInputs
             )
-            NSLog("[send] sendTurn succeeded, turnId=%@", resp.turnId ?? "nil")
-            thread.activeTurnId = resp.turnId
+            NSLog("[send] sendTurn succeeded")
         } catch {
             thread.status = .error(error.localizedDescription)
             endLiveActivity(key: key, phase: .failed)
@@ -2150,43 +3878,35 @@ final class ServerManager {
     func refreshSessions(for serverId: String) async {
         guard let conn = connections[serverId], conn.isConnected else { return }
         do {
-            let resp = try await conn.listThreads()
+            let threadList = try await conn.listThreads()
             var recentDirectoryEntries: [RecentDirectoryEntry] = []
-            for summary in resp.data {
+            for summary in threadList {
                 let key = ThreadKey(serverId: serverId, threadId: summary.id)
-                let updatedAt = Date(timeIntervalSince1970: TimeInterval(summary.updatedAt))
-                let normalizedPath = summary.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+                let updatedAt = summary.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                let normalizedPath = (summary.cwd ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !normalizedPath.isEmpty {
                     recentDirectoryEntries.append(
                         RecentDirectoryEntry(
                             serverId: serverId,
                             path: normalizedPath,
-                            lastUsedAt: updatedAt,
+                            lastUsedAt: updatedAt ?? Date(),
                             useCount: 0
                         )
                     )
                 }
                 if let existing = threads[key] {
-                    if existing.preview != summary.preview {
-                        existing.preview = summary.preview
+                    if let preview = summary.preview, existing.preview != preview {
+                        existing.preview = preview
                     }
-                    if existing.cwd != summary.cwd {
-                        existing.cwd = summary.cwd
+                    if let cwd = summary.cwd, existing.cwd != cwd {
+                        existing.cwd = cwd
                     }
                     let nextRolloutPath = summary.path ?? existing.rolloutPath
                     if existing.rolloutPath != nextRolloutPath {
                         existing.rolloutPath = nextRolloutPath
                     }
-                    if existing.modelProvider != summary.modelProvider {
-                        existing.modelProvider = summary.modelProvider
-                    }
-                    let nextParentThreadId = sanitizedLineageId(summary.parentThreadId) ?? existing.parentThreadId
-                    if existing.parentThreadId != nextParentThreadId {
-                        existing.parentThreadId = nextParentThreadId
-                    }
-                    let nextRootThreadId = sanitizedLineageId(summary.rootThreadId) ?? existing.rootThreadId
-                    if existing.rootThreadId != nextRootThreadId {
-                        existing.rootThreadId = nextRootThreadId
+                    if let mp = summary.modelProvider, existing.modelProvider != mp {
+                        existing.modelProvider = mp
                     }
                     let nextAgentNickname = sanitizedLineageId(summary.agentNickname) ?? existing.agentNickname
                     if existing.agentNickname != nextAgentNickname {
@@ -2199,11 +3919,11 @@ final class ServerManager {
                     upsertAgentDirectory(
                         serverId: serverId,
                         threadId: summary.id,
-                        agentId: summary.agentId,
+                        agentId: nil,
                         nickname: existing.agentNickname,
                         role: existing.agentRole
                     )
-                    if existing.updatedAt != updatedAt {
+                    if let updatedAt, existing.updatedAt != updatedAt {
                         existing.updatedAt = updatedAt
                     }
                 } else {
@@ -2213,378 +3933,28 @@ final class ServerManager {
                         serverName: conn.server.name,
                         serverSource: conn.server.source
                     )
-                    state.preview = summary.preview
-                    state.cwd = summary.cwd
+                    state.preview = summary.preview ?? ""
+                    state.cwd = summary.cwd ?? ""
                     state.rolloutPath = summary.path
-                    state.modelProvider = summary.modelProvider
-                    state.parentThreadId = sanitizedLineageId(summary.parentThreadId)
-                    state.rootThreadId = sanitizedLineageId(summary.rootThreadId)
+                    state.modelProvider = summary.modelProvider ?? ""
                     state.agentNickname = sanitizedLineageId(summary.agentNickname)
                     state.agentRole = sanitizedLineageId(summary.agentRole)
                     upsertAgentDirectory(
                         serverId: serverId,
                         threadId: summary.id,
-                        agentId: summary.agentId,
+                        agentId: nil,
                         nickname: state.agentNickname,
                         role: state.agentRole
                     )
-                    state.updatedAt = updatedAt
+                    if let updatedAt {
+                        state.updatedAt = updatedAt
+                    }
                     threads[key] = state
                     threadTurnCounts[key] = threadTurnCounts[key] ?? 0
                 }
             }
             _ = RecentDirectoryStore.shared.mergeSessionDirectories(recentDirectoryEntries, for: serverId)
         } catch {}
-    }
-
-    // MARK: - Notification Routing
-
-    func handleNotification(serverId: String, method: String, data: Data) async {
-        if suppressNotifications {
-            return
-        }
-        switch method {
-        case "account/login/completed", "account/updated", "account/rateLimits/updated":
-            connections[serverId]?.handleAccountNotification(method: method, data: data)
-
-        case "sessionConfigured":
-            handleSessionConfiguredNotification(serverId: serverId, data: data)
-
-        case "thread/started":
-            handleThreadStartedNotification(serverId: serverId, data: data)
-
-        case "thread/tokenUsage/updated":
-            handleThreadTokenUsageUpdatedNotification(serverId: serverId, data: data)
-
-        case "thread/status/changed":
-            ensureThreadExists(serverId: serverId, data: data)
-
-        case "thread/realtime/started":
-            handleRealtimeStarted(serverId: serverId, data: data)
-
-        case "thread/realtime/itemAdded":
-            handleRealtimeItemAdded(serverId: serverId, data: data)
-
-        case "thread/realtime/outputAudio/delta":
-            handleRealtimeOutputAudioDelta(serverId: serverId, data: data)
-
-        case "thread/realtime/error":
-            handleRealtimeError(serverId: serverId, data: data)
-
-        case "thread/realtime/closed":
-            handleRealtimeClosed(serverId: serverId, data: data)
-
-        case "turn/started":
-            let identifiers = await extractThreadIdentifiers(from: data)
-            if let threadId = identifiers.threadId {
-                let key = ThreadKey(serverId: serverId, threadId: threadId)
-                ensureThreadExistsByKey(serverId: serverId, threadId: threadId)
-                threads[key]?.status = .thinking
-                threads[key]?.activeTurnId = identifiers.turnId
-                if threads[key]?.isSubagent == true {
-                    threads[key]?.agentStatus = .running
-                }
-                removePendingRequests(serverId: serverId, threadId: threadId)
-            }
-
-        case "item/agentMessage/delta":
-            serversUsingItemNotifications.insert(serverId)
-            struct DeltaParams: Decodable, Sendable {
-                let delta: String
-                let threadId: String?
-                let agentId: String?
-                let agentNickname: String?
-                let agentRole: String?
-
-                private enum CodingKeys: String, CodingKey {
-                    case delta
-                    case id
-                    case source
-                    case threadId
-                    case threadIdSnake = "thread_id"
-                    case agentId
-                    case agentIdSnake = "agent_id"
-                    case agentNickname
-                    case agentNicknameSnake = "agent_nickname"
-                    case nickname
-                    case name
-                    case agentRole
-                    case agentRoleSnake = "agent_role"
-                    case agentType
-                    case agentTypeSnake = "agent_type"
-                    case role
-                    case type
-                }
-
-                init(from decoder: Decoder) throws {
-                    let container = try decoder.container(keyedBy: CodingKeys.self)
-                    let sourceAny = try? container.decodeIfPresent(AnyCodable.self, forKey: .source)
-                    delta = (try? container.decode(String.self, forKey: .delta)) ?? ""
-                    threadId = Self.decodeString(container, forKey: .threadId)
-                        ?? Self.decodeString(container, forKey: .threadIdSnake)
-                        ?? Self.extractSourceField(sourceAny?.value, keys: ["thread_id", "threadId"])
-
-                    let directAgentId = Self.decodeString(container, forKey: .agentId)
-                        ?? Self.decodeString(container, forKey: .agentIdSnake)
-                        ?? Self.decodeString(container, forKey: .id)
-                    agentId = directAgentId
-                        ?? Self.extractSourceField(sourceAny?.value, keys: ["agent_id", "agentId", "id"])
-
-                    let directNickname = Self.decodeString(container, forKey: .agentNickname)
-                        ?? Self.decodeString(container, forKey: .agentNicknameSnake)
-                        ?? Self.decodeString(container, forKey: .nickname)
-                        ?? Self.decodeString(container, forKey: .name)
-                    agentNickname = directNickname
-                        ?? Self.extractSourceField(sourceAny?.value, keys: ["agent_nickname", "agentNickname", "nickname", "name"])
-
-                    let roleFromPrimary = try? container.decodeIfPresent(String.self, forKey: .agentRole)
-                    let roleFromSnake = try? container.decodeIfPresent(String.self, forKey: .agentRoleSnake)
-                    let roleFromType = try? container.decodeIfPresent(String.self, forKey: .agentType)
-                    let roleFromTypeSnake = try? container.decodeIfPresent(String.self, forKey: .agentTypeSnake)
-                    let roleFromGeneric = try? container.decodeIfPresent(String.self, forKey: .role)
-                    let typeFromGeneric = try? container.decodeIfPresent(String.self, forKey: .type)
-                    let directRole = roleFromPrimary ?? roleFromSnake ?? roleFromType ?? roleFromTypeSnake ?? roleFromGeneric ?? typeFromGeneric
-                    agentRole = directRole
-                        ?? Self.extractSourceField(sourceAny?.value, keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"])
-                }
-
-                private static func decodeString(
-                    _ container: KeyedDecodingContainer<CodingKeys>,
-                    forKey key: CodingKeys
-                ) -> String? {
-                    if let value = try? container.decodeIfPresent(String.self, forKey: key) {
-                        return value
-                    }
-                    if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
-                        return String(value)
-                    }
-                    if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
-                        return String(value)
-                    }
-                    return nil
-                }
-
-                private static func extractSourceField(_ source: Any?, keys: [String]) -> String? {
-                    guard let sourceDict = source as? [String: Any] else { return nil }
-                    let subAgent = (sourceDict["subAgent"] as? [String: Any]) ?? (sourceDict["sub_agent"] as? [String: Any])
-                    guard let subAgent else { return nil }
-                    let threadSpawn = (subAgent["thread_spawn"] as? [String: Any]) ?? (subAgent["threadSpawn"] as? [String: Any])
-
-                    func extract(from dict: [String: Any]?) -> String? {
-                        guard let dict else { return nil }
-                        for key in keys {
-                            if let value = dict[key] as? String {
-                                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty {
-                                    return trimmed
-                                }
-                            } else if let value = dict[key] as? NSNumber {
-                                return value.stringValue
-                            }
-                        }
-                        return nil
-                    }
-
-                    return extract(from: threadSpawn) ?? extract(from: subAgent)
-                }
-            }
-            struct DeltaNotif: Decodable, Sendable { let params: DeltaParams }
-            guard let notif = await decodeJSONOnBackground(from: data, using: { data in
-                try? JSONDecoder().decode(DeltaNotif.self, from: data)
-            }),
-                  !notif.params.delta.isEmpty else { return }
-            let explicitThreadId = sanitizedLineageId(notif.params.threadId)
-            let key = resolveThreadKey(serverId: serverId, threadId: explicitThreadId)
-            guard let thread = threads[key] else { return }
-            let agentId = sanitizedLineageId(notif.params.agentId)
-            let agentNickname = sanitizedLineageId(notif.params.agentNickname) ?? thread.agentNickname
-            let agentRole = sanitizedLineageId(notif.params.agentRole) ?? thread.agentRole
-            debugAgentDirectoryLog(
-                "delta parsed threadId=\(explicitThreadId ?? "<nil>") agentId=\(agentId ?? "<nil>") nickname=\(agentNickname ?? "<nil>") role=\(agentRole ?? "<nil>")"
-            )
-            if let last = thread.items.last,
-               case .assistant(var data) = last.content {
-                data.text += notif.params.delta
-                if data.agentNickname == nil {
-                    data.agentNickname = agentNickname
-                }
-                if data.agentRole == nil {
-                    data.agentRole = agentRole
-                }
-                thread.items[thread.items.count - 1].content = .assistant(data)
-                thread.items[thread.items.count - 1].timestamp = Date()
-            } else {
-                thread.items.append(
-                    makeAssistantItem(
-                        text: notif.params.delta,
-                        agentNickname: agentNickname,
-                        agentRole: agentRole,
-                        sourceTurnId: thread.activeTurnId,
-                        sourceTurnIndex: nil
-                    )
-                )
-            }
-            if explicitThreadId != nil || agentId == nil {
-                thread.agentNickname = agentNickname
-                thread.agentRole = agentRole
-            }
-            upsertAgentDirectory(
-                serverId: serverId,
-                threadId: explicitThreadId ?? (agentId == nil ? key.threadId : nil),
-                agentId: agentId,
-                nickname: agentNickname,
-                role: agentRole
-            )
-            thread.updatedAt = Date()
-            updateLiveActivityOutput(key: key, thread: thread)
-
-        case "error", "codex/event/error":
-            handleErrorNotification(serverId: serverId, data: data)
-
-        case "turn/completed", "codex/event/task_complete":
-            if let threadId = await extractThreadId(from: data) {
-                let key = ThreadKey(serverId: serverId, threadId: threadId)
-                threads[key]?.status = .ready
-                threads[key]?.updatedAt = Date()
-                threads[key]?.activeTurnId = nil
-                if threads[key]?.isSubagent == true {
-                    threads[key]?.agentStatus = .completed
-                }
-                removePendingRequests(serverId: serverId, threadId: threadId)
-                liveItemMessageIndices[key] = nil
-                liveTurnDiffMessageIndices[key] = nil
-                backgroundedTurnKeys.remove(key)
-                endLiveActivity(key: key, phase: .completed)
-                postLocalNotificationIfNeeded(model: threads[key]?.model ?? "", threadPreview: threads[key]?.preview)
-                // Skip syncThreadFromServer — client already has all messages from streaming.
-                // Sync happens on thread resume/switch instead.
-            } else {
-                for (_, thread) in threads where thread.serverId == serverId && thread.hasTurnActive {
-                    thread.status = .ready
-                    thread.updatedAt = Date()
-                    thread.activeTurnId = nil
-                    removePendingRequests(serverId: serverId, threadId: thread.threadId)
-                    liveItemMessageIndices[thread.key] = nil
-                    liveTurnDiffMessageIndices[thread.key] = nil
-                    backgroundedTurnKeys.remove(thread.key)
-                }
-                endAllLiveActivities(phase: .completed)
-                postLocalNotificationIfNeeded(model: "", threadPreview: nil)
-            }
-            Task { await connections[serverId]?.fetchRateLimits() }
-
-        case "serverRequest/resolved":
-            guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let params = root["params"] as? [String: Any] else { return }
-            removePendingRequests(
-                serverId: serverId,
-                threadId: extractString(params, keys: ["threadId", "thread_id"]),
-                requestId: extractString(params, keys: ["requestId", "request_id"])
-            )
-
-        case "turn/diff/updated":
-            handleTurnDiffNotification(serverId: serverId, data: data)
-
-        case "turn/plan/updated":
-            handleTurnPlanUpdatedNotification(serverId: serverId, data: data)
-
-        default:
-            if method.hasPrefix("item/") {
-                await handleItemNotification(serverId: serverId, method: method, data: data)
-            } else if method == "codex/event/turn_diff" {
-                handleLegacyCodexEventNotification(serverId: serverId, method: method, data: data)
-            } else if method == "codex/event" || method.hasPrefix("codex/event/") {
-                ingestCodexEventAgentMetadata(serverId: serverId, method: method, data: data)
-                if !serversUsingItemNotifications.contains(serverId) {
-                    handleLegacyCodexEventNotification(serverId: serverId, method: method, data: data)
-                }
-            }
-        }
-    }
-
-    private func handleErrorNotification(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any] else { return }
-
-        let errorDict = params["error"] as? [String: Any]
-        let message = (errorDict?["message"] as? String)
-            ?? (params["message"] as? String)
-            ?? "Unknown error"
-
-        let threadId = extractString(params, keys: ["threadId", "thread_id"])
-        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key] else { return }
-
-        thread.items.append(
-            ConversationItem(
-                id: UUID().uuidString,
-                content: .error(ConversationSystemErrorData(title: "Error", message: message, details: nil)),
-                timestamp: Date()
-            )
-        )
-        thread.status = .error(message)
-        thread.updatedAt = Date()
-        endLiveActivity(key: key, phase: .failed)
-    }
-
-    private func handleSessionConfiguredNotification(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any],
-              let sessionId = extractString(params, keys: ["sessionId", "session_id", "threadId", "thread_id"]),
-              !sessionId.isEmpty else { return }
-
-        guard let conn = connections[serverId] else { return }
-        let key = ThreadKey(serverId: serverId, threadId: sessionId)
-        let thread = threads[key] ?? ThreadState(
-            serverId: serverId,
-            threadId: sessionId,
-            serverName: conn.server.name,
-            serverSource: conn.server.source
-        )
-        let parentId = extractString(
-            params,
-            keys: ["forkedFromId", "forked_from_id", "parentThreadId", "parent_thread_id"]
-        )
-        let rootId = extractString(params, keys: ["rootThreadId", "root_thread_id"])
-        let title = extractString(params, keys: ["threadName", "thread_name"])
-        let cwd = extractString(params, keys: ["cwd"])
-        let model = extractString(params, keys: ["model"])
-        let modelProvider = extractString(params, keys: ["modelProvider", "model_provider", "modelProviderId", "model_provider_id"])
-        let reasoningEffort = extractString(params, keys: ["reasoningEffort", "reasoning_effort"])
-        let agentMetadata = extractAgentMetadata(params)
-
-        thread.parentThreadId = sanitizedLineageId(parentId) ?? thread.parentThreadId
-        thread.rootThreadId = sanitizedLineageId(rootId) ?? thread.rootThreadId
-        thread.agentNickname = agentMetadata.nickname ?? thread.agentNickname
-        thread.agentRole = agentMetadata.role ?? thread.agentRole
-        upsertAgentDirectory(
-            serverId: serverId,
-            threadId: sessionId,
-            agentId: agentMetadata.agentId,
-            nickname: thread.agentNickname,
-            role: thread.agentRole
-        )
-        if let title, !title.isEmpty {
-            thread.preview = title
-        }
-        if let cwd, !cwd.isEmpty {
-            thread.cwd = cwd
-        }
-        if let model, !model.isEmpty {
-            thread.model = model
-        }
-        if let modelProvider, !modelProvider.isEmpty {
-            thread.modelProvider = modelProvider
-        }
-        if let reasoningEffort, !reasoningEffort.isEmpty {
-            thread.reasoningEffort = reasoningEffort
-        }
-
-        threads[key] = thread
-        let currentCwd = thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !currentCwd.isEmpty {
-            scheduleThreadMetadataRefresh(for: key, cwd: currentCwd)
-        }
     }
 
     /// Create a minimal ThreadState for a thread ID we haven't seen yet.
@@ -2604,159 +3974,141 @@ final class ServerManager {
         threadTurnCounts[key] = 0
     }
 
-    /// Extract threadId from notification data and ensure a ThreadState exists.
-    private func ensureThreadExists(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any] else { return }
-        if let threadId = extractString(params, keys: ["threadId", "thread_id"]),
-           !threadId.isEmpty {
-            ensureThreadExistsByKey(serverId: serverId, threadId: threadId)
-        }
-    }
-
-    /// Handle `thread/started` notifications for subagent threads.
-    /// These are emitted when a new child thread is spawned and tell us
-    /// the thread ID so we can create a `ThreadState` for it before items arrive.
-    private func handleThreadStartedNotification(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any] else { return }
-
-        // The thread object can be nested under "thread" or flat in params
-        let threadObj = (params["thread"] as? [String: Any]) ?? params
-        guard let threadId = extractString(threadObj, keys: ["id", "threadId", "thread_id"]),
-              !threadId.isEmpty else { return }
-
-        let key = ThreadKey(serverId: serverId, threadId: threadId)
-        // Only create if we don't already have this thread
-        guard threads[key] == nil else { return }
-        guard let conn = connections[serverId] else { return }
-
-        let state = ThreadState(
-            serverId: serverId,
-            threadId: threadId,
-            serverName: conn.server.name,
-            serverSource: conn.server.source
-        )
-
-        if let preview = extractString(threadObj, keys: ["preview"]), !preview.isEmpty {
-            state.preview = preview
-        }
-        if let modelProvider = extractString(threadObj, keys: ["modelProvider", "model_provider"]), !modelProvider.isEmpty {
-            state.modelProvider = modelProvider
-        }
-        if let model = extractString(threadObj, keys: ["model"]), !model.isEmpty {
-            state.model = model
-        }
-        if let cwd = extractString(threadObj, keys: ["cwd"]), !cwd.isEmpty {
-            state.cwd = cwd
-        }
-        if let createdAt = (threadObj["createdAt"] as? TimeInterval) ?? (threadObj["created_at"] as? TimeInterval) {
-            state.updatedAt = Date(timeIntervalSince1970: createdAt)
+    private func scheduleSubagentIdentityHydrationIfNeeded(serverId: String, item: ThreadItem) {
+        guard case .collabAgentToolCall(_, _, _, _, let receiverThreadIds, _, _, _, _) = item else {
+            return
         }
 
-        // Extract agent metadata from source if present
-        let source = (threadObj["source"] as? [String: Any])
-            ?? (threadObj["sessionSource"] as? [String: Any])
-        if let source {
-            let threadSpawn = (source["thread_spawn"] as? [String: Any])
-                ?? (source["threadSpawn"] as? [String: Any])
-            if let threadSpawn {
-                state.parentThreadId = sanitizedLineageId(
-                    extractString(threadSpawn, keys: ["parent_thread_id", "parentThreadId"])
-                )
-                state.agentNickname = extractString(threadSpawn, keys: ["agent_nickname", "agentNickname"])
-                state.agentRole = extractString(threadSpawn, keys: ["agent_role", "agentRole"])
+        var seen = Set<String>()
+        let childThreadIds: [String] = receiverThreadIds.compactMap { rawId in
+            let normalized = sanitizedLineageId(rawId)
+            guard let normalized, seen.insert(normalized).inserted else { return nil }
+            return normalized
+        }
 
-                upsertAgentDirectory(
-                    serverId: serverId,
-                    threadId: threadId,
-                    agentId: nil,
-                    nickname: state.agentNickname,
-                    role: state.agentRole
-                )
+        for childThreadId in childThreadIds {
+            let key = ThreadKey(serverId: serverId, threadId: childThreadId)
+            ensureThreadExistsByKey(serverId: serverId, threadId: childThreadId)
+            guard needsSubagentIdentityHydration(for: key),
+                  deferredSubagentIdentityHydrationTasks[key] == nil else {
+                continue
+            }
+
+            deferredSubagentIdentityHydrationTasks[key] = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.deferredSubagentIdentityHydrationTasks[key] = nil }
+
+                for attempt in 0..<4 {
+                    if Task.isCancelled { return }
+                    guard let conn = self.connections[serverId], conn.isConnected else { return }
+
+                    if let response = try? await conn.readThread(threadId: childThreadId) {
+                        self.applySubagentIdentityMetadata(response, to: key)
+                        if !self.needsSubagentIdentityHydration(for: key) {
+                            return
+                        }
+                    }
+
+                    if attempt < 3 {
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                }
             }
         }
-
-        // Also check top-level agent fields
-        let agentMetadata = extractAgentMetadata(threadObj)
-        if state.agentNickname == nil { state.agentNickname = agentMetadata.nickname }
-        if state.agentRole == nil { state.agentRole = agentMetadata.role }
-        if state.parentThreadId == nil {
-            state.parentThreadId = sanitizedLineageId(
-                extractString(threadObj, keys: ["parentThreadId", "parent_thread_id"])
-            )
-        }
-
-        state.requiresOpenHydration = true
-        threads[key] = state
-        threadTurnCounts[key] = 0
     }
 
+    private func needsSubagentIdentityHydration(for key: ThreadKey) -> Bool {
+        if let thread = threads[key], thread.agentDisplayLabel != nil {
+            return false
+        }
+
+        let entry = mergedAgentDirectoryEntry(
+            serverId: key.serverId,
+            threadId: key.threadId,
+            agentId: key.threadId
+        )
+        return AgentLabelFormatter.format(
+            nickname: entry?.nickname,
+            role: entry?.role,
+            fallbackIdentifier: nil
+        ) == nil
+    }
+
+    private func applySubagentIdentityMetadata(_ response: ThreadResponseWithHydration, to key: ThreadKey) {
+        guard let state = threads[key] else { return }
+
+        if let parentThreadId = sanitizedLineageId(response.parentThreadId) {
+            state.parentThreadId = parentThreadId
+        }
+        if let rootThreadId = sanitizedLineageId(response.rootThreadId) {
+            state.rootThreadId = rootThreadId
+        }
+        if let agentNickname = sanitizedLineageId(response.agentNickname) {
+            state.agentNickname = agentNickname
+        }
+        if let agentRole = sanitizedLineageId(response.agentRole) {
+            state.agentRole = agentRole
+        }
+        if let cwd = response.cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty {
+            state.cwd = cwd
+        }
+        if let model = response.model?.trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty {
+            state.model = model
+        }
+        if let modelProvider = response.modelProvider?.trimmingCharacters(in: .whitespacesAndNewlines), !modelProvider.isEmpty {
+            state.modelProvider = modelProvider
+        }
+
+        upsertAgentDirectory(
+            serverId: key.serverId,
+            threadId: response.threadId,
+            agentId: response.agentId,
+            nickname: state.agentNickname,
+            role: state.agentRole
+        )
+    }
+
+
     private func applyResumedThreadResponse(
-        _ resp: ThreadResumeResponse,
+        _ resp: ThreadResponseWithHydration,
         to state: ThreadState,
         key: ThreadKey,
         serverId: String
     ) async {
-        state.cwd = resp.cwd
-        state.model = resp.model
-        state.modelProvider = resp.modelProvider ?? resp.model
-        state.reasoningEffort = resp.reasoningEffort
-        state.rolloutPath = resp.thread.path ?? state.rolloutPath
-        state.parentThreadId = sanitizedLineageId(resp.thread.parentThreadId)
-        state.rootThreadId = sanitizedLineageId(resp.thread.rootThreadId)
-        state.agentNickname = sanitizedLineageId(resp.thread.agentNickname)
-        state.agentRole = sanitizedLineageId(resp.thread.agentRole)
+        state.cwd = resp.cwd ?? state.cwd
+        state.model = resp.model ?? state.model
+        state.modelProvider = resp.modelProvider ?? resp.model ?? state.modelProvider
+        state.reasoningEffort = resp.reasoningEffort ?? state.reasoningEffort
+        state.rolloutPath = resp.threadPath ?? state.rolloutPath
+        state.parentThreadId = sanitizedLineageId(resp.parentThreadId)
+        state.rootThreadId = sanitizedLineageId(resp.rootThreadId)
+        state.agentNickname = sanitizedLineageId(resp.agentNickname)
+        state.agentRole = sanitizedLineageId(resp.agentRole)
         upsertAgentDirectory(
             serverId: serverId,
             threadId: key.threadId,
-            agentId: resp.thread.agentId,
+            agentId: resp.agentId,
             nickname: state.agentNickname,
             role: state.agentRole
         )
         await Task.yield()
-        let restored = restoredMessages(
-            from: resp.thread.turns,
-            serverId: serverId,
-            defaultAgentNickname: resp.thread.agentNickname,
-            defaultAgentRole: resp.thread.agentRole
-        )
         installRestoredMessages(
-            restored,
+            resp.hydratedItems,
             on: state,
             key: key,
             staged: true,
             preferLocalMessages: true
         )
         state.requiresOpenHydration = false
-        threadTurnCounts[key] = resp.thread.turns.count
+        threadTurnCounts[key] = Int(resp.turnCount)
         liveItemMessageIndices[key] = nil
         liveTurnDiffMessageIndices[key] = nil
         state.status = .ready
         state.updatedAt = Date()
-        _ = RecentDirectoryStore.shared.record(path: resp.cwd, for: serverId)
-        scheduleThreadMetadataRefresh(for: key, cwd: resp.cwd)
-    }
-
-    private func handleThreadTokenUsageUpdatedNotification(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any],
-              let threadId = extractString(params, keys: ["threadId", "thread_id"]),
-              !threadId.isEmpty else { return }
-
-        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key],
-              let tokenUsage = (params["tokenUsage"] as? [String: Any]) ?? (params["token_usage"] as? [String: Any]) else {
-            return
+        if let cwd = resp.cwd, !cwd.isEmpty {
+            _ = RecentDirectoryStore.shared.record(path: cwd, for: serverId)
         }
-
-        if let modelContextWindow = extractInt64(tokenUsage, keys: ["modelContextWindow", "model_context_window"]) {
-            thread.modelContextWindow = modelContextWindow
-        }
-        if let lastUsage = (tokenUsage["last"] as? [String: Any]) ?? (tokenUsage["last_token_usage"] as? [String: Any]),
-           let contextTokens = extractInt64(lastUsage, keys: ["totalTokens", "total_tokens"]) {
-            thread.contextTokensUsed = contextTokens
-        }
+        scheduleThreadMetadataRefresh(for: key, cwd: resp.cwd ?? state.cwd)
     }
 
     private func handleVoiceSessionCoordinatorEvent(_ event: VoiceSessionCoordinator.Event) {
@@ -2848,137 +4200,6 @@ final class ServerManager {
         }
     }
 
-    private func handleRealtimeStarted(serverId: String, data: Data) {
-        guard let notification = try? JSONDecoder().decode(
-            ThreadRealtimeStartedNotification.self,
-            from: extractParams(data)
-        ) else {
-            return
-        }
-        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
-        guard var session = activeVoiceSession, session.threadKey == key else { return }
-
-        appendVoiceSessionDebug(
-            "<- thread/realtime/started threadId=\(notification.threadId) sessionId=\(notification.sessionId ?? "nil")",
-            to: &session
-        )
-        session.sessionId = notification.sessionId
-        session.phase = .listening
-        session.isListening = true
-        activeVoiceSession = session
-        syncVoiceCallActivity()
-
-        do {
-            try voiceSessionCoordinator.start { [weak self] chunk in
-                guard let self else { return }
-                await self.appendRealtimeAudioChunk(chunk, for: key)
-            }
-        } catch {
-            appendVoiceSessionSystemMessage(
-                "Failed to start microphone capture: \(error.localizedDescription)",
-                to: key
-            )
-            failVoiceSession(error.localizedDescription)
-        }
-    }
-
-    private func handleRealtimeItemAdded(serverId: String, data: Data) {
-        guard let notification = try? JSONDecoder().decode(
-            ThreadRealtimeItemAddedNotification.self,
-            from: extractParams(data)
-        ) else {
-            return
-        }
-        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
-        guard var session = activeVoiceSession,
-              session.threadKey == key,
-              let item = notification.item.value as? [String: Any],
-              (extractString(item, keys: ["type"]) ?? "") == "message" else {
-            return
-        }
-
-        let role = extractString(item, keys: ["role"]) ?? "assistant"
-        let content = item["content"] as? [[String: Any]] ?? []
-        let text = content.compactMap { part -> String? in
-            guard (extractString(part, keys: ["type"]) ?? "") == "text" else { return nil }
-            return extractString(part, keys: ["text"])
-        }
-        .joined(separator: " ")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !text.isEmpty else { return }
-        appendVoiceSessionDebug("<- thread/realtime/itemAdded role=\(role) text=\(text)", to: &session)
-        session.transcriptText = text
-        session.transcriptSpeaker = role == "assistant" ? "Codex" : "You"
-        if role == "assistant", !session.isSpeaking {
-            session.phase = .thinking
-        }
-        activeVoiceSession = session
-        syncVoiceCallActivity()
-    }
-
-    private func handleRealtimeOutputAudioDelta(serverId: String, data: Data) {
-        guard let notification = try? JSONDecoder().decode(
-            ThreadRealtimeOutputAudioDeltaNotification.self,
-            from: extractParams(data)
-        ) else {
-            return
-        }
-        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
-        guard activeVoiceSession?.threadKey == key else { return }
-        if let session = activeVoiceSession,
-           session.debugEntries.filter({ $0.line.contains("thread/realtime/outputAudio/delta") }).count < 3 {
-            recordVoiceSessionDebug(
-                "<- thread/realtime/outputAudio/delta bytes=\(notification.audio.data.count) rate=\(notification.audio.sampleRate)",
-                for: key
-            )
-        }
-        voiceSessionCoordinator.enqueueOutputAudio(notification.audio)
-    }
-
-    private func handleRealtimeError(serverId: String, data: Data) {
-        guard let notification = try? JSONDecoder().decode(
-            ThreadRealtimeErrorNotification.self,
-            from: extractParams(data)
-        ) else {
-            return
-        }
-        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
-        guard activeVoiceSession?.threadKey == key else { return }
-        recordVoiceSessionDebug(
-            "<- thread/realtime/error threadId=\(notification.threadId) message=\(notification.message)",
-            for: key
-        )
-        appendVoiceSessionSystemMessage("Realtime voice error: \(notification.message)", to: key)
-        failVoiceSession(notification.message)
-    }
-
-    private func handleRealtimeClosed(serverId: String, data: Data) {
-        guard let notification = try? JSONDecoder().decode(
-            ThreadRealtimeClosedNotification.self,
-            from: extractParams(data)
-        ) else {
-            return
-        }
-        let key = ThreadKey(serverId: serverId, threadId: notification.threadId)
-        guard activeVoiceSession?.threadKey == key else { return }
-
-        recordVoiceSessionDebug(
-            "<- thread/realtime/closed threadId=\(notification.threadId) reason=\(notification.reason ?? "nil")",
-            for: key
-        )
-        let reason = notification.reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if voiceStopRequestedThreadKey == key || reason == "requested" {
-            voiceStopRequestedThreadKey = nil
-            endVoiceSessionImmediately()
-            return
-        }
-        if !reason.isEmpty, reason != "requested" {
-            appendVoiceSessionSystemMessage("Realtime voice closed: \(reason)", to: key)
-        }
-        failVoiceSession(reason.isEmpty ? "Voice session closed" : reason)
-    }
-
     private func appendVoiceSessionSystemMessage(_ message: String, to key: ThreadKey) {
         guard let thread = threads[key] else { return }
         thread.items.append(
@@ -3009,12 +4230,14 @@ final class ServerManager {
         session.isSpeaking = false
         session.inputLevel = 0
         session.outputLevel = 0
+        session.transcriptLiveMessageID = nil
         appendVoiceSessionDebug("phase error \(message)", to: &session)
         activeVoiceSession = session
         syncVoiceCallActivity()
     }
 
     private func endVoiceSessionImmediately() {
+        let activeKey = activeVoiceSession?.threadKey
         voiceInputDecayToken = nil
         voiceOutputDecayToken = nil
         voiceStopRequestedThreadKey = nil
@@ -3026,6 +4249,10 @@ final class ServerManager {
             activeThreadKey = nil
         }
         voicePreviousActiveThreadKey = nil
+        if let activeKey {
+            pendingRealtimeMessageIDs.removeValue(forKey: activeKey)
+            lastRealtimeTranscriptDelta.removeValue(forKey: activeKey)
+        }
         activeVoiceSession = nil
         endVoiceCallActivity()
     }
@@ -3090,6 +4317,15 @@ final class ServerManager {
         return string
     }
 
+    private func debugJSONString(_ value: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let string = String(data: data, encoding: .utf8) else {
+            return "<encode-failed>"
+        }
+        return string
+    }
+
     private func appendVoiceSessionDebug(_ line: String, to session: inout VoiceSessionState) {
         session.debugEntries.append(VoiceSessionDebugEntry(line: line))
         if session.debugEntries.count > 40 {
@@ -3107,154 +4343,6 @@ final class ServerManager {
             return "apiKey"
         case .chatgpt(let email):
             return "chatgpt(\(email))"
-        }
-    }
-
-    private func extractParams(_ data: Data) -> Data {
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let params = obj["params"] {
-            return (try? JSONSerialization.data(withJSONObject: params)) ?? data
-        }
-        return data
-    }
-
-    private func handleItemNotification(serverId: String, method: String, data: Data) async {
-        // Format: item/started or item/completed → params.item has the ThreadItem with "type"
-        //         item/agentMessage/delta handled separately in handleNotification.
-        serversUsingItemNotifications.insert(serverId)
-        struct ItemNotification: Decodable { let params: AnyCodable? }
-        guard let raw = await decodeJSONOnBackground(from: data, using: { data in
-            try? JSONDecoder().decode(ItemNotification.self, from: data)
-        }),
-              let paramsDict = raw.params?.value as? [String: Any] else { return }
-
-        let threadId = extractString(paramsDict, keys: ["threadId", "thread_id"])
-        if let threadId { ensureThreadExistsByKey(serverId: serverId, threadId: threadId) }
-        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key] else { return }
-        let turnId = extractString(paramsDict, keys: ["turnId", "turn_id"])
-
-        switch method {
-        case "item/started", "item/completed":
-            guard let itemDict = paramsDict["item"] as? [String: Any] else { return }
-            let itemType = itemDict["type"] as? String ?? "unknown"
-            // agentMessage is streamed via delta; userMessage is added locally in send()
-            if itemType == "agentMessage" || itemType == "userMessage" {
-                return
-            }
-            // Handle dynamicToolCall for show_widget — create a placeholder widget message
-            if let itemType = itemDict["type"] as? String,
-               itemType == "dynamicToolCall",
-               let toolName = extractString(itemDict, keys: ["tool"]) {
-                if toolName == GenerativeUITools.showWidgetToolName {
-                    let itemId = extractString(itemDict, keys: ["id"]) ?? UUID().uuidString
-
-                    if method == "item/completed" {
-                        // On completion, preserve the existing widget message (already populated
-                        // by handleShowWidgetToolCall). Just finalize and clear live tracking.
-                        if let index = liveItemMessageIndices[key]?[itemId],
-                           thread.items.indices.contains(index),
-                           case .widget(var data) = thread.items[index].content {
-                            data.widgetState.isFinalized = true
-                            data.status = "completed"
-                            thread.items[index].content = .widget(data)
-                        }
-                        liveItemMessageIndices[key]?[itemId] = nil
-                        thread.updatedAt = Date()
-                        return
-                    }
-
-                    // item/started — create a placeholder widget with spinner
-                    let args = itemDict["arguments"] as? [String: Any] ?? [:]
-                    let widget = WidgetState.fromArguments(args, callId: itemId)
-                    let msg = ConversationItem(
-                        id: itemId,
-                        content: .widget(ConversationWidgetData(widgetState: widget, status: "inProgress")),
-                        timestamp: Date()
-                    )
-                    upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-                    thread.updatedAt = Date()
-                    return
-                }
-                // visualize_read_me is invisible — skip it
-                if toolName == GenerativeUITools.readMeToolName { return }
-            }
-            if method == "item/started", let itemType = itemDict["type"] as? String {
-                let toolName: String
-                if itemType == "commandExecution" || itemType == "command_execution",
-                   let cmd = commandString(from: itemDict) {
-                    toolName = cmd
-                } else {
-                    toolName = extractString(itemDict, keys: ["name", "toolName", "tool_name"]) ?? itemType
-                }
-                updateLiveActivity(key: key, phase: .toolCall, toolName: toolName)
-            }
-            guard let itemData = try? JSONSerialization.data(withJSONObject: itemDict),
-                  let item = await decodeJSONOnBackground(from: itemData, using: { data in
-                      try? JSONDecoder().decode(ResumedThreadItem.self, from: data)
-                  }),
-                  let msg = conversationItem(
-                    from: item,
-                    itemId: extractString(itemDict, keys: ["id"]) ?? UUID().uuidString,
-                    sourceTurnId: turnId,
-                    sourceTurnIndex: nil,
-                    serverId: serverId,
-                    defaultAgentNickname: thread.agentNickname,
-                    defaultAgentRole: thread.agentRole,
-                    isInProgressEvent: method == "item/started"
-                  ) else { return }
-            let itemId = extractString(itemDict, keys: ["id"])
-            if method == "item/started", let itemId {
-                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else if method == "item/completed", let itemId {
-                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "item/commandExecution/outputDelta":
-            guard let delta = extractString(paramsDict, keys: ["delta"]), !delta.isEmpty else { return }
-            if let itemId = extractString(paramsDict, keys: ["itemId", "item_id"]),
-               appendCommandOutputDelta(delta, itemId: itemId, key: key, thread: thread) {
-                thread.updatedAt = Date()
-                return
-            }
-            thread.items.append(
-                ConversationItem(
-                    id: UUID().uuidString,
-                    content: .note(ConversationNoteData(title: "Command Output", body: delta)),
-                    timestamp: Date()
-                )
-            )
-            thread.updatedAt = Date()
-
-        case "item/plan/delta":
-            guard let delta = extractString(paramsDict, keys: ["delta"]), !delta.isEmpty else { return }
-            if let itemId = extractString(paramsDict, keys: ["itemId", "item_id", "id"]),
-               appendProposedPlanDelta(delta, itemId: itemId, turnId: turnId, key: key, thread: thread) {
-                thread.updatedAt = Date()
-                return
-            }
-
-        case "item/mcpToolCall/progress":
-            guard let progress = extractString(paramsDict, keys: ["message"]), !progress.isEmpty else { return }
-            if let itemId = extractString(paramsDict, keys: ["itemId", "item_id"]),
-               appendMcpProgress(progress, itemId: itemId, key: key, thread: thread) {
-                thread.updatedAt = Date()
-                return
-            }
-            thread.items.append(
-                ConversationItem(
-                    id: UUID().uuidString,
-                    content: .note(ConversationNoteData(title: "MCP Tool Progress", body: progress)),
-                    timestamp: Date()
-                )
-            )
-            thread.updatedAt = Date()
-
-        default:
-            break
         }
     }
 
@@ -3307,6 +4395,23 @@ final class ServerManager {
         return nil
     }
 
+    private func extractRealtimeAudioChunk(params: [String: Any]) -> ThreadRealtimeAudioChunk? {
+        guard let audio = params["audio"] as? [String: Any],
+              let data = extractString(audio, keys: ["data"]) else {
+            return nil
+        }
+        let sampleRate = UInt32(extractInt64(audio, keys: ["sampleRate", "sample_rate"]) ?? 24_000)
+        let numChannels = UInt32(extractInt64(audio, keys: ["numChannels", "num_channels"]) ?? 1)
+        let samplesPerChannel = extractInt64(audio, keys: ["samplesPerChannel", "samples_per_channel"])
+            .map(UInt32.init)
+        return ThreadRealtimeAudioChunk(
+            data: data,
+            sampleRate: sampleRate,
+            numChannels: numChannels,
+            samplesPerChannel: samplesPerChannel
+        )
+    }
+
     private func extractInt64Value(_ value: Any?) -> Int64? {
         switch value {
         case let value as Int64:
@@ -3346,154 +4451,6 @@ final class ServerManager {
             }
         }
         return []
-    }
-
-    private func ingestCodexEventAgentMetadata(serverId: String, method: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any] else { return }
-
-        let eventPayload: [String: Any]
-        let eventType: String
-        if method == "codex/event" {
-            eventPayload = (params["msg"] as? [String: Any]) ?? params
-            eventType = extractString(eventPayload, keys: ["type"]) ?? "codex/event"
-        } else {
-            eventPayload = (params["msg"] as? [String: Any]) ?? params
-            eventType = String(method.dropFirst("codex/event/".count))
-        }
-
-        func upsertIdentity(
-            threadId: String?,
-            agentId: String?,
-            nickname: String?,
-            role: String?,
-            source: String
-        ) {
-            let normalizedThreadId = sanitizedLineageId(threadId)
-            let normalizedAgentId = sanitizedLineageId(agentId)
-            let normalizedNickname = sanitizedLineageId(nickname)
-            let normalizedRole = sanitizedLineageId(role)
-            guard normalizedThreadId != nil || normalizedAgentId != nil || normalizedNickname != nil || normalizedRole != nil else {
-                return
-            }
-            upsertAgentDirectory(
-                serverId: serverId,
-                threadId: normalizedThreadId,
-                agentId: normalizedAgentId,
-                nickname: normalizedNickname,
-                role: normalizedRole
-            )
-            debugAgentDirectoryLog(
-                "codex-event metadata server=\(serverId) event=\(eventType) source=\(source) threadId=\(normalizedThreadId ?? "<nil>") agentId=\(normalizedAgentId ?? "<nil>") nickname=\(normalizedNickname ?? "<nil>") role=\(normalizedRole ?? "<nil>")"
-            )
-        }
-
-        var senderMetadata = extractAgentMetadata(eventPayload)
-        senderMetadata.threadId = senderMetadata.threadId
-            ?? sanitizedLineageId(
-                extractString(
-                    eventPayload,
-                    keys: ["sender_thread_id", "senderThreadId", "thread_id", "threadId", "conversation_id", "conversationId"]
-                )
-            )
-            ?? sanitizedLineageId(
-                extractString(
-                    params,
-                    keys: ["thread_id", "threadId", "conversation_id", "conversationId"]
-                )
-            )
-        senderMetadata.agentId = senderMetadata.agentId
-            ?? sanitizedLineageId(extractString(eventPayload, keys: ["sender_agent_id", "senderAgentId"]))
-        upsertIdentity(
-            threadId: senderMetadata.threadId,
-            agentId: senderMetadata.agentId,
-            nickname: senderMetadata.nickname,
-            role: senderMetadata.role,
-            source: "sender"
-        )
-
-        upsertIdentity(
-            threadId: extractString(eventPayload, keys: ["new_thread_id", "newThreadId"]),
-            agentId: extractString(eventPayload, keys: ["new_agent_id", "newAgentId"]),
-            nickname: extractString(eventPayload, keys: ["new_agent_nickname", "newAgentNickname"]),
-            role: extractString(eventPayload, keys: ["new_agent_role", "newAgentRole"]),
-            source: "spawn-end"
-        )
-
-        upsertIdentity(
-            threadId: extractString(eventPayload, keys: ["receiver_thread_id", "receiverThreadId"]),
-            agentId: extractString(eventPayload, keys: ["receiver_agent_id", "receiverAgentId"]),
-            nickname: extractString(eventPayload, keys: ["receiver_agent_nickname", "receiverAgentNickname"]),
-            role: extractString(eventPayload, keys: ["receiver_agent_role", "receiverAgentRole"]),
-            source: "receiver-single"
-        )
-
-        let receiverThreadIds = extractStringArray(
-            eventPayload,
-            keys: ["receiver_thread_ids", "receiverThreadIds"]
-        )
-        let receiverAgentsAny = (eventPayload["receiver_agents"] as? [Any]) ?? (eventPayload["receiverAgents"] as? [Any]) ?? []
-
-        for (index, threadId) in receiverThreadIds.enumerated() {
-            let alignedAgent = index < receiverAgentsAny.count ? (receiverAgentsAny[index] as? [String: Any]) : nil
-            let alignedIdentity = alignedAgent.map { extractAgentMetadata($0) }
-            upsertIdentity(
-                threadId: threadId,
-                agentId: alignedIdentity?.agentId ?? alignedAgent.flatMap { extractString($0, keys: ["agent_id", "agentId", "id"]) },
-                nickname: alignedIdentity?.nickname ?? alignedAgent.flatMap { extractString($0, keys: ["agent_nickname", "agentNickname", "nickname", "name"]) },
-                role: alignedIdentity?.role ?? alignedAgent.flatMap { extractString($0, keys: ["agent_role", "agentRole", "agent_type", "agentType", "role", "type"]) },
-                source: "receiver-thread-ids[\(index)]"
-            )
-        }
-
-        for (index, rawReceiver) in receiverAgentsAny.enumerated() {
-            if let receiver = rawReceiver as? [String: Any] {
-                let metadata = extractAgentMetadata(receiver)
-                let threadId = metadata.threadId
-                    ?? extractString(receiver, keys: ["thread_id", "threadId", "receiver_thread_id", "receiverThreadId"])
-                upsertIdentity(
-                    threadId: threadId,
-                    agentId: metadata.agentId,
-                    nickname: metadata.nickname ?? extractString(receiver, keys: ["receiver_agent_nickname", "receiverAgentNickname"]),
-                    role: metadata.role ?? extractString(receiver, keys: ["receiver_agent_role", "receiverAgentRole"]),
-                    source: "receiver-agents[\(index)]"
-                )
-            } else {
-                upsertIdentity(
-                    threadId: extractStringValue(rawReceiver),
-                    agentId: nil,
-                    nickname: nil,
-                    role: nil,
-                    source: "receiver-agents[\(index)]-scalar"
-                )
-            }
-        }
-
-        if let statuses = eventPayload["statuses"] as? [String: Any] {
-            for (threadId, rawStatus) in statuses {
-                let statusDict = rawStatus as? [String: Any]
-                upsertIdentity(
-                    threadId: threadId,
-                    agentId: statusDict.flatMap { extractString($0, keys: ["agent_id", "agentId"]) },
-                    nickname: statusDict.flatMap { extractString($0, keys: ["agent_nickname", "agentNickname", "receiver_agent_nickname", "receiverAgentNickname"]) },
-                    role: statusDict.flatMap { extractString($0, keys: ["agent_role", "agentRole", "receiver_agent_role", "receiverAgentRole", "agent_type", "agentType"]) },
-                    source: "statuses"
-                )
-            }
-        }
-
-        if let statusEntries = eventPayload["agent_statuses"] as? [Any] {
-            for (index, rawEntry) in statusEntries.enumerated() {
-                guard let entry = rawEntry as? [String: Any] else { continue }
-                upsertIdentity(
-                    threadId: extractString(entry, keys: ["thread_id", "threadId", "receiver_thread_id", "receiverThreadId"]),
-                    agentId: extractString(entry, keys: ["agent_id", "agentId"]),
-                    nickname: extractString(entry, keys: ["agent_nickname", "agentNickname", "receiver_agent_nickname", "receiverAgentNickname"]),
-                    role: extractString(entry, keys: ["agent_role", "agentRole", "receiver_agent_role", "receiverAgentRole", "agent_type", "agentType"]),
-                    source: "agent-statuses[\(index)]"
-                )
-            }
-        }
     }
 
     private struct AgentIdentity {
@@ -3821,22 +4778,6 @@ final class ServerManager {
         return next
     }
 
-    private func handleTurnPlanUpdatedNotification(serverId: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any],
-              let turnId = extractString(params, keys: ["turnId", "turn_id"]),
-              !turnId.isEmpty else {
-            return
-        }
-
-        let threadId = extractString(params, keys: ["threadId", "thread_id"])
-        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key] else { return }
-
-        upsertTurnTodoList(turnId: turnId, steps: planSteps(from: params["plan"]), thread: thread)
-        thread.updatedAt = Date()
-    }
-
     private func proposedPlanItemIndex(for turnId: String, in thread: ThreadState) -> Int? {
         for index in thread.items.indices.reversed() {
             guard case .proposedPlan = thread.items[index].content else { continue }
@@ -3914,54 +4855,6 @@ final class ServerManager {
         }
     }
 
-    private func todoListSteps(from entries: [ResumedTodoListEntry]) -> [ConversationPlanStep] {
-        entries.compactMap { entry in
-            let step = (entry.step ?? entry.text)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !step.isEmpty else { return nil }
-            if let completed = entry.completed {
-                return ConversationPlanStep(step: step, status: completed ? .completed : .pending)
-            }
-            return ConversationPlanStep(
-                step: step,
-                status: planStepStatus(from: entry.status ?? ConversationPlanStepStatus.pending.rawValue)
-            )
-        }
-    }
-
-    private func handleTurnDiffNotification(serverId: String, data: Data) {
-        struct TurnDiffParams: Decodable {
-            let threadId: String?
-            let turnId: String?
-            let diff: String?
-        }
-        struct TurnDiffNotification: Decodable { let params: TurnDiffParams }
-        guard let notif = try? JSONDecoder().decode(TurnDiffNotification.self, from: data),
-              let diff = notif.params.diff?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !diff.isEmpty else { return }
-
-        let key = resolveThreadKey(serverId: serverId, threadId: notif.params.threadId)
-
-        // Count changed files for LA
-        let diffHeaders = diff.components(separatedBy: "diff --git ").count - 1
-        let fileChangeCount = max(diffHeaders, 1)
-        liveActivityFileChangeCounts[key] = fileChangeCount
-
-        guard let thread = threads[key] else { return }
-        let msg = ConversationItem(
-            id: notif.params.turnId ?? UUID().uuidString,
-            content: .turnDiff(ConversationTurnDiffData(diff: diff)),
-            sourceTurnId: notif.params.turnId,
-            sourceTurnIndex: nil,
-            timestamp: Date()
-        )
-
-        if let turnId = notif.params.turnId, !turnId.isEmpty {
-            upsertLiveTurnDiffMessage(msg, turnId: turnId, key: key, thread: thread)
-        } else {
-            thread.items.append(msg)
-        }
-        thread.updatedAt = Date()
-    }
 
     private func upsertLiveTurnDiffMessage(_ message: ConversationItem, turnId: String, key: ThreadKey, thread: ThreadState) {
         if let index = liveTurnDiffMessageIndices[key]?[turnId],
@@ -3971,323 +4864,6 @@ final class ServerManager {
             let index = thread.items.count
             thread.items.append(message)
             liveTurnDiffMessageIndices[key, default: [:]][turnId] = index
-        }
-    }
-
-    private func handleLegacyCodexEventNotification(serverId: String, method: String, data: Data) {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let params = root["params"] as? [String: Any] else { return }
-
-        let eventPayload: [String: Any]
-        let eventType: String
-
-        if method == "codex/event" {
-            guard let msg = params["msg"] as? [String: Any] else { return }
-            eventPayload = msg
-            eventType = extractString(msg, keys: ["type"]) ?? ""
-        } else {
-            eventPayload = (params["msg"] as? [String: Any]) ?? params
-            eventType = String(method.dropFirst("codex/event/".count))
-        }
-
-        guard !eventType.isEmpty else { return }
-
-        let threadId = extractString(params, keys: ["threadId", "thread_id", "conversationId", "conversation_id"])
-            ?? extractString(eventPayload, keys: ["threadId", "thread_id", "conversationId", "conversation_id"])
-        let key = resolveThreadKey(serverId: serverId, threadId: threadId)
-        guard let thread = threads[key] else { return }
-
-        switch eventType {
-        case "realtime_conversation_realtime":
-            guard var session = activeVoiceSession, session.threadKey == key else { return }
-            let payload = (eventPayload["payload"] as? [String: Any]) ?? [:]
-
-            if let input = payload["InputTranscriptDelta"] as? [String: Any],
-               let delta = extractString(input, keys: ["delta"]),
-               !delta.isEmpty {
-                applyRealtimeTranscriptDelta(
-                    delta,
-                    speaker: "You",
-                    phase: .listening,
-                    key: key,
-                    session: &session
-                )
-            } else if let output = payload["OutputTranscriptDelta"] as? [String: Any],
-                      let delta = extractString(output, keys: ["delta"]),
-                      !delta.isEmpty {
-                applyRealtimeTranscriptDelta(
-                    delta,
-                    speaker: "Codex",
-                    phase: .speaking,
-                    key: key,
-                    session: &session
-                )
-            }
-
-        case "exec_command_begin":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let command = extractCommandText(eventPayload)
-            let cwd = extractString(eventPayload, keys: ["cwd"]) ?? ""
-
-            updateLiveActivity(key: key, phase: .toolCall, toolName: command.isEmpty ? "shell" : command)
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .commandExecution(
-                    ConversationCommandExecutionData(
-                        command: command,
-                        cwd: cwd,
-                        status: "inProgress",
-                        output: nil,
-                        exitCode: nil,
-                        durationMs: nil,
-                        processId: nil,
-                        actions: []
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "exec_command_output_delta":
-            guard let delta = extractString(eventPayload, keys: ["chunk"]), !delta.isEmpty else { return }
-            if let itemId = extractString(eventPayload, keys: ["call_id", "callId"]),
-               appendCommandOutputDelta(delta, itemId: itemId, key: key, thread: thread) {
-                thread.updatedAt = Date()
-                return
-            }
-            thread.items.append(
-                ConversationItem(
-                    id: UUID().uuidString,
-                    content: .note(ConversationNoteData(title: "Command Output", body: delta)),
-                    timestamp: Date()
-                )
-            )
-            thread.updatedAt = Date()
-
-        case "exec_command_end":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let command = extractCommandText(eventPayload)
-            let cwd = extractString(eventPayload, keys: ["cwd"]) ?? ""
-            let status = extractString(eventPayload, keys: ["status"]) ?? "completed"
-            let exitCode = extractString(eventPayload, keys: ["exit_code", "exitCode"])
-            let durationMs = durationMillis(from: eventPayload["duration"])
-
-            let output = extractCommandOutput(eventPayload)
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .commandExecution(
-                    ConversationCommandExecutionData(
-                        command: command,
-                        cwd: cwd,
-                        status: status,
-                        output: output.isEmpty ? nil : output,
-                        exitCode: exitCode.flatMap(Int.init),
-                        durationMs: durationMs,
-                        processId: nil,
-                        actions: []
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "mcp_tool_call_begin":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let invocation = eventPayload["invocation"] as? [String: Any]
-            let server = invocation.flatMap { extractString($0, keys: ["server"]) } ?? ""
-            let tool = invocation.flatMap { extractString($0, keys: ["tool"]) } ?? ""
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .mcpToolCall(
-                    ConversationMcpToolCallData(
-                        server: server,
-                        tool: tool,
-                        status: "inProgress",
-                        durationMs: nil,
-                        argumentsJSON: invocation.flatMap { $0["arguments"] }.flatMap(prettyJSON),
-                        contentSummary: nil,
-                        structuredContentJSON: nil,
-                        rawOutputJSON: nil,
-                        errorMessage: nil,
-                        progressMessages: []
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "mcp_tool_call_end":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let invocation = eventPayload["invocation"] as? [String: Any]
-            let server = invocation.flatMap { extractString($0, keys: ["server"]) } ?? ""
-            let tool = invocation.flatMap { extractString($0, keys: ["tool"]) } ?? ""
-            let durationMs = durationMillis(from: eventPayload["duration"])
-            let result = eventPayload["result"]
-
-            var status = "completed"
-            if let resultDict = result as? [String: Any], resultDict["Err"] != nil {
-                status = "failed"
-            }
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .mcpToolCall(
-                    ConversationMcpToolCallData(
-                        server: server,
-                        tool: tool,
-                        status: status,
-                        durationMs: durationMs,
-                        argumentsJSON: invocation.flatMap { $0["arguments"] }.flatMap(prettyJSON),
-                        contentSummary: result.map(stringifyValue),
-                        structuredContentJSON: nil,
-                        rawOutputJSON: result.flatMap(prettyJSON),
-                        errorMessage: status == "failed" ? stringifyValue(result ?? "") : nil,
-                        progressMessages: []
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "web_search_begin":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId", "item_id", "itemId"])
-            let query = extractString(eventPayload, keys: ["query"]) ?? ""
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .webSearch(
-                    ConversationWebSearchData(
-                        query: query,
-                        actionJSON: nil,
-                        isInProgress: true
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "web_search_end":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId", "item_id", "itemId"])
-            let query = extractString(eventPayload, keys: ["query"]) ?? ""
-            let status = extractString(eventPayload, keys: ["status"]) ?? "completed"
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .webSearch(
-                    ConversationWebSearchData(
-                        query: query,
-                        actionJSON: eventPayload["action"].flatMap(prettyJSON),
-                        isInProgress: status.lowercased().contains("progress")
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "patch_apply_begin":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let changeSummary = legacyPatchChangeBody(from: eventPayload["changes"])
-            let autoApproved = (eventPayload["auto_approved"] as? Bool) == true
-
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .fileChange(
-                    ConversationFileChangeData(
-                        status: "inProgress",
-                        changes: legacyPatchChanges(from: eventPayload["changes"]),
-                        outputDelta: autoApproved ? "Approval: auto" : "Approval: requested"
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                upsertLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "patch_apply_end":
-            let itemId = extractString(eventPayload, keys: ["call_id", "callId"])
-            let status = extractString(eventPayload, keys: ["status"]) ?? ((eventPayload["success"] as? Bool) == true ? "completed" : "failed")
-            let stdout = extractString(eventPayload, keys: ["stdout"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let stderr = extractString(eventPayload, keys: ["stderr"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let changeSummary = legacyPatchChangeBody(from: eventPayload["changes"])
-
-            let outputDelta = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n\n")
-            let msg = ConversationItem(
-                id: itemId ?? UUID().uuidString,
-                content: .fileChange(
-                    ConversationFileChangeData(
-                        status: status,
-                        changes: legacyPatchChanges(from: eventPayload["changes"]),
-                        outputDelta: outputDelta.isEmpty ? nil : outputDelta
-                    )
-                ),
-                timestamp: Date()
-            )
-            if let itemId {
-                completeLiveItemMessage(msg, itemId: itemId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        case "turn_diff":
-            let turnId = extractString(params, keys: ["id", "turnId", "turn_id"])
-                ?? extractString(eventPayload, keys: ["id", "turnId", "turn_id"])
-            guard let diff = extractString(eventPayload, keys: ["unified_diff"])?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !diff.isEmpty else { return }
-            let msg = ConversationItem(
-                id: turnId ?? UUID().uuidString,
-                content: .turnDiff(ConversationTurnDiffData(diff: diff)),
-                sourceTurnId: turnId,
-                sourceTurnIndex: nil,
-                timestamp: Date()
-            )
-
-            if let turnId, !turnId.isEmpty {
-                upsertLiveTurnDiffMessage(msg, turnId: turnId, key: key, thread: thread)
-            } else {
-                thread.items.append(msg)
-            }
-            thread.updatedAt = Date()
-
-        default:
-            break
         }
     }
 
@@ -4350,47 +4926,6 @@ final class ServerManager {
         }
     }
 
-    private func decodeJSONOnBackground<T>(
-        from data: Data,
-        using decode: @escaping @Sendable (Data) -> T?
-    ) async -> T? {
-        await withCheckedContinuation { continuation in
-            notificationDecodeQueue.async {
-                continuation.resume(returning: decode(data))
-            }
-        }
-    }
-
-    private func extractThreadIdentifiers(from data: Data) async -> (threadId: String?, turnId: String?) {
-        struct Wrapper: Decodable {
-            struct Params: Decodable {
-                struct Turn: Decodable { let id: String? }
-
-                let threadId: String?
-                let conversationId: String?
-                let turn: Turn?
-                let turnId: String?
-            }
-
-            let params: Params?
-        }
-
-        guard let params = await decodeJSONOnBackground(from: data, using: { data in
-            try? JSONDecoder().decode(Wrapper.self, from: data)
-        })?.params else {
-            return (nil, nil)
-        }
-
-        return (
-            params.threadId ?? params.conversationId,
-            params.turn?.id ?? params.turnId
-        )
-    }
-
-    private func extractThreadId(from data: Data) async -> String? {
-        let identifiers = await extractThreadIdentifiers(from: data)
-        return identifiers.threadId
-    }
 
     func syncActiveThreadFromServer() async {
         guard let key = activeThreadKey else { return }
@@ -4431,7 +4966,7 @@ final class ServerManager {
             }
             return
         }
-        if force { NSLog("[%@ sync] resumeThread OK for %@, turns=%d", ts, key.threadId, response.thread.turns.count) }
+        if force { NSLog("[%@ sync] resumeThread OK for %@, turns=%d", ts, key.threadId, Int(response.turnCount)) }
 
         // resumeThread re-subscribes to events. If a turn is still active,
         // the server will keep sending notifications. Don't reset status.
@@ -4439,23 +4974,18 @@ final class ServerManager {
             NSLog("[%@ sync] after resume: wasActive=%d hasTurnActive=%d", ts, wasActive ? 1 : 0, thread.hasTurnActive ? 1 : 0)
         }
 
-        var restored = restoredMessages(
-            from: response.thread.turns,
-            serverId: key.serverId,
-            defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
-            defaultAgentRole: response.thread.agentRole ?? thread.agentRole
-        )
+        let restored = response.hydratedItems
 
-        thread.cwd = response.cwd
-        thread.model = response.model
-        thread.modelProvider = response.modelProvider ?? response.model
+        thread.cwd = response.cwd ?? thread.cwd
+        thread.model = response.model ?? thread.model
+        thread.modelProvider = response.modelProvider ?? response.model ?? thread.modelProvider
         thread.reasoningEffort = response.reasoningEffort ?? thread.reasoningEffort
-        thread.rolloutPath = response.thread.path ?? thread.rolloutPath
-        thread.parentThreadId = sanitizedLineageId(response.thread.parentThreadId) ?? thread.parentThreadId
-        thread.rootThreadId = sanitizedLineageId(response.thread.rootThreadId) ?? thread.rootThreadId
-        thread.agentNickname = sanitizedLineageId(response.thread.agentNickname) ?? thread.agentNickname
-        thread.agentRole = sanitizedLineageId(response.thread.agentRole) ?? thread.agentRole
-        scheduleThreadMetadataRefresh(for: key, cwd: response.cwd)
+        thread.rolloutPath = response.threadPath ?? thread.rolloutPath
+        thread.parentThreadId = sanitizedLineageId(response.parentThreadId) ?? thread.parentThreadId
+        thread.rootThreadId = sanitizedLineageId(response.rootThreadId) ?? thread.rootThreadId
+        thread.agentNickname = sanitizedLineageId(response.agentNickname) ?? thread.agentNickname
+        thread.agentRole = sanitizedLineageId(response.agentRole) ?? thread.agentRole
+        scheduleThreadMetadataRefresh(for: key, cwd: response.cwd ?? thread.cwd)
 
         if !messagesEquivalent(thread.items, restored),
            !shouldPreferLocalMessages(current: thread.items, restored: restored) {
@@ -4464,13 +4994,13 @@ final class ServerManager {
                 preservingIdentityFrom: thread.items
             )
             thread.items = prepared
-            threadTurnCounts[key] = response.thread.turns.count
+            threadTurnCounts[key] = Int(response.turnCount)
         }
 
         upsertAgentDirectory(
             serverId: key.serverId,
-            threadId: response.thread.id,
-            agentId: response.thread.agentId,
+            threadId: response.threadId,
+            agentId: response.agentId,
             nickname: thread.agentNickname,
             role: thread.agentRole
         )
@@ -4485,8 +5015,7 @@ final class ServerManager {
               let conn = connections[key.serverId],
               conn.isConnected,
               let response = try? await conn.readConfig(cwd: normalizedCwd),
-              let config = response.config.value as? [String: Any],
-              let modelContextWindow = extractInt64(config, keys: ["model_context_window", "modelContextWindow"]),
+              let modelContextWindow = response.config.modelContextWindow,
               let thread = threads[key] else {
             return
         }
@@ -4748,16 +5277,18 @@ final class ServerManager {
 
         for key in activeTurnKeys {
             if liveActivities[key] == nil, let thread = threads[key] {
-                startLiveActivity(key: key, model: thread.model, cwd: thread.cwd, prompt: thread.preview ?? "")
+                startLiveActivity(key: key, model: thread.model, cwd: thread.cwd, prompt: thread.preview)
             }
         }
 
         registerPushProxy()
 
-        var bgID = UIBackgroundTaskIdentifier.invalid
-        bgID = UIApplication.shared.beginBackgroundTask {
+        let bgID = UIApplication.shared.beginBackgroundTask { [weak self] in
             NSLog("[bg] background task expiring")
-            UIApplication.shared.endBackgroundTask(bgID)
+            guard let self else { return }
+            let expiredID = self.backgroundTaskID
+            self.backgroundTaskID = .invalid
+            UIApplication.shared.endBackgroundTask(expiredID)
         }
         backgroundTaskID = bgID
     }
@@ -4809,6 +5340,10 @@ final class ServerManager {
                     NSLog("[%@ bg] skipping reconnect for healthy %@", ts, serverId)
                     continue
                 }
+                if conn.connectionHealth == .connecting {
+                    NSLog("[%@ bg] skipping reconnect for connecting %@", ts, serverId)
+                    continue
+                }
                 conn.connectionHealth = .connecting
                 NSLog("[%@ bg] reconnecting server %@", ts, serverId)
                 conn.disconnect()
@@ -4823,12 +5358,7 @@ final class ServerManager {
                 guard let conn = connections[key.serverId], conn.isConnected,
                       let thread = threads[key] else { continue }
                 if let response = try? await conn.readThread(threadId: key.threadId) {
-                    let restored = restoredMessages(
-                        from: response.thread.turns,
-                        serverId: key.serverId,
-                        defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
-                        defaultAgentRole: response.thread.agentRole ?? thread.agentRole
-                    )
+                    let restored = response.hydratedItems
                     installRestoredMessages(
                         restored,
                         on: thread,
@@ -4836,16 +5366,15 @@ final class ServerManager {
                         staged: false,
                         preferLocalMessages: true
                     )
-                    if let model = response.model { thread.model = model }
-                    if let cwd = response.cwd { thread.cwd = cwd }
-                    let turnDone = response.thread.turns.last?.status == "completed"
-                        || response.thread.turns.last?.status == "failed"
-                        || response.thread.turns.last?.status == "interrupted"
+                    if let cwd = response.cwd, !cwd.isEmpty { thread.cwd = cwd }
+                    let turnDone = response.lastTurnStatus == "completed"
+                        || response.lastTurnStatus == "failed"
+                        || response.lastTurnStatus == "interrupted"
                     if turnDone {
                         thread.status = .ready
                         thread.activeTurnId = nil
                     }
-                    NSLog("[%@ bg] read %@ msgs=%d lastStatus=%@", ts, key.threadId, restored.count, response.thread.turns.last?.status ?? "nil")
+                    NSLog("[%@ bg] read %@ msgs=%d lastStatus=%@", ts, key.threadId, restored.count, response.lastTurnStatus ?? "nil")
                 }
             }
 
@@ -4879,6 +5408,10 @@ final class ServerManager {
                 NSLog("[%@ push-wake] no connection object for %@", ts, serverId)
                 continue
             }
+            if conn.connectionHealth == .connecting {
+                NSLog("[%@ push-wake] server %@ already connecting, skipping reconnect", ts, serverId)
+                continue
+            }
             NSLog("[%@ push-wake] server %@ isConnected=%d, reconnecting", ts, serverId, conn.isConnected ? 1 : 0)
             conn.disconnect()
             await conn.connect()
@@ -4890,12 +5423,7 @@ final class ServerManager {
                   let thread = threads[key] else { continue }
             do {
                 let response = try await conn.readThread(threadId: key.threadId)
-                let restored = restoredMessages(
-                    from: response.thread.turns,
-                    serverId: key.serverId,
-                    defaultAgentNickname: response.thread.agentNickname ?? thread.agentNickname,
-                    defaultAgentRole: response.thread.agentRole ?? thread.agentRole
-                )
+                let restored = response.hydratedItems
                 installRestoredMessages(
                     restored,
                     on: thread,
@@ -4903,11 +5431,9 @@ final class ServerManager {
                     staged: false,
                     preferLocalMessages: true
                 )
-                if let model = response.model { thread.model = model }
-                if let cwd = response.cwd { thread.cwd = cwd }
-                let lastTurn = response.thread.turns.last
-                let lastTurnStatus = lastTurn?.status
-                let turnCount = response.thread.turns.count
+                if let cwd = response.cwd, !cwd.isEmpty { thread.cwd = cwd }
+                let lastTurnStatus = response.lastTurnStatus
+                let turnCount = Int(response.turnCount)
                 NSLog("[%@ push-wake] read %@ turns=%d lastStatus=%@ msgs=%d", ts, key.threadId, turnCount, lastTurnStatus ?? "nil", restored.count)
                 let turnDone = lastTurnStatus == "completed" || lastTurnStatus == "failed" || lastTurnStatus == "interrupted"
                 if turnDone {
@@ -4935,7 +5461,6 @@ final class ServerManager {
             deregisterPushProxy()
         }
     }
-
 
     private func endBackgroundTaskIfNeeded() {
         guard backgroundTaskID != .invalid else { return }
@@ -5023,7 +5548,7 @@ final class ServerManager {
     private func updateLiveActivityBGWake(key: ThreadKey) {
         guard let activity = liveActivities[key] else { return }
         let thread = threads[key]
-        // If session already completed, don't update — let endLiveActivity's dismissal finish
+        // If session already completed, don't update the background timer.
         guard thread?.hasTurnActive == true else { return }
         let elapsed = Int(Date().timeIntervalSince(liveActivityStartDates[key] ?? Date()))
 
@@ -5106,330 +5631,9 @@ final class ServerManager {
         return (try? JSONDecoder().decode([SavedServer].self, from: data)) ?? []
     }
 
-    // MARK: - Conversation Restoration
 
-    func restoredMessages(
-        from turns: [ResumedTurn],
-        serverId: String? = nil,
-        defaultAgentNickname: String? = nil,
-        defaultAgentRole: String? = nil
-    ) -> [ConversationItem] {
-        var restored: [ConversationItem] = []
-        restored.reserveCapacity(turns.count * 3)
-        for (turnIndex, turn) in turns.enumerated() {
-            for (itemIndex, item) in turn.items.enumerated() {
-                if let restoredItem = conversationItem(
-                    from: item,
-                    itemId: "\(turn.id)-\(itemIndex)",
-                    sourceTurnId: turn.id,
-                    sourceTurnIndex: turnIndex,
-                    serverId: serverId,
-                    defaultAgentNickname: defaultAgentNickname,
-                    defaultAgentRole: defaultAgentRole
-                ) {
-                    restored.append(restoredItem)
-                }
-            }
-        }
-        return restored
-    }
-
-    private func conversationItem(
-        from item: ResumedThreadItem,
-        itemId: String,
-        sourceTurnId: String?,
-        sourceTurnIndex: Int?,
-        serverId: String?,
-        defaultAgentNickname: String? = nil,
-        defaultAgentRole: String? = nil,
-        isInProgressEvent: Bool = false
-    ) -> ConversationItem? {
-        switch item {
-        case .userMessage(let content, let timestamp):
-            let (text, images) = renderUserInput(content)
-            guard !text.isEmpty || !images.isEmpty else { return nil }
-            return ConversationItem(
-                id: itemId,
-                content: .user(ConversationUserMessageData(text: text, images: images)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date(),
-                isFromUserTurnBoundary: true
-            )
-        case .agentMessage(let text, _, let itemAgentId, let itemAgentNickname, let itemAgentRole, let timestamp):
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return nil }
-            let normalizedNickname = sanitizedLineageId(itemAgentNickname) ?? sanitizedLineageId(defaultAgentNickname)
-            let normalizedRole = sanitizedLineageId(itemAgentRole) ?? sanitizedLineageId(defaultAgentRole)
-            upsertAgentDirectory(
-                serverId: serverId,
-                threadId: nil,
-                agentId: itemAgentId,
-                nickname: normalizedNickname,
-                role: normalizedRole
-            )
-            return ConversationItem(
-                id: itemId,
-                content: .assistant(
-                    ConversationAssistantMessageData(
-                        text: trimmed,
-                        agentNickname: normalizedNickname,
-                        agentRole: normalizedRole
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .proposedPlan(let text, let timestamp):
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return nil }
-            return ConversationItem(
-                id: itemId,
-                content: .proposedPlan(ConversationProposedPlanData(content: trimmed)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .todoList(let entries, let timestamp):
-            let steps = todoListSteps(from: entries)
-            guard !steps.isEmpty else { return nil }
-            return ConversationItem(
-                id: itemId,
-                content: .todoList(ConversationTodoListData(steps: steps)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .reasoning(let summary, let content, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .reasoning(ConversationReasoningData(summary: summary, content: content)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .commandExecution(let command, let cwd, let status, let commandActions, let output, let exitCode, let durationMs, let processId, let timestamp):
-            let actions = commandActions.map { action in
-                let kind: ConversationCommandActionKind
-                switch action.type {
-                case "read":
-                    kind = .read
-                case "search":
-                    kind = .search
-                case "listFiles":
-                    kind = .listFiles
-                default:
-                    kind = .unknown
-                }
-                return ConversationCommandAction(
-                    kind: kind,
-                    command: action.command,
-                    name: action.name,
-                    path: action.path,
-                    query: action.query
-                )
-            }
-            return ConversationItem(
-                id: itemId,
-                content: .commandExecution(
-                    ConversationCommandExecutionData(
-                        command: command,
-                        cwd: cwd,
-                        status: status,
-                        output: output,
-                        exitCode: exitCode,
-                        durationMs: durationMs,
-                        processId: processId,
-                        actions: actions
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .fileChange(let changes, let status, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .fileChange(
-                    ConversationFileChangeData(
-                        status: status,
-                        changes: changes.map { ConversationFileChangeEntry(path: $0.path, kind: $0.kind, diff: $0.diff) },
-                        outputDelta: nil
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .mcpToolCall(let server, let tool, let status, let arguments, let result, let error, let durationMs, let timestamp):
-            let rawOutputJSON = result.flatMap { result -> String? in
-                prettyJSON([
-                    "content": result.content.map(\.value),
-                    "structuredContent": result.structuredContent?.value ?? NSNull()
-                ])
-            }
-            let contentSummary = result?.content
-                .map { stringifyValue($0.value) }
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
-            let structuredJSON = result?.structuredContent.flatMap { prettyJSON($0.value) }
-            return ConversationItem(
-                id: itemId,
-                content: .mcpToolCall(
-                    ConversationMcpToolCallData(
-                        server: server,
-                        tool: tool,
-                        status: status,
-                        durationMs: durationMs,
-                        argumentsJSON: arguments.flatMap { prettyJSON($0.value) },
-                        contentSummary: contentSummary,
-                        structuredContentJSON: structuredJSON,
-                        rawOutputJSON: rawOutputJSON,
-                        errorMessage: error?.message,
-                        progressMessages: []
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .collabAgentToolCall(let tool, let status, let receiverThreadIds, let receiverAgents, let agentsStates, let prompt, let timestamp):
-            let targets = receiverThreadIds.compactMap { targetId -> String? in
-                let normalizedTarget = sanitizedLineageId(targetId)
-                let matchingAgent = receiverAgents.first { sanitizedLineageId($0.threadId) == normalizedTarget || sanitizedLineageId($0.agentId) == normalizedTarget }
-                let label = formatAgentLabel(
-                    nickname: matchingAgent?.agentNickname,
-                    role: matchingAgent?.agentRole,
-                    fallbackThreadId: normalizedTarget
-                )
-                return label ?? normalizedTarget
-            }
-            let states = agentsStates.map { key, value in
-                ConversationMultiAgentState(
-                    targetId: key,
-                    status: value.status,
-                    message: value.message
-                )
-            }.sorted { $0.targetId < $1.targetId }
-            if let serverId {
-                for (threadId, agentState) in agentsStates {
-                    let childKey = ThreadKey(serverId: serverId, threadId: threadId)
-                    threads[childKey]?.agentStatus = SubagentStatus(fromRaw: agentState.status)
-                }
-            }
-            return ConversationItem(
-                id: itemId,
-                content: .multiAgentAction(
-                    ConversationMultiAgentActionData(
-                        tool: tool,
-                        status: status,
-                        prompt: prompt,
-                        targets: targets,
-                        receiverThreadIds: receiverThreadIds,
-                        agentStates: states
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .webSearch(let query, let action, let isInProgress, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .webSearch(
-                    ConversationWebSearchData(
-                        query: query,
-                        actionJSON: action.flatMap { prettyJSON($0.value) },
-                        isInProgress: isInProgress
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .imageView(let path, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .note(ConversationNoteData(title: "Image View", body: "Path: \(path)")),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .enteredReviewMode(let review, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .divider(.reviewEntered(review)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .exitedReviewMode(let review, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .divider(.reviewExited(review)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .dynamicToolCall(let tool, let arguments, let status, let contentItems, let success, let durationMs, let timestamp):
-            if tool == GenerativeUITools.readMeToolName {
-                return nil
-            }
-            if tool == GenerativeUITools.showWidgetToolName {
-                guard let args = arguments?.value as? [String: Any],
-                      let code = args["widget_code"] as? String,
-                      !code.isEmpty else {
-                    return nil
-                }
-                let widget = WidgetState.fromArguments(args, callId: itemId, isFinalized: status.lowercased().contains("complete"))
-                return ConversationItem(
-                    id: itemId,
-                    content: .widget(ConversationWidgetData(widgetState: widget, status: status)),
-                    sourceTurnId: sourceTurnId,
-                    sourceTurnIndex: sourceTurnIndex,
-                    timestamp: timestamp ?? Date()
-                )
-            }
-            let contentSummary = contentItems.map { item in
-                stringifyValue(item.value)
-            } ?? ""
-            return ConversationItem(
-                id: itemId,
-                content: .dynamicToolCall(
-                    ConversationDynamicToolCallData(
-                        tool: tool,
-                        status: status,
-                        durationMs: durationMs,
-                        success: success,
-                        argumentsJSON: arguments.flatMap { prettyJSON($0.value) },
-                        contentSummary: contentSummary
-                    )
-                ),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .contextCompaction(let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .divider(.contextCompaction(isComplete: !isInProgressEvent)),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .unknown(let type, let timestamp):
-            return ConversationItem(
-                id: itemId,
-                content: .note(ConversationNoteData(title: "Event", body: "Unhandled item type: \(type)")),
-                sourceTurnId: sourceTurnId,
-                sourceTurnIndex: sourceTurnIndex,
-                timestamp: timestamp ?? Date()
-            )
-        case .ignored:
-            return nil
-        }
-    }
+    // MARK: - Conversation Restoration (now in RustConversationBridge)
+    // restoredMessages/conversationItem/renderUserInput/decodeBase64DataURI/todoListSteps removed
 
     private func makeUserItem(
         text: String,
@@ -5488,48 +5692,6 @@ final class ServerManager {
             sourceTurnIndex: sourceTurnIndex,
             timestamp: timestamp
         )
-    }
-
-    private func renderUserInput(_ content: [ResumedUserInput]) -> (String, [ChatImage]) {
-        var textParts: [String] = []
-        var images: [ChatImage] = []
-        for input in content {
-            switch input.type {
-            case "text":
-                let trimmed = input.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !trimmed.isEmpty { textParts.append(trimmed) }
-            case "image":
-                if let url = input.url, let imageData = decodeBase64DataURI(url) {
-                    images.append(ChatImage(data: imageData))
-                }
-            case "localImage":
-                if let path = input.path, let data = FileManager.default.contents(atPath: path) {
-                    images.append(ChatImage(data: data))
-                }
-            case "skill":
-                let name = (input.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let path = (input.path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !name.isEmpty && !path.isEmpty { textParts.append("[Skill] \(name) (\(path))") }
-                else if !name.isEmpty { textParts.append("[Skill] \(name)") }
-                else if !path.isEmpty { textParts.append("[Skill] \(path)") }
-            case "mention":
-                let name = (input.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let path = (input.path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !name.isEmpty && !path.isEmpty { textParts.append("[Mention] \(name) (\(path))") }
-                else if !name.isEmpty { textParts.append("[Mention] \(name)") }
-                else if !path.isEmpty { textParts.append("[Mention] \(path)") }
-            default:
-                break
-            }
-        }
-        return (textParts.joined(separator: "\n"), images)
-    }
-
-    private func decodeBase64DataURI(_ uri: String) -> Data? {
-        guard uri.hasPrefix("data:") else { return nil }
-        guard let commaIndex = uri.firstIndex(of: ",") else { return nil }
-        let base64 = String(uri[uri.index(after: commaIndex)...])
-        return Data(base64Encoded: base64, options: .ignoreUnknownCharacters)
     }
 
     private func prettyJSON(_ value: Any) -> String? {

@@ -23,7 +23,7 @@ struct CodexVoiceCallLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     Button(intent: EndVoiceSessionIntent()) {
-                        Image(systemName: "phone.down.fill")
+                        Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.white)
                     }
                     .buttonStyle(.plain)
@@ -46,10 +46,10 @@ struct CodexVoiceCallLiveActivity: Widget {
                     .scaledToFit()
                     .frame(width: 16, height: 16)
             } compactTrailing: {
-                Image(systemName: "phone.fill")
+                Image(systemName: "waveform")
                     .foregroundStyle(.white.opacity(0.85))
             } minimal: {
-                Image(systemName: "phone.fill")
+                Image(systemName: "waveform")
                     .foregroundStyle(.white.opacity(0.85))
             }
         }

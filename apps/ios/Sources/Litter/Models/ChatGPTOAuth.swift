@@ -1,6 +1,5 @@
 import AuthenticationServices
 import CryptoKit
-import Darwin
 import Foundation
 import Network
 import Security
@@ -131,109 +130,6 @@ final class ChatGPTOAuthTokenStore {
     }
 }
 
-enum RealtimeAPIKeyStoreError: LocalizedError {
-    case keychain(OSStatus)
-    case encodingFailed
-    case decodingFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .keychain(let status):
-            return "Keychain error (\(status))"
-        case .encodingFailed:
-            return "Failed to encode API key"
-        case .decodingFailed:
-            return "Failed to decode API key"
-        }
-    }
-}
-
-final class RealtimeAPIKeyStore {
-    static let shared = RealtimeAPIKeyStore()
-
-    private let service = "com.sigkitten.litter.realtime.openai-api-key"
-    private let account = "default"
-
-    private init() {}
-
-    func load() throws -> String? {
-        let query = baseQuery().merging([
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]) { _, new in new }
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        switch status {
-        case errSecSuccess:
-            guard let data = item as? Data else {
-                throw RealtimeAPIKeyStoreError.decodingFailed
-            }
-            guard let value = String(data: data, encoding: .utf8) else {
-                throw RealtimeAPIKeyStoreError.decodingFailed
-            }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        case errSecItemNotFound:
-            return nil
-        default:
-            throw RealtimeAPIKeyStoreError.keychain(status)
-        }
-    }
-
-    func save(_ apiKey: String) throws {
-        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let data = trimmed.data(using: .utf8) else {
-            throw RealtimeAPIKeyStoreError.encodingFailed
-        }
-
-        let attributes: [String: Any] = baseQuery().merging([
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            kSecValueData as String: data
-        ]) { _, new in new }
-
-        let status = SecItemAdd(attributes as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            let updates: [String: Any] = [
-                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-                kSecValueData as String: data
-            ]
-            let updateStatus = SecItemUpdate(baseQuery() as CFDictionary, updates as CFDictionary)
-            guard updateStatus == errSecSuccess else {
-                throw RealtimeAPIKeyStoreError.keychain(updateStatus)
-            }
-            return
-        }
-
-        guard status == errSecSuccess else {
-            throw RealtimeAPIKeyStoreError.keychain(status)
-        }
-    }
-
-    func clear() throws {
-        let status = SecItemDelete(baseQuery() as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw RealtimeAPIKeyStoreError.keychain(status)
-        }
-    }
-
-    func applyProcessEnvironment() throws {
-        if let apiKey = try load() {
-            setenv("OPENAI_API_KEY", apiKey, 1)
-        } else {
-            unsetenv("OPENAI_API_KEY")
-        }
-    }
-
-    private func baseQuery() -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-    }
-}
-
 @MainActor
 enum ChatGPTOAuth {
     static let authIssuer = "https://auth.openai.com"
@@ -283,14 +179,6 @@ enum ChatGPTOAuth {
         }
         try ChatGPTOAuthTokenStore.shared.save(refreshed)
         return refreshed
-    }
-
-    static func loadStoredTokens() throws -> ChatGPTOAuthTokenBundle? {
-        try ChatGPTOAuthTokenStore.shared.load()
-    }
-
-    static func clearStoredTokens() throws {
-        try ChatGPTOAuthTokenStore.shared.clear()
     }
 
     static func buildAuthorizeURL(

@@ -65,21 +65,19 @@ struct ConversationComposerTextView: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: ConversationComposerTextView
         var isSynchronizingText = false
+        private var requestedFocusState: Bool?
+        private var focusSyncWorkItem: DispatchWorkItem?
 
         init(_ parent: ConversationComposerTextView) {
             self.parent = parent
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
-            if !parent.isFocused {
-                parent.isFocused = true
-            }
+            updateFocusBinding(true)
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
-            if parent.isFocused {
-                parent.isFocused = false
-            }
+            updateFocusBinding(false)
         }
 
         func textViewDidChange(_ textView: UITextView) {
@@ -93,13 +91,29 @@ struct ConversationComposerTextView: UIViewRepresentable {
 
         func syncFocus(for textView: UITextView) {
             let requestedFocus = parent.isFocused
-            if requestedFocus {
-                if textView.window != nil, !textView.isFirstResponder {
-                    textView.becomeFirstResponder()
+            let needsUIKitSync: Bool = {
+                if requestedFocus {
+                    return textView.window != nil && !textView.isFirstResponder
                 }
-            } else if textView.isFirstResponder {
-                textView.resignFirstResponder()
+                return textView.isFirstResponder
+            }()
+            guard requestedFocusState != requestedFocus || needsUIKitSync else { return }
+            requestedFocusState = requestedFocus
+
+            focusSyncWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak textView, weak self] in
+                guard let self, let textView else { return }
+                self.focusSyncWorkItem = nil
+                let latestRequestedFocus = self.requestedFocusState ?? false
+                if latestRequestedFocus {
+                    guard textView.window != nil, !textView.isFirstResponder else { return }
+                    textView.becomeFirstResponder()
+                } else if textView.isFirstResponder {
+                    textView.resignFirstResponder()
+                }
             }
+            focusSyncWorkItem = work
+            DispatchQueue.main.async(execute: work)
         }
 
         func applyStyling(to textView: UITextView, textScale: CGFloat) {
@@ -134,6 +148,14 @@ struct ConversationComposerTextView: UIViewRepresentable {
                 return LitterFont.uiMonoFont(size: pointSize)
             }
             return UIFont.systemFont(ofSize: pointSize)
+        }
+
+        private func updateFocusBinding(_ isFocused: Bool) {
+            guard parent.isFocused != isFocused else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.parent.isFocused != isFocused else { return }
+                self.parent.isFocused = isFocused
+            }
         }
     }
 }

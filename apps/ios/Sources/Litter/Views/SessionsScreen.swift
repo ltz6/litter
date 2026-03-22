@@ -1,5 +1,4 @@
 import SwiftUI
-import Inject
 import os
 
 private let sessionsScreenSignpostLog = OSLog(
@@ -8,7 +7,6 @@ private let sessionsScreenSignpostLog = OSLog(
 )
 
 struct SessionsScreen: View {
-    @ObserveInjection var inject
     @Environment(ServerManager.self) private var serverManager
     @Environment(AppState.self) private var appState
     @Environment(ConversationWarmupCoordinator.self) private var conversationWarmup
@@ -60,7 +58,6 @@ struct SessionsScreen: View {
                     refreshToolbarButton
                 }
             }
-            .enableInjection()
 
         let lifecycle = attachLifecycleHandlers(to: base, derived: derived)
         let alerts = attachSheetAndAlerts(to: lifecycle)
@@ -980,6 +977,12 @@ struct SessionsScreen: View {
         guard autoLoadSessions else { return }
         guard force || !hasLoadedInitialSessions else { return }
         await loadSessions()
+    }
+
+    private func refreshSessions() {
+        Task {
+            await loadSessions()
+        }
     }
 
     private func loadSessions() async {

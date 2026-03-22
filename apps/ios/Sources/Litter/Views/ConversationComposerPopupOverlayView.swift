@@ -20,7 +20,10 @@ struct ConversationComposerPopupOverlayView: View {
 
         case .slash(let suggestions):
             suggestionPopup {
-                ForEach(Array(suggestions.enumerated()), id: \.element.rawValue) { index, command in
+                let indexedSuggestions = Array(suggestions.enumerated())
+                ForEach(indexedSuggestions, id: \.offset) { item in
+                    let index = item.offset
+                    let command = item.element
                     VStack(spacing: 0) {
                         Button {
                             onApplySlashSuggestion(command)
@@ -56,7 +59,10 @@ struct ConversationComposerPopupOverlayView: View {
                 } else if suggestions.isEmpty {
                     popupStateText("No matches")
                 } else {
-                    ForEach(Array(suggestions.prefix(8).enumerated()), id: \.element.id) { index, suggestion in
+                    let indexedSuggestions = Array(Array(suggestions.prefix(8)).enumerated())
+                    ForEach(indexedSuggestions, id: \.offset) { item in
+                        let index = item.offset
+                        let suggestion = item.element
                         VStack(spacing: 0) {
                             Button {
                                 onApplyFileSuggestion(suggestion)
@@ -78,7 +84,7 @@ struct ConversationComposerPopupOverlayView: View {
 
                             Divider()
                                 .background(LitterTheme.border)
-                                .opacity(index < min(suggestions.count, 8) - 1 ? 1 : 0)
+                                .opacity(index < indexedSuggestions.count - 1 ? 1 : 0)
                         }
                     }
                 }
@@ -91,7 +97,10 @@ struct ConversationComposerPopupOverlayView: View {
                 } else if suggestions.isEmpty {
                     popupStateText("No skills found")
                 } else {
-                    ForEach(Array(suggestions.prefix(8).enumerated()), id: \.element.id) { index, skill in
+                    let indexedSuggestions = Array(Array(suggestions.prefix(8)).enumerated())
+                    ForEach(indexedSuggestions, id: \.offset) { item in
+                        let index = item.offset
+                        let skill = item.element
                         VStack(spacing: 0) {
                             Button {
                                 onApplySkillSuggestion(skill)
@@ -113,7 +122,7 @@ struct ConversationComposerPopupOverlayView: View {
 
                             Divider()
                                 .background(LitterTheme.border)
-                                .opacity(index < min(suggestions.count, 8) - 1 ? 1 : 0)
+                                .opacity(index < indexedSuggestions.count - 1 ? 1 : 0)
                         }
                     }
                 }

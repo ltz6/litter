@@ -6,7 +6,7 @@ struct PreparedImageAttachment {
     let mimeType: String
 
     var userInput: UserInput {
-        UserInput(type: "image", imageURL: dataURI)
+        .image(url: dataURI)
     }
 
     var chatImage: ChatImage {
@@ -27,7 +27,7 @@ enum ConversationAttachmentSupport {
     static func buildTurnInputs(text: String, additionalInput: [UserInput]) -> [UserInput] {
         var inputs: [UserInput] = []
         if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            inputs.append(UserInput(type: "text", text: text))
+            inputs.append(.text(text: text, textElements: []))
         }
         inputs.append(contentsOf: additionalInput)
         return inputs

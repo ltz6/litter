@@ -31,11 +31,11 @@ jobs:
       - name: Download ios_system frameworks
         run: ./apps/ios/scripts/download-ios-system.sh
 
-      - name: Build (LitterRemote)
+      - name: Build (Litter)
         run: |
           xcodebuild \
             -project apps/ios/Litter.xcodeproj \
-            -scheme LitterRemote \
+            -scheme Litter \
             -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
             build

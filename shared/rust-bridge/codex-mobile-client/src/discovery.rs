@@ -1,0 +1,1180 @@
+//! Server discovery: Bonjour/mDNS, Tailscale, LAN probing, ARP scanning.
+//!
+//! Multi-source progressive discovery with parallel candidate filtering,
+//! reachability checking, and continuous monitoring.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{Semaphore, broadcast, mpsc};
+
+/// Default ports to probe for Codex servers.
+const DEFAULT_SCAN_PORTS: &[u16] = &[8390, 4222, 9234];
+
+/// Maximum concurrent TCP probes during subnet scans.
+const MAX_CONCURRENT_PROBES: usize = 32;
+
+/// Interval between continuous scan sweeps.
+const CONTINUOUS_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Staleness threshold — servers not seen for this long are considered lost.
+const SERVER_STALE_TIMEOUT: Duration = Duration::from_secs(90);
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// A server found during discovery.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredServer {
+    pub id: String,
+    pub display_name: String,
+    pub host: String,
+    pub port: u16,
+    pub codex_port: Option<u16>,
+    pub ssh_port: Option<u16>,
+    pub source: DiscoverySource,
+    pub metadata: HashMap<String, String>,
+    #[serde(skip)]
+    pub last_seen: Instant,
+    pub reachable: bool,
+}
+
+/// A resolved mDNS/Bonjour service seed supplied by the platform layer.
+#[derive(Debug, Clone)]
+pub struct MdnsSeed {
+    pub name: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub service_type: String,
+    pub txt: HashMap<String, String>,
+}
+
+/// How the server was discovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoverySource {
+    Bonjour,
+    Tailscale,
+    LanProbe,
+    ArpScan,
+    Manual,
+    Bundled,
+}
+
+/// Events emitted during continuous discovery.
+#[derive(Debug, Clone)]
+pub enum DiscoveryEvent {
+    ServerFound(DiscoveredServer),
+    ServerLost(String),
+    ServerUpdated(DiscoveredServer),
+    ScanComplete { source: DiscoverySource },
+}
+
+/// Configuration for the discovery service.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    pub scan_ports: Vec<u16>,
+    pub probe_timeout: Duration,
+    pub enable_bonjour: bool,
+    pub enable_tailscale: bool,
+    pub enable_lan_probe: bool,
+    pub enable_arp_scan: bool,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            scan_ports: DEFAULT_SCAN_PORTS.to_vec(),
+            probe_timeout: Duration::from_secs(2),
+            enable_bonjour: true,
+            enable_tailscale: true,
+            enable_lan_probe: true,
+            enable_arp_scan: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform mDNS browser trait
+// ---------------------------------------------------------------------------
+
+/// Event from the platform-specific mDNS browser.
+#[derive(Debug, Clone)]
+pub enum MdnsServiceEvent {
+    Found {
+        name: String,
+        host: String,
+        port: u16,
+        txt: HashMap<String, String>,
+    },
+    Lost {
+        name: String,
+    },
+}
+
+/// Platform-provided mDNS browser (iOS = NWBrowser, Android = NsdManager).
+///
+/// The Rust layer coordinates results; actual browsing is delegated to the
+/// platform because reliable mDNS requires OS-level APIs.
+#[async_trait::async_trait]
+pub trait PlatformMdnsBrowser: Send + Sync {
+    /// Start browsing for the given service type (e.g. `_codex._tcp.`).
+    /// Returns a channel that yields discovery events.
+    fn browse(&self, service_type: &str) -> mpsc::Receiver<MdnsServiceEvent>;
+
+    /// Stop the browser.
+    fn stop(&self);
+}
+
+/// A no-op mDNS browser used when no platform browser is provided.
+struct NoopMdnsBrowser;
+
+#[async_trait::async_trait]
+impl PlatformMdnsBrowser for NoopMdnsBrowser {
+    fn browse(&self, _service_type: &str) -> mpsc::Receiver<MdnsServiceEvent> {
+        let (_tx, rx) = mpsc::channel(1);
+        rx
+    }
+
+    fn stop(&self) {}
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryService
+// ---------------------------------------------------------------------------
+
+/// Multi-source server discovery service.
+pub struct DiscoveryService {
+    config: DiscoveryConfig,
+    mdns_browser: Arc<dyn PlatformMdnsBrowser>,
+    servers: Arc<Mutex<HashMap<String, DiscoveredServer>>>,
+    manual_servers: Arc<Mutex<Vec<(String, u16)>>>,
+    running: Arc<AtomicBool>,
+}
+
+impl DiscoveryService {
+    /// Create a new discovery service with default (no-op) mDNS browser.
+    pub fn new(config: DiscoveryConfig) -> Self {
+        Self {
+            config,
+            mdns_browser: Arc::new(NoopMdnsBrowser),
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            manual_servers: Arc::new(Mutex::new(Vec::new())),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create with a platform-specific mDNS browser.
+    pub fn with_mdns_browser(
+        config: DiscoveryConfig,
+        browser: Arc<dyn PlatformMdnsBrowser>,
+    ) -> Self {
+        Self {
+            config,
+            mdns_browser: browser,
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            manual_servers: Arc::new(Mutex::new(Vec::new())),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Run a single discovery sweep across all enabled sources.
+    pub async fn scan_once(&self) -> Vec<DiscoveredServer> {
+        self.scan_once_with_context(&[], None).await
+    }
+
+    /// Run a single discovery sweep using pre-resolved platform mDNS seeds.
+    pub async fn scan_once_with_mdns_seeds(&self, mdns_seeds: &[MdnsSeed]) -> Vec<DiscoveredServer> {
+        self.scan_once_with_context(mdns_seeds, None).await
+    }
+
+    /// Run a single discovery sweep using platform hints from the UI layer.
+    pub async fn scan_once_with_context(
+        &self,
+        mdns_seeds: &[MdnsSeed],
+        local_ipv4_hint: Option<&str>,
+    ) -> Vec<DiscoveredServer> {
+        let mut all = Vec::new();
+        let local_ipv4_hint = local_ipv4_hint.and_then(parse_ipv4_hint);
+
+        // Run all sources concurrently.
+        let (lan_res, tailscale_res, bonjour_res, arp_res, manual_res) = tokio::join!(
+            self.scan_lan_probe(local_ipv4_hint),
+            self.scan_tailscale(),
+            self.scan_bonjour_with_seeds(mdns_seeds),
+            self.scan_arp(),
+            self.scan_manual(),
+        );
+
+        all.extend(lan_res);
+        all.extend(tailscale_res);
+        all.extend(bonjour_res);
+        all.extend(arp_res);
+        all.extend(manual_res);
+
+        // Deduplicate by id, merging per-source details while preferring
+        // higher-priority display/source metadata.
+        let mut map: HashMap<String, DiscoveredServer> = HashMap::new();
+        for server in all {
+            match map.get_mut(&server.id) {
+                Some(existing) => merge_server(existing, server),
+                None => {
+                    map.insert(server.id.clone(), server);
+                }
+            }
+        }
+
+        // Update internal cache.
+        {
+            let mut servers = self.servers.lock().unwrap();
+            for (id, srv) in &map {
+                servers.insert(id.clone(), srv.clone());
+            }
+        }
+
+        let mut results: Vec<DiscoveredServer> = map.into_values().collect();
+        results.sort_by(|a, b| {
+            source_rank(a.source)
+                .cmp(&source_rank(b.source))
+                .then_with(|| {
+                    a.display_name
+                        .to_lowercase()
+                        .cmp(&b.display_name.to_lowercase())
+                })
+        });
+        results
+    }
+
+    /// Start continuous scanning. Returns a broadcast receiver for events.
+    ///
+    /// Scans run every 30 seconds until [`stop`] is called.
+    pub fn start(&self) -> broadcast::Receiver<DiscoveryEvent> {
+        let (tx, rx) = broadcast::channel(128);
+        self.running.store(true, Ordering::SeqCst);
+
+        let config = self.config.clone();
+        let mdns_browser = self.mdns_browser.clone();
+        let servers = self.servers.clone();
+        let manual_servers = self.manual_servers.clone();
+        let running = self.running.clone();
+
+        tokio::spawn(async move {
+            let svc = DiscoveryService {
+                config,
+                mdns_browser,
+                servers: servers.clone(),
+                manual_servers,
+                running: running.clone(),
+            };
+
+            while running.load(Ordering::SeqCst) {
+                let new_results = svc.scan_once().await;
+
+                // Diff against previous state and emit events.
+                let mut prev = servers.lock().unwrap().clone();
+
+                for server in &new_results {
+                    match prev.remove(&server.id) {
+                        None => {
+                            let _ = tx.send(DiscoveryEvent::ServerFound(server.clone()));
+                        }
+                        Some(old) => {
+                            if old.reachable != server.reachable
+                                || old.port != server.port
+                                || old.source != server.source
+                            {
+                                let _ = tx.send(DiscoveryEvent::ServerUpdated(server.clone()));
+                            }
+                        }
+                    }
+                }
+
+                // Any remaining in `prev` that are stale => lost.
+                let now = Instant::now();
+                for (id, old) in &prev {
+                    if now.duration_since(old.last_seen) > SERVER_STALE_TIMEOUT {
+                        let _ = tx.send(DiscoveryEvent::ServerLost(id.clone()));
+                        servers.lock().unwrap().remove(id);
+                    }
+                }
+
+                // Update cache with new results.
+                {
+                    let mut cache = servers.lock().unwrap();
+                    for server in new_results {
+                        cache.insert(server.id.clone(), server);
+                    }
+                }
+
+                // Emit scan-complete events for each enabled source.
+                for source in &[
+                    DiscoverySource::LanProbe,
+                    DiscoverySource::Tailscale,
+                    DiscoverySource::Bonjour,
+                    DiscoverySource::ArpScan,
+                ] {
+                    let _ = tx.send(DiscoveryEvent::ScanComplete { source: *source });
+                }
+
+                tokio::time::sleep(CONTINUOUS_SCAN_INTERVAL).await;
+            }
+        });
+
+        rx
+    }
+
+    /// Stop continuous scanning.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.mdns_browser.stop();
+    }
+
+    /// Add a manual server entry. It will be probed on the next scan.
+    pub fn add_manual(&mut self, host: String, port: u16) -> DiscoveredServer {
+        let server = DiscoveredServer {
+            id: format!("manual-{}:{}", host, port),
+            display_name: format!("{}:{}", host, port),
+            host: host.clone(),
+            port,
+            codex_port: Some(port),
+            ssh_port: None,
+            source: DiscoverySource::Manual,
+            metadata: HashMap::new(),
+            last_seen: Instant::now(),
+            reachable: false, // will be verified on next scan
+        };
+
+        self.manual_servers.lock().unwrap().push((host, port));
+
+        self.servers
+            .lock()
+            .unwrap()
+            .insert(server.id.clone(), server.clone());
+
+        server
+    }
+
+    /// Probe a single host:port for TCP connectivity.
+    pub async fn probe_host(&self, host: &str, port: u16) -> bool {
+        tcp_probe(host, port, self.config.probe_timeout).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-specific scan methods
+    // -----------------------------------------------------------------------
+
+    /// LAN subnet probe: detect local IP, scan /24 subnet in parallel.
+    async fn scan_lan_probe(&self, local_ipv4_hint: Option<Ipv4Addr>) -> Vec<DiscoveredServer> {
+        if !self.config.enable_lan_probe {
+            return Vec::new();
+        }
+
+        let local_ip = match local_ipv4_hint.or_else(detect_local_ipv4) {
+            Some(ip) => ip,
+            None => {
+                tracing::debug!("discovery: could not detect local IPv4 address");
+                return Vec::new();
+            }
+        };
+
+        let octets = local_ip.octets();
+        let prefix = [octets[0], octets[1], octets[2]];
+        let local_last = octets[3];
+
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
+        let timeout = self.config.probe_timeout;
+        let ports = self.config.scan_ports.clone();
+
+        let mut handles = Vec::with_capacity(253);
+
+        for host_octet in 1u8..=254u8 {
+            if host_octet == local_last {
+                continue;
+            }
+            let ip = Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host_octet);
+            let sem = semaphore.clone();
+            let ports = ports.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let host_str = ip.to_string();
+                for &port in &ports {
+                    if tcp_probe(&host_str, port, timeout).await {
+                        return Some(DiscoveredServer {
+                            id: format!("network-{}", host_str),
+                            display_name: host_str.clone(),
+                            host: host_str,
+                            port,
+                            codex_port: Some(port),
+                            ssh_port: None,
+                            source: DiscoverySource::LanProbe,
+                            metadata: HashMap::new(),
+                            last_seen: Instant::now(),
+                            reachable: true,
+                        });
+                    }
+                }
+                None
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(Some(server)) = handle.await {
+                results.push(server);
+            }
+        }
+
+        results
+    }
+
+    /// Tailscale peer discovery via local API.
+    async fn scan_tailscale(&self) -> Vec<DiscoveredServer> {
+        if !self.config.enable_tailscale {
+            return Vec::new();
+        }
+
+        let peers = match fetch_tailscale_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::debug!("discovery: tailscale not available: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let timeout = self.config.probe_timeout;
+        let ports = self.config.scan_ports.clone();
+
+        let mut handles = Vec::new();
+        for (ip, hostname) in peers {
+            let ports = ports.clone();
+            handles.push(tokio::spawn(async move {
+                for &port in &ports {
+                    if tcp_probe(&ip, port, timeout).await {
+                        let display = if hostname.is_empty() {
+                            ip.clone()
+                        } else {
+                            hostname.clone()
+                        };
+                        return Some(DiscoveredServer {
+                            id: format!("network-{}", ip),
+                            display_name: display,
+                            host: ip,
+                            port,
+                            codex_port: Some(port),
+                            ssh_port: None,
+                            source: DiscoverySource::Tailscale,
+                            metadata: {
+                                let mut m = HashMap::new();
+                                if !hostname.is_empty() {
+                                    m.insert("hostname".to_string(), hostname);
+                                }
+                                m
+                            },
+                            last_seen: Instant::now(),
+                            reachable: true,
+                        });
+                    }
+                }
+                None
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(Some(server)) = handle.await {
+                results.push(server);
+            }
+        }
+        results
+    }
+
+    /// Bonjour/mDNS discovery via platform browser.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn scan_bonjour(&self) -> Vec<DiscoveredServer> {
+        self.scan_bonjour_with_seeds(&[]).await
+    }
+
+    async fn scan_bonjour_with_seeds(&self, seeds: &[MdnsSeed]) -> Vec<DiscoveredServer> {
+        if !self.config.enable_bonjour {
+            return Vec::new();
+        }
+
+        let mut mdns_seeds = seeds.to_vec();
+        mdns_seeds.extend(self.collect_browser_mdns_seeds().await);
+        self.scan_bonjour_seeds(mdns_seeds).await
+    }
+
+    async fn collect_browser_mdns_seeds(&self) -> Vec<MdnsSeed> {
+        let mut seeds = Vec::new();
+
+        for service_type in &["_codex._tcp.", "_ssh._tcp."] {
+            let mut rx = self.mdns_browser.browse(service_type);
+            let deadline = tokio::time::sleep(Duration::from_secs(5));
+            tokio::pin!(deadline);
+
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Some(MdnsServiceEvent::Found { name, host, port, txt }) => {
+                                seeds.push(MdnsSeed {
+                                    name,
+                                    host,
+                                    port: (port > 0).then_some(port),
+                                    service_type: (*service_type).to_string(),
+                                    txt,
+                                });
+                            }
+                            Some(MdnsServiceEvent::Lost { .. }) | None => {}
+                        }
+                    }
+                    _ = &mut deadline => break,
+                }
+            }
+        }
+
+        seeds
+    }
+
+    async fn scan_bonjour_seeds(&self, seeds: Vec<MdnsSeed>) -> Vec<DiscoveredServer> {
+        let mut results = Vec::new();
+
+        for seed in seeds {
+            let host = seed.host.trim().to_string();
+            if host.is_empty() {
+                continue;
+            }
+
+            let display = clean_hostname(&seed.name);
+            let is_codex_service = seed.service_type.starts_with("_codex.");
+            let is_ssh_service = seed.service_type.starts_with("_ssh.");
+
+            let mut codex_port = if is_codex_service { seed.port } else { None };
+            let ssh_port = if is_ssh_service {
+                Some(seed.port.unwrap_or(22))
+            } else {
+                None
+            };
+
+            let mut reachable = false;
+            if let Some(port) = codex_port {
+                reachable |= tcp_probe(&host, port, self.config.probe_timeout).await;
+            }
+            if let Some(port) = ssh_port {
+                reachable |= tcp_probe(&host, port, self.config.probe_timeout).await;
+            }
+
+            if codex_port.is_none() {
+                for &port in &self.config.scan_ports {
+                    if tcp_probe(&host, port, self.config.probe_timeout).await {
+                        codex_port = Some(port);
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+
+            if codex_port.is_none() && ssh_port.is_none() {
+                continue;
+            }
+
+            let mut metadata = seed.txt;
+            metadata.insert("service_type".to_string(), seed.service_type);
+            let port = primary_port(codex_port, ssh_port);
+            if port == 0 {
+                continue;
+            }
+
+            results.push(DiscoveredServer {
+                id: format!("network-{}", host),
+                display_name: if display.is_empty() { host.clone() } else { display },
+                host,
+                port,
+                codex_port,
+                ssh_port,
+                source: DiscoverySource::Bonjour,
+                metadata,
+                last_seen: Instant::now(),
+                reachable,
+            });
+        }
+
+        results
+    }
+
+    /// ARP table scan (Linux/Android: /proc/net/arp, macOS: `arp -a`).
+    async fn scan_arp(&self) -> Vec<DiscoveredServer> {
+        if !self.config.enable_arp_scan {
+            return Vec::new();
+        }
+
+        let candidates = parse_arp_table();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
+        let timeout = self.config.probe_timeout;
+        let ports = self.config.scan_ports.clone();
+
+        let mut handles = Vec::new();
+        for ip in candidates {
+            let sem = semaphore.clone();
+            let ports = ports.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                for &port in &ports {
+                    if tcp_probe(&ip, port, timeout).await {
+                        return Some(DiscoveredServer {
+                            id: format!("network-{}", ip),
+                            display_name: ip.clone(),
+                            host: ip,
+                            port,
+                            codex_port: Some(port),
+                            ssh_port: None,
+                            source: DiscoverySource::ArpScan,
+                            metadata: HashMap::new(),
+                            last_seen: Instant::now(),
+                            reachable: true,
+                        });
+                    }
+                }
+                None
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(Some(server)) = handle.await {
+                results.push(server);
+            }
+        }
+        results
+    }
+
+    /// Probe manually-added servers.
+    async fn scan_manual(&self) -> Vec<DiscoveredServer> {
+        let entries: Vec<(String, u16)> = self.manual_servers.lock().unwrap().clone();
+        let timeout = self.config.probe_timeout;
+
+        let mut handles = Vec::new();
+        for (host, port) in entries {
+            handles.push(tokio::spawn(async move {
+                let reachable = tcp_probe(&host, port, timeout).await;
+                DiscoveredServer {
+                    id: format!("manual-{}:{}", host, port),
+                    display_name: format!("{}:{}", host, port),
+                    host,
+                    port,
+                    codex_port: Some(port),
+                    ssh_port: None,
+                    source: DiscoverySource::Manual,
+                    metadata: HashMap::new(),
+                    last_seen: Instant::now(),
+                    reachable,
+                }
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(server) = handle.await {
+                results.push(server);
+            }
+        }
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// TCP connect probe with timeout.
+async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
+    let addr = format!("{}:{}", host, port);
+    tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+fn primary_port(codex_port: Option<u16>, ssh_port: Option<u16>) -> u16 {
+    codex_port.or(ssh_port).unwrap_or_default()
+}
+
+fn merge_server(existing: &mut DiscoveredServer, candidate: DiscoveredServer) {
+    let prefer_candidate = source_rank(candidate.source) < source_rank(existing.source);
+    let candidate_name_is_better =
+        existing.display_name == existing.host && candidate.display_name != candidate.host;
+
+    if prefer_candidate {
+        existing.source = candidate.source;
+    }
+    if prefer_candidate || candidate_name_is_better {
+        existing.display_name = candidate.display_name.clone();
+    }
+    if prefer_candidate && !candidate.host.is_empty() {
+        existing.host = candidate.host.clone();
+    }
+    if candidate.codex_port.is_some() && (existing.codex_port.is_none() || prefer_candidate) {
+        existing.codex_port = candidate.codex_port;
+    }
+    if candidate.ssh_port.is_some() && (existing.ssh_port.is_none() || prefer_candidate) {
+        existing.ssh_port = candidate.ssh_port;
+    }
+    existing.metadata.extend(candidate.metadata);
+    existing.reachable |= candidate.reachable;
+    if candidate.last_seen > existing.last_seen {
+        existing.last_seen = candidate.last_seen;
+    }
+    let merged_port = primary_port(existing.codex_port, existing.ssh_port);
+    if merged_port > 0 {
+        existing.port = merged_port;
+    } else if prefer_candidate && candidate.port > 0 {
+        existing.port = candidate.port;
+    }
+}
+
+/// Detect the local IPv4 address by binding a UDP socket to a public address.
+///
+/// This is a standard trick: the OS picks the correct source address for the
+/// route to 8.8.8.8 without actually sending any traffic.
+fn detect_local_ipv4() -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+fn parse_ipv4_hint(value: &str) -> Option<Ipv4Addr> {
+    value.parse::<Ipv4Addr>().ok().filter(|ip| !ip.is_loopback())
+}
+
+/// Fetch the list of Tailscale peers from the local API.
+///
+/// Talks raw HTTP/1.1 over a TCP connection to the Tailscale local API daemon.
+/// On macOS this is at 127.0.0.1:41112, on Linux/Android at 100.100.100.100:80.
+async fn fetch_tailscale_peers() -> Result<Vec<(String, String)>, String> {
+    // Try both known endpoints.
+    let endpoints = [
+        ("100.100.100.100", 80), // Linux / Android
+        ("127.0.0.1", 41112),    // macOS
+    ];
+
+    for (host, port) in &endpoints {
+        match fetch_tailscale_status(host, *port).await {
+            Ok(peers) => return Ok(peers),
+            Err(_) => continue,
+        }
+    }
+
+    Err("could not reach tailscale local API".to_string())
+}
+
+/// Raw HTTP GET to the Tailscale local API, parsing peer list from JSON.
+async fn fetch_tailscale_status(host: &str, port: u16) -> Result<Vec<(String, String)>, String> {
+    let addr = format!("{}:{}", host, port);
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| "timeout")?
+        .map_err(|e| e.to_string())?;
+
+    let request = format!(
+        "GET /localapi/v0/status HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut buf = Vec::with_capacity(64 * 1024);
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+        .await
+        .map_err(|_| "read timeout")?
+        .map_err(|e| e.to_string())?;
+
+    let response = String::from_utf8_lossy(&buf);
+
+    // Find the start of the JSON body (after blank line).
+    let body_start = response
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .ok_or("no HTTP body")?;
+    let body = &response[body_start..];
+
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("JSON parse error: {}", e))?;
+
+    let peers_obj = json
+        .get("Peer")
+        .and_then(|v| v.as_object())
+        .ok_or("no Peer object")?;
+
+    let mut results = Vec::new();
+    for (_key, peer) in peers_obj {
+        // Skip offline peers.
+        if let Some(false) = peer.get("Online").and_then(|v| v.as_bool()) {
+            continue;
+        }
+
+        let hostname = peer
+            .get("HostName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let hostname = if hostname.is_empty() {
+            peer.get("DNSName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('.')
+                .to_string()
+        } else {
+            hostname
+        };
+
+        let ips = match peer.get("TailscaleIPs").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        for ip_val in ips {
+            if let Some(ip_str) = ip_val.as_str() {
+                let ip_str = ip_str.trim();
+                if is_likely_ipv4(ip_str) {
+                    results.push((ip_str.to_string(), hostname.clone()));
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Parse ARP table to find candidate IPs.
+///
+/// On Linux/Android reads `/proc/net/arp`.
+/// On macOS, runs `arp -a` and parses the output.
+fn parse_arp_table() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // Try /proc/net/arp first (Linux/Android).
+    if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            let ip = parts[0];
+            let flags = parts[2];
+            if ip == "127.0.0.1" || ip == "0.0.0.0" {
+                continue;
+            }
+            // 0x2 = complete entry
+            if flags != "0x2" {
+                continue;
+            }
+            if is_likely_ipv4(ip) {
+                candidates.push(ip.to_string());
+            }
+        }
+        return candidates;
+    }
+
+    // macOS fallback: run `arp -a` and parse output.
+    // Format: hostname (ip) at mac on iface ...
+    if let Ok(output) = std::process::Command::new("arp").arg("-a").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(start) = line.find('(') {
+                if let Some(end) = line.find(')') {
+                    let ip = &line[start + 1..end];
+                    if ip != "127.0.0.1" && is_likely_ipv4(ip) {
+                        // Skip incomplete entries
+                        if !line.contains("incomplete") {
+                            candidates.push(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Check if a string looks like a valid IPv4 address.
+fn is_likely_ipv4(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// Remove `.local` suffix and trailing dots from a hostname.
+fn clean_hostname(name: &str) -> String {
+    let mut s = name.trim().to_string();
+    // Strip trailing dot first (e.g. "myhost.local." → "myhost.local").
+    if s.ends_with('.') {
+        s.pop();
+    }
+    if s.to_lowercase().ends_with(".local") {
+        s.truncate(s.len() - ".local".len());
+    }
+    s
+}
+
+/// Rank discovery sources for deduplication priority (lower = better).
+fn source_rank(source: DiscoverySource) -> u8 {
+    match source {
+        DiscoverySource::Bundled => 0,
+        DiscoverySource::Bonjour => 1,
+        DiscoverySource::Tailscale => 2,
+        DiscoverySource::LanProbe => 3,
+        DiscoverySource::ArpScan => 4,
+        DiscoverySource::Manual => 5,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_likely_ipv4() {
+        assert!(is_likely_ipv4("192.168.1.1"));
+        assert!(is_likely_ipv4("10.0.0.1"));
+        assert!(is_likely_ipv4("0.0.0.0"));
+        assert!(is_likely_ipv4("255.255.255.255"));
+        assert!(!is_likely_ipv4("not-an-ip"));
+        assert!(!is_likely_ipv4("192.168.1"));
+        assert!(!is_likely_ipv4("192.168.1.256"));
+        assert!(!is_likely_ipv4("::1"));
+        assert!(!is_likely_ipv4(""));
+    }
+
+    #[test]
+    fn test_clean_hostname() {
+        assert_eq!(clean_hostname("myhost.local"), "myhost");
+        assert_eq!(clean_hostname("myhost.local."), "myhost");
+        assert_eq!(clean_hostname("myhost.LOCAL"), "myhost");
+        assert_eq!(clean_hostname("myhost"), "myhost");
+        assert_eq!(clean_hostname("  myhost  "), "myhost");
+        assert_eq!(clean_hostname(""), "");
+    }
+
+    #[test]
+    fn test_source_rank_ordering() {
+        assert!(source_rank(DiscoverySource::Bundled) < source_rank(DiscoverySource::Bonjour));
+        assert!(source_rank(DiscoverySource::Bonjour) < source_rank(DiscoverySource::Tailscale));
+        assert!(source_rank(DiscoverySource::Tailscale) < source_rank(DiscoverySource::LanProbe));
+        assert!(source_rank(DiscoverySource::LanProbe) < source_rank(DiscoverySource::ArpScan));
+        assert!(source_rank(DiscoverySource::ArpScan) < source_rank(DiscoverySource::Manual));
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = DiscoveryConfig::default();
+        assert_eq!(config.scan_ports, vec![8390, 4222, 9234]);
+        assert_eq!(config.probe_timeout, Duration::from_secs(2));
+        assert!(config.enable_bonjour);
+        assert!(config.enable_tailscale);
+        assert!(config.enable_lan_probe);
+        assert!(config.enable_arp_scan);
+    }
+
+    #[test]
+    fn test_detect_local_ipv4() {
+        // This should return Some on any machine with network access, None otherwise.
+        // We just verify it doesn't panic.
+        let _ip = detect_local_ipv4();
+    }
+
+    #[test]
+    fn test_add_manual_server() {
+        let config = DiscoveryConfig::default();
+        let mut svc = DiscoveryService::new(config);
+
+        let server = svc.add_manual("10.0.0.50".to_string(), 8390);
+        assert_eq!(server.id, "manual-10.0.0.50:8390");
+        assert_eq!(server.host, "10.0.0.50");
+        assert_eq!(server.port, 8390);
+        assert_eq!(server.source, DiscoverySource::Manual);
+        assert!(!server.reachable);
+
+        // Verify it's in the internal state.
+        let manual = svc.manual_servers.lock().unwrap();
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0], ("10.0.0.50".to_string(), 8390));
+    }
+
+    #[tokio::test]
+    async fn test_probe_host_unreachable() {
+        let config = DiscoveryConfig {
+            probe_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let svc = DiscoveryService::new(config);
+
+        // Probe a non-routable address — should return false quickly.
+        let reachable = svc.probe_host("192.0.2.1", 9999).await;
+        assert!(!reachable);
+    }
+
+    #[tokio::test]
+    async fn test_scan_once_with_all_disabled() {
+        let config = DiscoveryConfig {
+            enable_bonjour: false,
+            enable_tailscale: false,
+            enable_lan_probe: false,
+            enable_arp_scan: false,
+            probe_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let svc = DiscoveryService::new(config);
+        let results = svc.scan_once().await;
+        // With everything disabled, should get no results (no manual entries either).
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_manual_servers() {
+        let config = DiscoveryConfig {
+            enable_bonjour: false,
+            enable_tailscale: false,
+            enable_lan_probe: false,
+            enable_arp_scan: false,
+            probe_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut svc = DiscoveryService::new(config);
+        svc.add_manual("192.0.2.1".to_string(), 8390);
+
+        let results = svc.scan_once().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].host, "192.0.2.1");
+        assert_eq!(results[0].source, DiscoverySource::Manual);
+        // Non-routable, so not reachable.
+        assert!(!results[0].reachable);
+    }
+
+    #[tokio::test]
+    async fn test_start_stop_continuous() {
+        let config = DiscoveryConfig {
+            enable_bonjour: false,
+            enable_tailscale: false,
+            enable_lan_probe: false,
+            enable_arp_scan: false,
+            probe_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let svc = DiscoveryService::new(config);
+
+        let _rx = svc.start();
+        // Let it run briefly.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        svc.stop();
+        // Should not panic or hang.
+    }
+
+    #[test]
+    fn test_parse_arp_table_doesnt_panic() {
+        // Just verify it handles missing /proc/net/arp gracefully.
+        let _candidates = parse_arp_table();
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_peers_handles_unavailable() {
+        // Should return an error, not panic.
+        let result = fetch_tailscale_peers().await;
+        // On most CI/dev machines Tailscale isn't running, so this should be Err.
+        // We just check it doesn't panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_discovered_server_clone() {
+        let server = DiscoveredServer {
+            id: "test-1".to_string(),
+            display_name: "Test".to_string(),
+            host: "10.0.0.1".to_string(),
+            port: 8390,
+            codex_port: Some(8390),
+            ssh_port: None,
+            source: DiscoverySource::LanProbe,
+            metadata: HashMap::new(),
+            last_seen: Instant::now(),
+            reachable: true,
+        };
+        let cloned = server.clone();
+        assert_eq!(cloned.id, server.id);
+        assert_eq!(cloned.host, server.host);
+        assert_eq!(cloned.source, server.source);
+    }
+
+    /// Test that the mock mDNS browser works correctly with the service.
+    #[tokio::test]
+    async fn test_bonjour_with_mock_browser() {
+        struct MockBrowser;
+
+        #[async_trait::async_trait]
+        impl PlatformMdnsBrowser for MockBrowser {
+            fn browse(&self, _service_type: &str) -> mpsc::Receiver<MdnsServiceEvent> {
+                let (tx, rx) = mpsc::channel(8);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(MdnsServiceEvent::Found {
+                            name: "test-server.local".to_string(),
+                            host: "192.0.2.42".to_string(),
+                            port: 8390,
+                            txt: HashMap::new(),
+                        })
+                        .await;
+                });
+                rx
+            }
+
+            fn stop(&self) {}
+        }
+
+        let config = DiscoveryConfig {
+            enable_bonjour: true,
+            enable_tailscale: false,
+            enable_lan_probe: false,
+            enable_arp_scan: false,
+            probe_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let svc = DiscoveryService::with_mdns_browser(config, Arc::new(MockBrowser));
+
+        let results = svc.scan_bonjour().await;
+        // 192.0.2.42 is TEST-NET-1 (RFC 5737) — typically unreachable.
+        // If the probe fails the result list will be empty; if the
+        // environment happens to route it, verify the entry is well-formed.
+        for srv in &results {
+            assert_eq!(srv.source, DiscoverySource::Bonjour);
+            assert!(!srv.host.is_empty());
+            assert!(srv.port > 0);
+        }
+    }
+}

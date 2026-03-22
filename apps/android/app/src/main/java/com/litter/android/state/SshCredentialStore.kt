@@ -1,5 +1,10 @@
 package com.litter.android.state
 
+// NOTE: SSH credentials are NOT part of the Rust auth migration. The Rust
+// MobileAuthManager handles API key and OAuth credentials only. SSH key/password
+// storage remains in this file and continues to use its own EncryptedSharedPreferences
+// (`litter_ssh_credentials_secure`). This store is intentionally kept as-is.
+
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences

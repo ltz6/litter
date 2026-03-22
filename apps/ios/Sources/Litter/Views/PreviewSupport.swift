@@ -38,37 +38,37 @@ enum LitterPreviewData {
         hasCodexServer: true
     )
 
-    static let sampleModels: [CodexModel] = [
-        CodexModel(
+    static let sampleModels: [Model] = [
+        Model(
             id: "gpt-5.4",
             model: "gpt-5.4",
-            upgrade: nil,
+            upgrade: nil, upgradeInfo: nil, availabilityNux: nil,
             displayName: "gpt-5.4",
             description: "Balanced flagship model",
             hidden: false,
             supportedReasoningEfforts: [
-                ReasoningEffortOption(reasoningEffort: "medium", description: "Balanced"),
-                ReasoningEffortOption(reasoningEffort: "high", description: "Deeper reasoning"),
-                ReasoningEffortOption(reasoningEffort: "xhigh", description: "Maximum reasoning")
+                ReasoningEffortOption(reasoningEffort: .medium, description: "Balanced"),
+                ReasoningEffortOption(reasoningEffort: .high, description: "Deeper reasoning"),
+                ReasoningEffortOption(reasoningEffort: .xHigh, description: "Maximum reasoning")
             ],
-            defaultReasoningEffort: "high",
-            inputModalities: ["text", "image"],
+            defaultReasoningEffort: .high,
+            inputModalities: [.text, .image],
             supportsPersonality: true,
             isDefault: true
         ),
-        CodexModel(
+        Model(
             id: "gpt-5.4-mini",
             model: "gpt-5.4-mini",
-            upgrade: nil,
+            upgrade: nil, upgradeInfo: nil, availabilityNux: nil,
             displayName: "gpt-5.4-mini",
             description: "Faster lower-cost model",
             hidden: false,
             supportedReasoningEfforts: [
-                ReasoningEffortOption(reasoningEffort: "low", description: "Fast"),
-                ReasoningEffortOption(reasoningEffort: "medium", description: "Balanced")
+                ReasoningEffortOption(reasoningEffort: .low, description: "Fast"),
+                ReasoningEffortOption(reasoningEffort: .medium, description: "Balanced")
             ],
-            defaultReasoningEffort: "medium",
-            inputModalities: ["text"],
+            defaultReasoningEffort: .medium,
+            inputModalities: [.text],
             supportsPersonality: true,
             isDefault: false
         )
@@ -152,32 +152,6 @@ enum LitterPreviewData {
         requesterAgentRole: "worker",
         createdAt: Date()
     )
-
-    static var sampleThreadSummaries: [ThreadSummary] {
-        [
-            makeThreadSummary(
-                id: "thread-preview-main",
-                preview: "Map the patch repair bottleneck in repo scheduler",
-                modelProvider: "gpt-5.4",
-                updatedAt: Date().addingTimeInterval(-900),
-                cwd: sampleCwd
-            ),
-            makeThreadSummary(
-                id: "thread-preview-fork",
-                preview: "Check whether repo-first mode is enabled",
-                modelProvider: "gpt-5.4-mini",
-                updatedAt: Date().addingTimeInterval(-3600),
-                cwd: sampleCwd + "/shared"
-            ),
-            makeThreadSummary(
-                id: "thread-preview-older",
-                preview: "Summarize queue metrics from the last hour",
-                modelProvider: "gpt-5.4",
-                updatedAt: Date().addingTimeInterval(-7200),
-                cwd: sampleCwd
-            )
-        ]
-    }
 
     static var longConversation: [ChatMessage] {
         var msgs: [ChatMessage] = []
@@ -390,26 +364,6 @@ enum LitterPreviewData {
         }
     }
 
-    private static func makeThreadSummary(
-        id: String,
-        preview: String,
-        modelProvider: String,
-        updatedAt: Date,
-        cwd: String
-    ) -> ThreadSummary {
-        let payload: [String: Any] = [
-            "id": id,
-            "preview": preview,
-            "model_provider": modelProvider,
-            "created_at": Int64(updatedAt.addingTimeInterval(-900).timeIntervalSince1970),
-            "updated_at": Int64(updatedAt.timeIntervalSince1970),
-            "cwd": cwd,
-            "path": cwd + "/.codex/sessions/\(id).jsonl",
-            "cli_version": "preview"
-        ]
-        let data = try! JSONSerialization.data(withJSONObject: payload, options: [])
-        return try! JSONDecoder().decode(ThreadSummary.self, from: data)
-    }
 }
 
 @MainActor

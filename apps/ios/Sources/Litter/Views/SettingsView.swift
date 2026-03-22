@@ -306,7 +306,7 @@ private struct SettingsConnectionAccountSection: View {
                         guard !key.isEmpty else { return }
                         Task {
                             isAuthWorking = true
-                            await connection.saveOpenAIApiKey(key)
+                            await connection.loginWithApiKey(key)
                             isAuthWorking = false
                         }
                     }

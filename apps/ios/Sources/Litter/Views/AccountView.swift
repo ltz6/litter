@@ -155,8 +155,28 @@ private struct AccountConnectionView: View {
                     .foregroundColor(LitterTheme.textMuted)
                     .frame(maxWidth: .infinity)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    SecureField("sk-...", text: $apiKey)
+            VStack(alignment: .leading, spacing: 8) {
+                SecureField("sk-...", text: $apiKey)
+                    .litterFont(.subheadline)
+                    .foregroundColor(LitterTheme.textPrimary)
+                    .padding(12)
+                    .background(LitterTheme.surface)
+                    .cornerRadius(8)
+                    .padding(.horizontal, 16)
+
+                Button {
+                    let key = apiKey.trimmingCharacters(in: .whitespaces)
+                    guard !key.isEmpty else { return }
+                    Task {
+                        isWorking = true
+                        await connection.loginWithApiKey(key)
+                        isWorking = false
+                        if case .apiKey = connection.authStatus {
+                            dismiss()
+                        }
+                    }
+                } label: {
+                    Text("Save API Key")
                         .litterFont(.subheadline)
                         .foregroundColor(LitterTheme.textPrimary)
                         .textInputAutocapitalization(.never)
@@ -165,41 +185,6 @@ private struct AccountConnectionView: View {
                         .background(LitterTheme.surface)
                         .cornerRadius(8)
                         .padding(.horizontal, 16)
-
-                    Button {
-                        let key = apiKey.trimmingCharacters(in: .whitespaces)
-                        guard !key.isEmpty else { return }
-                        Task {
-                            isWorking = true
-                            await connection.saveOpenAIApiKey(key)
-                            isWorking = false
-                            if connection.lastAuthError == nil, connection.hasOpenAIApiKey {
-                                apiKey = ""
-                                dismiss()
-                            }
-                        }
-                    } label: {
-                        Text("Save API Key")
-                            .litterFont(.subheadline)
-                            .foregroundColor(LitterTheme.accent)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(LitterTheme.accent.opacity(0.4), lineWidth: 1)
-                            )
-                    }
-                    .padding(.horizontal, 16)
-                    .disabled(apiKey.trimmingCharacters(in: .whitespaces).isEmpty || isWorking)
-
-                    Text("If both are saved, Litter will keep ChatGPT OAuth for normal Codex requests and use the API key for local realtime.")
-                        .litterFont(.caption)
-                        .foregroundColor(LitterTheme.textSecondary)
-                        .padding(.horizontal, 20)
-                }
-            }
-        }
-    }
 
     private var authColor: Color {
         switch authStatus {

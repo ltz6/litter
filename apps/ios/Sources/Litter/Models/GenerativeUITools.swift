@@ -4,12 +4,12 @@ enum GenerativeUITools {
     static let readMeToolName = "visualize_read_me"
     static let showWidgetToolName = "show_widget"
 
-    static func buildDynamicToolSpecs() -> [DynamicToolSpec] {
+    static func buildDynamicToolSpecs() -> [DynamicToolSpecParams] {
         [readMeToolSpec(), showWidgetToolSpec()]
     }
 
-    private static func readMeToolSpec() -> DynamicToolSpec {
-        DynamicToolSpec(
+    private static func readMeToolSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
             name: readMeToolName,
             description: """
                 Returns design guidelines for show_widget (CSS patterns, colors, typography, layout rules, examples). \
@@ -25,8 +25,8 @@ enum GenerativeUITools {
         )
     }
 
-    private static func showWidgetToolSpec() -> DynamicToolSpec {
-        DynamicToolSpec(
+    private static func showWidgetToolSpec() -> DynamicToolSpecParams {
+        DynamicToolSpecParams(
             name: showWidgetToolName,
             description: """
                 Show visual content — SVG graphics, diagrams, charts, or interactive HTML widgets — rendered inline in the conversation. \

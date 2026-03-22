@@ -134,113 +134,10 @@ struct ConversationComposerModalCoordinator<Content: View>: View {
                 }
             }
             .sheet(isPresented: $showExperimentalSheet) {
-                NavigationStack {
-                    Group {
-                        if experimentalFeaturesLoading {
-                            ProgressView().tint(LitterTheme.accent)
-                        } else if experimentalFeatures.isEmpty {
-                            Text("No experimental features available")
-                                .litterFont(.footnote)
-                                .foregroundColor(LitterTheme.textMuted)
-                        } else {
-                            List {
-                                ForEach(Array(experimentalFeatures.enumerated()), id: \.element.id) { _, feature in
-                                    HStack(alignment: .top, spacing: 10) {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(feature.displayName ?? feature.name)
-                                                .litterFont(.subheadline)
-                                                .foregroundColor(LitterTheme.textPrimary)
-                                            Text(feature.description ?? feature.stage)
-                                                .litterFont(.caption)
-                                                .foregroundColor(LitterTheme.textSecondary)
-                                        }
-                                        Spacer(minLength: 0)
-                                        Toggle(
-                                            "",
-                                            isOn: Binding(
-                                                get: { onIsExperimentalFeatureEnabled(feature.id, feature.enabled) },
-                                                set: { value in
-                                                    Task { await onSetExperimentalFeature(feature.name, value) }
-                                                }
-                                            )
-                                        )
-                                        .labelsHidden()
-                                        .tint(LitterTheme.accent)
-                                    }
-                                    .listRowBackground(LitterTheme.surface.opacity(0.6))
-                                }
-                            }
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
-                    .navigationTitle("Experimental")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("Reload") { Task { await onLoadExperimentalFeatures() } }
-                                .foregroundColor(LitterTheme.accent)
-                        }
-                        ToolbarItem(placement: .topBarTrailing) {
-                            Button("Done") { showExperimentalSheet = false }
-                                .foregroundColor(LitterTheme.accent)
-                        }
-                    }
-                }
+                experimentalSheetContent
             }
             .sheet(isPresented: $showSkillsSheet) {
-                NavigationStack {
-                    Group {
-                        if skillsLoading {
-                            ProgressView().tint(LitterTheme.accent)
-                        } else if skills.isEmpty {
-                            Text("No skills available for this workspace")
-                                .litterFont(.footnote)
-                                .foregroundColor(LitterTheme.textMuted)
-                        } else {
-                            List {
-                                ForEach(skills) { skill in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text(skill.name)
-                                                .litterFont(.subheadline)
-                                                .foregroundColor(LitterTheme.textPrimary)
-                                            Spacer()
-                                            if skill.enabled {
-                                                Text("enabled")
-                                                    .litterFont(.caption2)
-                                                    .foregroundColor(LitterTheme.accent)
-                                            }
-                                        }
-                                        Text(skill.description)
-                                            .litterFont(.caption)
-                                            .foregroundColor(LitterTheme.textSecondary)
-                                        Text(skill.path)
-                                            .litterFont(.caption2)
-                                            .foregroundColor(LitterTheme.textMuted)
-                                    }
-                                    .listRowBackground(LitterTheme.surface.opacity(0.6))
-                                }
-                            }
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
-                    .navigationTitle("Skills")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("Reload") { Task { await onLoadSkills(true, true) } }
-                                .foregroundColor(LitterTheme.accent)
-                        }
-                        ToolbarItem(placement: .topBarTrailing) {
-                            Button("Done") { showSkillsSheet = false }
-                                .foregroundColor(LitterTheme.accent)
-                        }
-                    }
-                }
+                skillsSheetContent
             }
             .alert("Rename Thread", isPresented: Binding(
                 get: { showRenamePrompt },
@@ -278,5 +175,118 @@ struct ConversationComposerModalCoordinator<Content: View>: View {
             } message: {
                 Text("Microphone permission is required for voice input. Enable it in Settings.")
             }
+    }
+
+    @ViewBuilder
+    private var experimentalSheetContent: some View {
+        NavigationStack {
+            Group {
+                if experimentalFeaturesLoading {
+                    ProgressView().tint(LitterTheme.accent)
+                } else if experimentalFeatures.isEmpty {
+                    Text("No experimental features available")
+                        .litterFont(.footnote)
+                        .foregroundColor(LitterTheme.textMuted)
+                } else {
+                    List {
+                        ForEach(Array(experimentalFeatures.enumerated()), id: \.element.id) { _, feature in
+                            HStack(alignment: .top, spacing: 10) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(feature.displayName ?? feature.name)
+                                        .litterFont(.subheadline)
+                                        .foregroundColor(LitterTheme.textPrimary)
+                                    Text(feature.description ?? "")
+                                        .litterFont(.caption)
+                                        .foregroundColor(LitterTheme.textSecondary)
+                                }
+                                Spacer(minLength: 0)
+                                Toggle(
+                                    "",
+                                    isOn: Binding(
+                                        get: { onIsExperimentalFeatureEnabled(feature.id, feature.enabled) },
+                                        set: { value in
+                                            Task { await onSetExperimentalFeature(feature.name, value) }
+                                        }
+                                    )
+                                )
+                                .labelsHidden()
+                                .tint(LitterTheme.accent)
+                            }
+                            .listRowBackground(LitterTheme.surface.opacity(0.6))
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+            .navigationTitle("Experimental")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Reload") { Task { await onLoadExperimentalFeatures() } }
+                        .foregroundColor(LitterTheme.accent)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showExperimentalSheet = false }
+                        .foregroundColor(LitterTheme.accent)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var skillsSheetContent: some View {
+        NavigationStack {
+            Group {
+                if skillsLoading {
+                    ProgressView().tint(LitterTheme.accent)
+                } else if skills.isEmpty {
+                    Text("No skills available for this workspace")
+                        .litterFont(.footnote)
+                        .foregroundColor(LitterTheme.textMuted)
+                } else {
+                    List {
+                        ForEach(skills) { skill in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(skill.name)
+                                        .litterFont(.subheadline)
+                                        .foregroundColor(LitterTheme.textPrimary)
+                                    Spacer()
+                                    if skill.enabled {
+                                        Text("enabled")
+                                            .litterFont(.caption2)
+                                            .foregroundColor(LitterTheme.accent)
+                                    }
+                                }
+                                Text(skill.description)
+                                    .litterFont(.caption)
+                                    .foregroundColor(LitterTheme.textSecondary)
+                                Text(skill.path.value)
+                                    .litterFont(.caption2)
+                                    .foregroundColor(LitterTheme.textMuted)
+                            }
+                            .listRowBackground(LitterTheme.surface.opacity(0.6))
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+            .navigationTitle("Skills")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Reload") { Task { await onLoadSkills(true, true) } }
+                        .foregroundColor(LitterTheme.accent)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showSkillsSheet = false }
+                        .foregroundColor(LitterTheme.accent)
+                }
+            }
+        }
     }
 }

@@ -34,8 +34,8 @@ struct ConversationComposerContextBarView: View {
         .padding(.trailing, 40)
     }
 
-    private func normalizedPercent(_ raw: Double) -> Int {
-        let used = raw > 1 ? min(Int(raw), 100) : min(Int(raw * 100), 100)
+    private func normalizedPercent(_ raw: Int32) -> Int {
+        let used = min(Int(raw), 100)
         return max(0, 100 - used)
     }
 

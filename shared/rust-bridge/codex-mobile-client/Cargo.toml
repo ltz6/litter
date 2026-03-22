@@ -1,0 +1,54 @@
+[package]
+name = "codex-mobile-client"
+version = "0.1.0"
+edition = "2024"
+description = "Shared mobile client library for Codex iOS and Android apps"
+
+[lib]
+name = "codex_mobile_client"
+crate-type = ["lib"]
+
+[dependencies]
+uniffi = { version = "0.31.0", features = ["tokio"] }
+
+# Upstream Codex crates
+codex-app-server = { workspace = true }
+codex-app-server-client = { workspace = true }
+codex-app-server-protocol = { workspace = true }
+codex-protocol = { workspace = true }
+codex-core = { workspace = true }
+codex-config = { workspace = true }
+codex-cloud-requirements = { workspace = true }
+codex-feedback = { workspace = true }
+codex-arg0 = { workspace = true }
+
+# Runtime & async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Transport
+tokio-tungstenite = { workspace = true }
+
+# Utilities
+thiserror = { workspace = true }
+tracing = { workspace = true }
+lru = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+base64 = { workspace = true }
+russh = { workspace = true }
+russh-keys = { workspace = true }
+futures = { workspace = true }
+
+[features]
+rpc-trace = []
+
+[build-dependencies]
+uniffi = { version = "0.31.0", features = ["build"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+webrtc-audio-processing = { version = "2.0.0", features = ["bundled"] }

@@ -13,7 +13,6 @@ on:
         type: choice
         options:
           - Litter
-          - LitterRemote
       app_bundle_id:
         description: "App bundle identifier"
         required: true

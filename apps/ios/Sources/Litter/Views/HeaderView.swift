@@ -1,8 +1,6 @@
 import SwiftUI
-import Inject
 
 struct HeaderView: View {
-    @ObserveInjection var inject
     @Environment(AppState.self) private var appState
     let thread: ThreadState
     let connection: ServerConnection
@@ -112,7 +110,6 @@ struct HeaderView: View {
         .task(id: thread.key) {
             await loadModelsIfNeeded()
         }
-        .enableInjection()
     }
 
     private var shouldPulse: Bool {
@@ -154,8 +151,8 @@ struct HeaderView: View {
         // Fall back to the model's default reasoning effort from the loaded model list.
         let currentModel = thread.model.trimmingCharacters(in: .whitespacesAndNewlines)
         if let model = connection.models.first(where: { $0.model == currentModel }),
-           !model.defaultReasoningEffort.isEmpty {
-            return model.defaultReasoningEffort
+           !model.defaultReasoningEffort.wireValue.isEmpty {
+            return model.defaultReasoningEffort.wireValue
         }
 
         return "default"
@@ -235,13 +232,13 @@ struct HeaderView: View {
 }
 
 struct InlineModelSelectorView: View {
-    let models: [CodexModel]
+    let models: [Model]
     @Binding var selectedModel: String
     @Binding var reasoningEffort: String
     @AppStorage("fastMode") private var fastMode = false
     var onDismiss: () -> Void
 
-    private var currentModel: CodexModel? {
+    private var currentModel: Model? {
         models.first { $0.id == selectedModel }
     }
 
@@ -252,7 +249,7 @@ struct InlineModelSelectorView: View {
                     ForEach(models) { model in
                         Button {
                             selectedModel = model.id
-                            reasoningEffort = model.defaultReasoningEffort
+                            reasoningEffort = model.defaultReasoningEffort.wireValue
                             onDismiss()
                         } label: {
                             HStack {
@@ -300,15 +297,15 @@ struct InlineModelSelectorView: View {
                     HStack(spacing: 6) {
                         ForEach(info.supportedReasoningEfforts) { effort in
                             Button {
-                                reasoningEffort = effort.reasoningEffort
+                                reasoningEffort = effort.reasoningEffort.wireValue
                                 onDismiss()
                             } label: {
-                                Text(effort.reasoningEffort)
+                                Text(effort.reasoningEffort.wireValue)
                                     .litterFont(.caption2, weight: .medium)
-                                    .foregroundColor(effort.reasoningEffort == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                                    .foregroundColor(effort.reasoningEffort.wireValue == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(effort.reasoningEffort == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
+                                    .background(effort.reasoningEffort.wireValue == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
                                     .clipShape(Capsule())
                             }
                         }
@@ -348,12 +345,12 @@ struct InlineModelSelectorView: View {
 }
 
 struct ModelSelectorSheet: View {
-    let models: [CodexModel]
+    let models: [Model]
     @Binding var selectedModel: String
     @Binding var reasoningEffort: String
     @AppStorage("fastMode") private var fastMode = false
 
-    private var currentModel: CodexModel? {
+    private var currentModel: Model? {
         models.first { $0.id == selectedModel }
     }
 
@@ -362,7 +359,7 @@ struct ModelSelectorSheet: View {
             ForEach(models) { model in
                 Button {
                     selectedModel = model.id
-                    reasoningEffort = model.defaultReasoningEffort
+                    reasoningEffort = model.defaultReasoningEffort.wireValue
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -402,14 +399,14 @@ struct ModelSelectorSheet: View {
                     HStack(spacing: 6) {
                         ForEach(info.supportedReasoningEfforts) { effort in
                             Button {
-                                reasoningEffort = effort.reasoningEffort
+                                reasoningEffort = effort.reasoningEffort.wireValue
                             } label: {
-                                Text(effort.reasoningEffort)
+                                Text(effort.reasoningEffort.wireValue)
                                     .litterFont(.caption2, weight: .medium)
-                                    .foregroundColor(effort.reasoningEffort == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
+                                    .foregroundColor(effort.reasoningEffort.wireValue == reasoningEffort ? LitterTheme.textOnAccent : LitterTheme.textPrimary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(effort.reasoningEffort == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
+                                    .background(effort.reasoningEffort.wireValue == reasoningEffort ? LitterTheme.accent : LitterTheme.surfaceLight)
                                     .clipShape(Capsule())
                             }
                         }

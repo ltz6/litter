@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Build system stamps
+.build-stamps/
+
 # Xcode user/workspace state
 *.xcuserstate
 *.xcworkspace/xcuserdata/
@@ -21,6 +24,11 @@ Packages/
 
 # Rust
 **/target/
+
+# Generated code (codegen + UniFFI — regenerate with build-rust.sh)
+*.generated.rs
+*.generated.swift
+shared/rust-bridge/generated/
 
 # Android JNI outputs (generated from Rust bridge)
 apps/android/core/bridge/src/main/jniLibs/*/*.so
@@ -51,3 +59,5 @@ node_modules/
 
 # Factory/Droid
 .factory/
+.claude/
+shared/third_party/codex/

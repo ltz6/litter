@@ -3,32 +3,61 @@ import Foundation
 
 enum VoiceSessionAudioCodec {
     static let targetSampleRate: Double = 24_000
+    static let aecProcessingSampleRate: Double = 48_000
     static let targetChannels: Int = 1
 
     static func makeInputChunk(buffer: AVAudioPCMBuffer) -> ThreadRealtimeAudioChunk? {
-        guard let samples = monoSamples(from: buffer) else { return nil }
-        return makeInputChunk(samples: samples, sampleRate: buffer.format.sampleRate, channels: targetChannels)
+        guard let samples = resampleToTarget(buffer: buffer) else { return nil }
+        return encodeChunk(samples: samples)
     }
 
     static func makeInputChunk(samples: [Float], sampleRate: Double, channels: Int) -> ThreadRealtimeAudioChunk? {
         guard !samples.isEmpty else { return nil }
         let resampled = resample(samples: samples, from: sampleRate, to: targetSampleRate)
         guard !resampled.isEmpty else { return nil }
-        let data = encodePCM16(samples: resampled)
-        return ThreadRealtimeAudioChunk(
-            data: data.base64EncodedString(),
-            sampleRate: UInt32(targetSampleRate.rounded()),
-            numChannels: UInt16(channels),
-            samplesPerChannel: UInt32(resampled.count)
-        )
+        return encodeChunk(samples: resampled, channels: channels)
     }
 
     static func makePlaybackBuffer(from chunk: ThreadRealtimeAudioChunk) -> AVAudioPCMBuffer? {
         guard let samples = decodePCM16Base64(chunk.data, numChannels: Int(chunk.numChannels)) else {
             return nil
         }
+        return makePlaybackBuffer(samples: samples, sampleRate: Double(chunk.sampleRate))
+    }
+
+    static func resampleToTarget(buffer: AVAudioPCMBuffer) -> [Float]? {
+        guard let samples = monoSamples(from: buffer) else { return nil }
+        let resampled = resample(samples: samples, from: buffer.format.sampleRate, to: targetSampleRate)
+        return resampled.isEmpty ? nil : resampled
+    }
+
+    static func resampleForAec(buffer: AVAudioPCMBuffer) -> [Float]? {
+        guard let samples = monoSamples(from: buffer) else { return nil }
+        let resampled = resample(samples: samples, from: buffer.format.sampleRate, to: aecProcessingSampleRate)
+        return resampled.isEmpty ? nil : resampled
+    }
+
+    static func resampleForAec(samples: [Float], sampleRate: Double) -> [Float] {
+        resample(samples: samples, from: sampleRate, to: aecProcessingSampleRate)
+    }
+
+    static func resampleToTarget(samples: [Float], sampleRate: Double) -> [Float] {
+        resample(samples: samples, from: sampleRate, to: targetSampleRate)
+    }
+
+    static func encodeChunk(samples: [Float], channels: Int = targetChannels) -> ThreadRealtimeAudioChunk {
+        let data = encodePCM16(samples: samples)
+        return ThreadRealtimeAudioChunk(
+            data: data.base64EncodedString(),
+            sampleRate: UInt32(targetSampleRate.rounded()),
+            numChannels: UInt32(channels),
+            samplesPerChannel: UInt32(samples.count)
+        )
+    }
+
+    static func makePlaybackBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCMBuffer? {
         let format = AVAudioFormat(
-            standardFormatWithSampleRate: Double(chunk.sampleRate),
+            standardFormatWithSampleRate: sampleRate,
             channels: 1
         )
         guard let format,

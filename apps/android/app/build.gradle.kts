@@ -134,6 +134,8 @@ dependencies {
         exclude(group = "org.jetbrains", module = "annotations-java5")
     }
     kapt("io.noties:prism4j-bundler:2.0.0")
+    // MIGRATION: JSch can be removed once RustSshBridge replaces SshSessionManager.
+    // See: core/bridge/.../RustSshBridge.kt and state/SshSessionManager.kt
     implementation("com.github.mwiede:jsch:0.2.22")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 

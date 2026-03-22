@@ -62,7 +62,7 @@ struct VoiceCallLockScreenCardView: View {
                     .foregroundStyle(tertiaryText)
                 Spacer()
                 Button(intent: EndVoiceSessionIntent()) {
-                    Image(systemName: "phone.down.fill")
+                    Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(8)
@@ -88,7 +88,7 @@ struct VoiceCallLockScreenCardView: View {
         case .listening: return "Listening"
         case .thinking: return "Thinking"
         case .speaking: return "Codex speaking"
-        case .error: return "Call ended"
+        case .error: return "Session ended"
         }
     }
 

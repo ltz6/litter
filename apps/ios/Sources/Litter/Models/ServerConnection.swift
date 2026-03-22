@@ -51,16 +51,17 @@ final class ServerConnection: Identifiable {
             onLoginCompleted?()
         }
     }
-    var models: [CodexModel] = []
+    var models: [Model] = []
     var modelsLoaded = false
     var rateLimits: RateLimitSnapshot?
 
-    @ObservationIgnored let client = JSONRPCClient()
-    @ObservationIgnored private(set) var channelClient: CodexChannel?
+    @ObservationIgnored private(set) var codexClient: CodexClient? = CodexSharedClient.shared
+    @ObservationIgnored private var rustServerId: String?
+    @ObservationIgnored private var sshSessionId: String?
     @ObservationIgnored private var serverURL: URL?
     @ObservationIgnored private var pendingLoginId: String?
 
-    @ObservationIgnored var onNotification: ((String, Data) -> Void)?
+    @ObservationIgnored var onTypedEvent: ((UiEvent) -> Void)?
     @ObservationIgnored var onServerRequest: ((_ requestId: String, _ method: String, _ data: Data) -> Bool)?
     @ObservationIgnored var onDisconnect: (() -> Void)?
     @ObservationIgnored var onLoginCompleted: (() -> Void)?
@@ -84,24 +85,19 @@ final class ServerConnection: Identifiable {
         connectionHealth = .connecting
         connectionPhase = "start"
         do {
+            guard let client = codexClient else {
+                connectionPhase = "client-init-failed"
+                connectionHealth = .disconnected
+                return
+            }
+
             switch target {
             case .local:
-                guard OnDeviceCodexFeature.isEnabled else {
-                    connectionPhase = OnDeviceCodexFeature.compiledIn ? "local-disabled" : "local-unavailable"
-                    connectionHealth = .disconnected
-                    return
-                }
-                applyLocalRealtimeAPIKeyEnvironment()
                 connectionPhase = "local-channel-starting"
-                let channel = try await CodexBridge.shared.ensureChannelStarted()
-                channelClient = channel
+                let assignedId = try await client.connectLocal(serverId: id, displayName: server.name, host: "127.0.0.1", port: 0)
+                rustServerId = assignedId
                 connectionPhase = "local-channel-setup"
-                await setupChannelNotifications(channel)
-                await setupChannelDisconnect(channel)
-                // Initialize handshake already done by Rust in_process::start
-                await restoreLocalChatGPTAuthIfNeeded()
-                await checkAuth()
-                await fetchRateLimits()
+                startEventPolling(client)
                 connectionHealth = .connected
                 connectionPhase = "ready"
                 return
@@ -116,23 +112,37 @@ final class ServerConnection: Identifiable {
             case .remoteURL(let url):
                 serverURL = url
                 connectionPhase = "remote-url"
-            case .sshThenRemote:
-                connectionPhase = "sshThenRemote-not-supported"
-                connectionHealth = .disconnected
-                return
+            case .sshThenRemote(let host, let credentials):
+                connectionPhase = "ssh-bootstrap"
+                let bootstrap = try await sshConnectAndBootstrap(
+                    client: client,
+                    host: host,
+                    credentials: credentials
+                )
+                sshSessionId = bootstrap.sessionId
+                let targetHost = server.sshPortForwardingEnabled
+                    ? "127.0.0.1"
+                    : bootstrap.normalizedHost
+                let targetPort = server.sshPortForwardingEnabled
+                    ? bootstrap.tunnelLocalPort ?? bootstrap.serverPort
+                    : bootstrap.serverPort
+                guard let url = websocketURL(host: targetHost, port: targetPort) else {
+                    connectionPhase = "invalid-url"
+                    connectionHealth = .disconnected
+                    return
+                }
+                serverURL = url
+                connectionPhase = "remote-url"
             }
             guard serverURL != nil else {
                 connectionPhase = "no-url"
                 connectionHealth = .disconnected
                 return
             }
-            connectionPhase = "setup-notifications"
-            await setupNotifications()
-            await setupDisconnectHandler()
-            await setupHealthHandler()
+            connectionPhase = "setup-events"
+            startEventPolling(client)
             connectionPhase = "connect-and-initialize"
-            try await connectAndInitialize()
-            await configureLocalRealtimeConversationFeatureIfNeeded()
+            try await connectAndInitialize(client: client)
             connectionHealth = .connected
             connectionPhase = "ready"
             Task { [weak self] in
@@ -140,43 +150,74 @@ final class ServerConnection: Identifiable {
                 await self?.fetchRateLimits()
             }
         } catch {
+            eventPollTask?.cancel()
+            eventPollTask = nil
+            eventSubscription = nil
+            if let serverId = rustServerId, let client = codexClient {
+                client.disconnectServer(serverId: serverId)
+            }
+            if let sessionId = sshSessionId, let client = codexClient {
+                try? await client.sshClose(sessionId: sessionId)
+            }
+            rustServerId = nil
+            sshSessionId = nil
             connectionPhase = "error: \(error.localizedDescription)"
             connectionHealth = .disconnected
+            serverURL = nil
         }
     }
 
     func disconnect() {
-        if let channelClient {
-            Task { await CodexBridge.shared.disconnectChannelIfCurrent(channelClient) }
-            self.channelClient = nil
+        eventPollTask?.cancel()
+        eventPollTask = nil
+        eventSubscription = nil
+        if let client = codexClient {
+            let serverId = rustServerId
+            let sshSessionId = sshSessionId
+            if let serverId {
+                client.disconnectServer(serverId: serverId)
+            }
+            if let sshSessionId {
+                Task { try? await client.sshClose(sessionId: sshSessionId) }
+            }
         }
-        Task { await client.disconnect() }
+        rustServerId = nil
+        sshSessionId = nil
         connectionHealth = .disconnected
         serverURL = nil
         rateLimits = nil
+        oauthURL = nil
+        pendingLoginId = nil
+        lastAuthError = nil
+        isChatGPTLoginInProgress = false
     }
 
     func forwardOAuthCallback(_ url: URL) {
         switch target {
         case .local:
             Task { _ = try? await URLSession.shared.data(from: url) }
-        case .remote, .remoteURL:
+        case .remote, .remoteURL, .sshThenRemote:
             Task {
                 _ = try? await execCommand(["curl", "-s", "-4", "-L", "--max-time", "10", url.absoluteString])
             }
-        case .sshThenRemote:
-            break
         }
     }
 
     // MARK: - RPC Methods
 
-    func listThreads(cwd: String? = nil, cursor: String? = nil, limit: Int? = 20) async throws -> ThreadListResponse {
-        try await routedSendRequest(
-            method: "thread/list",
-            params: ThreadListParams(cursor: cursor, limit: limit, sortKey: "updated_at", cwd: cwd),
-            responseType: ThreadListResponse.self
-        )
+    private func requireRustServerId(_ explicitServerId: String? = nil) throws -> String {
+        if let explicitServerId, !explicitServerId.isEmpty {
+            return explicitServerId
+        }
+        guard let rustServerId, !rustServerId.isEmpty else {
+            throw ClientError.Transport("Server session unavailable")
+        }
+        return rustServerId
+    }
+
+    func listThreads(cwd: String? = nil, cursor: String? = nil, limit: Int? = 20) async throws -> [ThreadInfo] {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.listThreads(serverId: try requireRustServerId())
     }
 
     func startThread(
@@ -184,8 +225,8 @@ final class ServerConnection: Identifiable {
         model: String? = nil,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil,
-        dynamicTools: [DynamicToolSpec]? = nil
-    ) async throws -> ThreadStartResponse {
+        dynamicTools: [DynamicToolSpecParams]? = nil
+    ) async throws -> ThreadKey {
         let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await startThread(
@@ -212,7 +253,7 @@ final class ServerConnection: Identifiable {
         cwd: String,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
-    ) async throws -> ThreadResumeResponse {
+    ) async throws -> ThreadResponseWithHydration {
         let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await resumeThread(
@@ -237,7 +278,7 @@ final class ServerConnection: Identifiable {
         cwd: String? = nil,
         approvalPolicy: String = "never",
         sandboxMode: String? = nil
-    ) async throws -> ThreadForkResponse {
+    ) async throws -> ThreadResponseWithHydration {
         let preferredSandbox = sandboxMode ?? (target == .local ? Self.localSandboxMode : Self.defaultSandboxMode)
         do {
             return try await forkThread(
@@ -257,20 +298,33 @@ final class ServerConnection: Identifiable {
         }
     }
 
-    private func startThread(cwd: String, model: String?, approvalPolicy: String, sandbox: String, dynamicTools: [DynamicToolSpec]? = nil) async throws -> ThreadStartResponse {
+    private func startThread(cwd: String, model: String?, approvalPolicy: String, sandbox: String, dynamicTools: [DynamicToolSpecParams]? = nil) async throws -> ThreadKey {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
         let instructions = target == .local ? Self.localSystemInstructions : nil
-        return try await routedSendRequest(
-            method: "thread/start",
-            params: ThreadStartParams(model: model, cwd: cwd, approvalPolicy: approvalPolicy, sandbox: sandbox, dynamicTools: dynamicTools, developerInstructions: instructions),
-            responseType: ThreadStartResponse.self
+        let typedTools: [DynamicToolSpec]? = try dynamicTools?.map { spec in
+            DynamicToolSpec(
+                name: spec.name,
+                description: spec.description,
+                inputSchema: try JsonValue(encodable: spec.inputSchema),
+                deferLoading: false
+            )
+        }
+        return try await client.rpcThreadStart(
+            serverId: try requireRustServerId(),
+            model: model, cwd: cwd,
+            approvalPolicy: AskForApproval(wireValue: approvalPolicy),
+            sandbox: SandboxMode(wireValue: sandbox),
+            developerInstructions: instructions,
+            dynamicTools: typedTools,
+            persistExtendedHistory: true
         )
     }
 
-    func readThread(threadId: String) async throws -> ThreadReadResponse {
-        try await routedSendRequest(
-            method: "thread/read",
-            params: ThreadReadParams(threadId: threadId),
-            responseType: ThreadReadResponse.self
+    func readThread(threadId: String) async throws -> ThreadResponseWithHydration {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcThreadReadHydrated(
+            serverId: try requireRustServerId(),
+            threadId: threadId
         )
     }
 
@@ -279,18 +333,15 @@ final class ServerConnection: Identifiable {
         cwd: String,
         approvalPolicy: String,
         sandbox: String
-    ) async throws -> ThreadResumeResponse {
+    ) async throws -> ThreadResponseWithHydration {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
         let instructions = target == .local ? Self.localSystemInstructions : nil
-        return try await routedSendRequest(
-            method: "thread/resume",
-            params: ThreadResumeParams(
-                threadId: threadId,
-                cwd: cwd,
-                approvalPolicy: approvalPolicy,
-                sandbox: sandbox,
-                developerInstructions: instructions
-            ),
-            responseType: ThreadResumeResponse.self
+        return try await client.rpcThreadResumeHydrated(
+            serverId: try requireRustServerId(),
+            threadId: threadId, cwd: cwd,
+            approvalPolicy: AskForApproval(wireValue: approvalPolicy),
+            sandbox: SandboxMode(wireValue: sandbox),
+            developerInstructions: instructions
         )
     }
 
@@ -299,23 +350,23 @@ final class ServerConnection: Identifiable {
         cwd: String?,
         approvalPolicy: String,
         sandbox: String
-    ) async throws -> ThreadForkResponse {
+    ) async throws -> ThreadResponseWithHydration {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
         let instructions = target == .local ? Self.localSystemInstructions : nil
-        return try await routedSendRequest(
-            method: "thread/fork",
-            params: ThreadForkParams(
-                threadId: threadId,
-                cwd: cwd,
-                approvalPolicy: approvalPolicy,
-                sandbox: sandbox,
-                developerInstructions: instructions
-            ),
-            responseType: ThreadForkResponse.self
+        return try await client.rpcThreadForkHydrated(
+            serverId: try requireRustServerId(),
+            threadId: threadId, cwd: cwd,
+            approvalPolicy: AskForApproval(wireValue: approvalPolicy),
+            sandbox: SandboxMode(wireValue: sandbox),
+            developerInstructions: instructions
         )
     }
 
     private func shouldRetryWithoutLinuxSandbox(_ error: Error) -> Bool {
-        guard case let JSONRPCClientError.serverError(_, message) = error else {
+        let message: String
+        if case ClientError.Rpc(let msg) = error {
+            message = msg
+        } else {
             return false
         }
         let lower = message.lowercased()
@@ -323,7 +374,6 @@ final class ServerConnection: Identifiable {
             lower.contains("missing codex-linux-sandbox executable path")
     }
 
-    @discardableResult
     func sendTurn(
         threadId: String,
         text: String,
@@ -333,7 +383,8 @@ final class ServerConnection: Identifiable {
         effort: String? = nil,
         serviceTier: String? = nil,
         additionalInput: [UserInput] = []
-    ) async throws -> TurnStartResponse {
+    ) async throws -> Void {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
         let inputs = ConversationAttachmentSupport.buildTurnInputs(text: text, additionalInput: additionalInput)
         guard !inputs.isEmpty else {
             throw NSError(
@@ -342,178 +393,187 @@ final class ServerConnection: Identifiable {
                 userInfo: [NSLocalizedDescriptionKey: "Cannot send an empty turn"]
             )
         }
-        return try await routedSendRequest(
-            method: "turn/start",
-            params: TurnStartParams(
-                threadId: threadId,
-                input: inputs,
-                approvalPolicy: approvalPolicy,
-                sandboxPolicy: TurnSandboxPolicy(mode: sandboxMode),
-                model: model,
-                effort: effort,
-                serviceTier: serviceTier
-            ),
-            responseType: TurnStartResponse.self
+        let sandboxPolicyJson: String? = TurnSandboxPolicy(mode: sandboxMode).flatMap { policy in
+            try? String(data: JSONEncoder().encode(policy), encoding: .utf8)
+        }
+        return try await client.rpcTurnStart(
+            serverId: try requireRustServerId(),
+            threadId: threadId, input: inputs,
+            approvalPolicy: approvalPolicy.flatMap(AskForApproval.init(wireValue:)),
+            sandboxPolicyJson: sandboxPolicyJson,
+            model: model,
+            effort: effort.flatMap(ReasoningEffort.init(wireValue:)),
+            serviceTier: serviceTier.flatMap(ServiceTier.init(wireValue:))
         )
     }
 
     func interrupt(threadId: String, turnId: String) async {
-        struct Empty: Decodable {}
-        _ = try? await routedSendRequest(
-            method: "turn/interrupt",
-            params: TurnInterruptParams(threadId: threadId, turnId: turnId),
-            responseType: Empty.self
+        guard let client = codexClient else { return }
+        try? await client.rpcTurnInterrupt(
+            serverId: try requireRustServerId(),
+            threadId: threadId, turnId: turnId
         )
     }
 
-    func startRealtimeConversation(threadId: String, prompt: String, sessionId: String? = nil) async throws {
-        let _: ThreadRealtimeStartResponse = try await client.sendRequest(
-            method: "thread/realtime/start",
-            params: ThreadRealtimeStartParams(threadId: threadId, prompt: prompt, sessionId: sessionId),
-            responseType: ThreadRealtimeStartResponse.self
+    func startRealtimeConversation(threadId: String, prompt: String, sessionId: String? = nil, clientControlledHandoff: Bool = false) async throws {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeStart(
+            serverId: try requireRustServerId(),
+            threadId: threadId, prompt: prompt,
+            sessionId: sessionId, clientControlledHandoff: clientControlledHandoff
         )
     }
 
     func appendRealtimeAudio(threadId: String, audio: ThreadRealtimeAudioChunk) async throws {
-        let _: ThreadRealtimeAppendAudioResponse = try await client.sendRequest(
-            method: "thread/realtime/appendAudio",
-            params: ThreadRealtimeAppendAudioParams(threadId: threadId, audio: audio),
-            responseType: ThreadRealtimeAppendAudioResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeAppendAudio(
+            serverId: try requireRustServerId(),
+            threadId: threadId, audioData: audio.data,
+            sampleRate: audio.sampleRate, numChannels: audio.numChannels,
+            samplesPerChannel: audio.samplesPerChannel
         )
     }
 
     func appendRealtimeText(threadId: String, text: String) async throws {
-        let _: ThreadRealtimeAppendTextResponse = try await client.sendRequest(
-            method: "thread/realtime/appendText",
-            params: ThreadRealtimeAppendTextParams(threadId: threadId, text: text),
-            responseType: ThreadRealtimeAppendTextResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeAppendText(
+            serverId: try requireRustServerId(),
+            threadId: threadId, text: text
         )
     }
 
     func stopRealtimeConversation(threadId: String) async throws {
-        let _: ThreadRealtimeStopResponse = try await client.sendRequest(
-            method: "thread/realtime/stop",
-            params: ThreadRealtimeStopParams(threadId: threadId),
-            responseType: ThreadRealtimeStopResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeStop(
+            serverId: try requireRustServerId(),
+            threadId: threadId
         )
     }
 
-    func rollbackThread(threadId: String, numTurns: Int) async throws -> ThreadRollbackResponse {
-        try await routedSendRequest(
-            method: "thread/rollback",
-            params: ThreadRollbackParams(threadId: threadId, numTurns: numTurns),
-            responseType: ThreadRollbackResponse.self
+    func resolveRealtimeHandoff(threadId: String, handoffId: String, outputText: String) async throws {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeResolveHandoff(
+            serverId: try requireRustServerId(),
+            threadId: threadId, handoffId: handoffId, outputText: outputText
+        )
+    }
+
+    func finalizeRealtimeHandoff(threadId: String, handoffId: String) async throws {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcRealtimeFinalizeHandoff(
+            serverId: try requireRustServerId(),
+            threadId: threadId, handoffId: handoffId
+        )
+    }
+
+    func rollbackThread(threadId: String, numTurns: Int) async throws -> ThreadResponseWithHydration {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcThreadRollbackHydrated(
+            serverId: try requireRustServerId(),
+            threadId: threadId, numTurns: UInt32(numTurns)
         )
     }
 
     func archiveThread(threadId: String) async throws {
-        let _: ThreadArchiveResponse = try await routedSendRequest(
-            method: "thread/archive",
-            params: ThreadArchiveParams(threadId: threadId),
-            responseType: ThreadArchiveResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcThreadArchive(
+            serverId: try requireRustServerId(),
+            threadId: threadId
         )
     }
 
     func listModels() async throws -> ModelListResponse {
-        try await routedSendRequest(
-            method: "model/list",
-            params: ModelListParams(limit: 50, includeHidden: false),
-            responseType: ModelListResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcModelList(
+            serverId: try requireRustServerId(),
+            limit: 50, includeHidden: false
         )
     }
 
     func execCommand(_ command: [String], cwd: String? = nil) async throws -> CommandExecResponse {
-        try await routedSendRequest(
-            method: "command/exec",
-            params: CommandExecParams(command: command, cwd: cwd),
-            responseType: CommandExecResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcCommandExec(
+            serverId: try requireRustServerId(),
+            command: command, cwd: cwd
         )
     }
 
     func fuzzyFileSearch(query: String, roots: [String], cancellationToken: String?) async throws -> FuzzyFileSearchResponse {
-        try await routedSendRequest(
-            method: "fuzzyFileSearch",
-            params: FuzzyFileSearchParams(query: query, roots: roots, cancellationToken: cancellationToken),
-            responseType: FuzzyFileSearchResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcFuzzyFileSearch(
+            serverId: try requireRustServerId(),
+            query: query, roots: roots, cancellationToken: cancellationToken
         )
     }
 
     func listSkills(cwds: [String]?, forceReload: Bool = false) async throws -> SkillsListResponse {
-        try await routedSendRequest(
-            method: "skills/list",
-            params: SkillsListParams(cwds: cwds, forceReload: forceReload),
-            responseType: SkillsListResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcSkillsList(
+            serverId: try requireRustServerId(),
+            cwds: cwds, forceReload: forceReload
         )
     }
 
-    func respondToServerRequest(id: String, result: [String: Any]) {
-        Task {
-            routedSendResult(id: id, result: result)
-        }
-    }
+    // respondToServerRequest is defined in the Transport section below
 
-    func respondToServerRequestError(id: String, code: Int = -32000, message: String) {
-        Task {
-            routedSendError(id: id, code: code, message: message)
-        }
-    }
-
-    func listExperimentalFeatures(cursor: String? = nil, limit: Int? = 100) async throws -> ExperimentalFeatureListResponse {
-        try await routedSendRequest(
-            method: "experimentalFeature/list",
-            params: ExperimentalFeatureListParams(cursor: cursor, limit: limit),
-            responseType: ExperimentalFeatureListResponse.self
+    func listExperimentalFeatures(serverId: String? = nil, cursor: String? = nil, limit: Int? = 100) async throws -> ExperimentalFeatureListResponse {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcExperimentalFeatureList(
+            serverId: try requireRustServerId(serverId),
+            cursor: cursor, limit: limit.map { UInt32($0) }
         )
     }
 
-    func readConfig(cwd: String?) async throws -> ConfigReadResponse {
-        try await routedSendRequest(
-            method: "config/read",
-            params: ConfigReadParams(includeLayers: false, cwd: cwd),
-            responseType: ConfigReadResponse.self
+    func readConfig(serverId: String? = nil, cwd: String?) async throws -> ConfigReadResponse {
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcConfigRead(
+            serverId: try requireRustServerId(serverId),
+            cwd: cwd
         )
     }
 
     func writeConfigValue<Value: Encodable>(
+        serverId: String? = nil,
         keyPath: String,
         value: Value,
-        mergeStrategy: String = "upsert"
+        mergeStrategy: MergeStrategy = .upsert
     ) async throws -> ConfigWriteResponse {
-        try await routedSendRequest(
-            method: "config/value/write",
-            params: ConfigValueWriteParams(keyPath: keyPath, value: value, mergeStrategy: mergeStrategy, filePath: nil, expectedVersion: nil),
-            responseType: ConfigWriteResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcConfigValueWrite(
+            serverId: try requireRustServerId(serverId),
+            keyPath: keyPath,
+            value: try JsonValue(encodable: value),
+            mergeStrategy: mergeStrategy
         )
     }
 
     func writeConfigBatch(
+        serverId: String? = nil,
         edits: [ConfigEdit],
         reloadUserConfig: Bool = false
     ) async throws -> ConfigWriteResponse {
-        try await client.sendRequest(
-            method: "config/batchWrite",
-            params: ConfigBatchWriteParams(
-                edits: edits,
-                filePath: nil,
-                expectedVersion: nil,
-                reloadUserConfig: reloadUserConfig
-            ),
-            responseType: ConfigWriteResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcConfigBatchWrite(
+            serverId: try requireRustServerId(serverId),
+            edits: edits,
+            reloadUserConfig: reloadUserConfig
         )
     }
 
     @discardableResult
     func setExperimentalFeature(
+        serverId: String? = nil,
         named featureName: String,
         enabled: Bool,
         reloadUserConfig: Bool = true
     ) async throws -> ConfigWriteResponse {
-        try await writeConfigBatch(
+        return try await writeConfigBatch(
+            serverId: serverId,
             edits: [
                 ConfigEdit(
                     keyPath: "features.\(featureName)",
-                    value: AnyEncodable(enabled),
-                    mergeStrategy: "upsert"
+                    value: try JsonValue(encodable: enabled),
+                    mergeStrategy: .upsert
                 )
             ],
             reloadUserConfig: reloadUserConfig
@@ -521,31 +581,34 @@ final class ServerConnection: Identifiable {
     }
 
     func setThreadName(threadId: String, name: String) async throws {
-        let _: ThreadSetNameResponse = try await routedSendRequest(
-            method: "thread/name/set",
-            params: ThreadSetNameParams(threadId: threadId, name: name),
-            responseType: ThreadSetNameResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        try await client.rpcThreadSetName(
+            serverId: try requireRustServerId(),
+            threadId: threadId, name: name
         )
     }
 
     func startReview(threadId: String) async throws -> ReviewStartResponse {
-        try await routedSendRequest(
-            method: "review/start",
-            params: ReviewStartParams(threadId: threadId, target: .uncommittedChanges, delivery: "inline"),
-            responseType: ReviewStartResponse.self
+        guard let client = codexClient else { throw ClientError.Transport("Not connected") }
+        return try await client.rpcReviewStart(
+            serverId: try requireRustServerId(),
+            threadId: threadId
         )
     }
 
     // MARK: - Auth
 
     func checkAuth() async {
+        guard let client = codexClient else {
+            authStatus = .notLoggedIn
+            return
+        }
         do {
             let resp: GetAccountResponse = try await withThrowingTaskGroup(of: GetAccountResponse.self) { group in
                 group.addTask {
-                    try await self.routedSendRequest(
-                        method: "account/read",
-                        params: GetAccountParams(refreshToken: false),
-                        responseType: GetAccountResponse.self
+                    try await client.rpcAccountRead(
+                        serverId: try self.requireRustServerId(),
+                        refreshToken: false
                     )
                 }
                 group.addTask {
@@ -557,10 +620,11 @@ final class ServerConnection: Identifiable {
                 return result
             }
             if let account = resp.account {
-                switch account.type {
-                case "chatgpt": authStatus = .chatgpt(email: account.email ?? "")
-                case "apiKey":  authStatus = .apiKey
-                default:        authStatus = .notLoggedIn
+                switch account {
+                case .chatgpt(let email, _):
+                    authStatus = .chatgpt(email: email)
+                case .apiKey:
+                    authStatus = .apiKey
                 }
             } else {
                 authStatus = .notLoggedIn
@@ -573,19 +637,20 @@ final class ServerConnection: Identifiable {
     }
 
     func getAuthToken() async -> (method: String?, token: String?) {
+        guard let client = codexClient else { return (nil, nil) }
         do {
-            let resp: GetAuthStatusResponse = try await routedSendRequest(
-                method: "getAuthStatus",
-                params: GetAuthStatusParams(includeToken: true, refreshToken: false),
-                responseType: GetAuthStatusResponse.self
+            let resp = try await client.rpcGetAuthStatus(
+                serverId: try requireRustServerId(),
+                includeToken: true, refreshToken: false
             )
-            return (resp.authMethod, resp.authToken)
+            return (Self.authModeName(resp.authMethod), resp.authToken)
         } catch {
             return (nil, nil)
         }
     }
 
     func loginWithChatGPT() async {
+        guard let client = codexClient else { return }
         guard !isChatGPTLoginInProgress else { return }
         isChatGPTLoginInProgress = true
         defer { isChatGPTLoginInProgress = false }
@@ -598,14 +663,11 @@ final class ServerConnection: Identifiable {
             oauthURL = nil
             pendingLoginId = nil
             let tokens = try await ChatGPTOAuth.login()
-            let _: LoginStartResponse = try await routedSendRequest(
-                method: "account/login/start",
-                params: LoginStartChatGPTAuthTokensParams(
-                    accessToken: tokens.accessToken,
-                    chatgptAccountId: tokens.accountID,
-                    chatgptPlanType: tokens.planType
-                ),
-                responseType: LoginStartResponse.self
+            _ = try await client.rpcLoginStartChatgptAuthTokens(
+                serverId: try requireRustServerId(),
+                accessToken: tokens.accessToken,
+                chatgptAccountId: tokens.accountID,
+                chatgptPlanType: tokens.planType
             )
             await checkAuth()
         } catch ChatGPTOAuthError.cancelled {
@@ -617,12 +679,12 @@ final class ServerConnection: Identifiable {
     }
 
     func loginWithApiKey(_ key: String) async {
+        guard let client = codexClient else { return }
         do {
             lastAuthError = nil
-            let _: LoginStartResponse = try await routedSendRequest(
-                method: "account/login/start",
-                params: LoginStartApiKeyParams(apiKey: key),
-                responseType: LoginStartResponse.self
+            _ = try await client.rpcLoginStartApiKey(
+                serverId: try requireRustServerId(),
+                apiKey: key
             )
             await checkAuth()
         } catch {
@@ -630,59 +692,12 @@ final class ServerConnection: Identifiable {
         }
     }
 
-    func saveOpenAIApiKey(_ key: String) async {
-        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedKey.isEmpty else {
-            lastAuthError = "API key cannot be empty"
-            return
-        }
-
-        guard target == .local else {
-            lastAuthError = "Realtime API key is only used for on-device Codex."
-            return
-        }
-
-        do {
-            lastAuthError = nil
-            try RealtimeAPIKeyStore.shared.save(trimmedKey)
-            try RealtimeAPIKeyStore.shared.applyProcessEnvironment()
-            hasOpenAIApiKey = Self.realtimeAPIKeyIsSaved(for: target)
-        } catch {
-            lastAuthError = error.localizedDescription
-            hasOpenAIApiKey = Self.realtimeAPIKeyIsSaved(for: target)
-        }
-    }
-
-    func clearOpenAIApiKey() async {
-        guard target == .local else {
-            lastAuthError = "Realtime API key is only used for on-device Codex."
-            return
-        }
-
-        do {
-            lastAuthError = nil
-            try RealtimeAPIKeyStore.shared.clear()
-            try RealtimeAPIKeyStore.shared.applyProcessEnvironment()
-            hasOpenAIApiKey = Self.realtimeAPIKeyIsSaved(for: target)
-        } catch {
-            lastAuthError = error.localizedDescription
-            hasOpenAIApiKey = Self.realtimeAPIKeyIsSaved(for: target)
-        }
-    }
-
     func logout() async {
-        struct Empty: Decodable {}
-        struct EmptyParams: Encodable {}
-        _ = try? await routedSendRequest(
-            method: "account/logout",
-            params: EmptyParams(),
-            responseType: Empty.self
-        )
-        if target == .local {
-            try? ChatGPTOAuth.clearStoredTokens()
+        try? ChatGPTOAuthTokenStore.shared.clear()
+        if let client = codexClient {
+            try? await client.rpcAccountLogout(serverId: try requireRustServerId())
         }
         authStatus = .notLoggedIn
-        hasOpenAIApiKey = Self.localRealtimeAPIKeyIsSaved(for: target)
         lastAuthError = nil
         oauthURL = nil
         pendingLoginId = nil
@@ -691,12 +706,12 @@ final class ServerConnection: Identifiable {
 
     func cancelLogin() async {
         guard let loginId = pendingLoginId else { return }
-        struct Empty: Decodable {}
-        _ = try? await routedSendRequest(
-            method: "account/login/cancel",
-            params: CancelLoginParams(loginId: loginId),
-            responseType: Empty.self
-        )
+        if let client = codexClient {
+            try? await client.rpcAccountLoginCancel(
+                serverId: try requireRustServerId(),
+                loginId: loginId
+            )
+        }
         pendingLoginId = nil
         oauthURL = nil
     }
@@ -704,11 +719,9 @@ final class ServerConnection: Identifiable {
     // MARK: - Rate Limits
 
     func fetchRateLimits() async {
-        struct EmptyParams: Encodable {}
-        guard let resp = try? await routedSendRequest(
-            method: "account/rateLimits/read",
-            params: EmptyParams(),
-            responseType: GetAccountRateLimitsResponse.self
+        guard let client = codexClient else { return }
+        guard let resp = try? await client.rpcAccountRateLimitsRead(
+            serverId: try requireRustServerId()
         ) else { return }
         rateLimits = resp.rateLimits
     }
@@ -716,29 +729,121 @@ final class ServerConnection: Identifiable {
     // MARK: - Account Notifications
 
     func handleAccountNotification(method: String, data: Data) {
+        guard let params = try? JSONSerialization.jsonObject(with: extractParams(data)) else { return }
+        handleAccountNotificationFromParams(method: method, params: params)
+    }
+
+    func handleAccountNotificationFromParams(method: String, params: Any) {
         switch method {
         case "account/login/completed":
-            if let notif = try? JSONDecoder().decode(AccountLoginCompletedNotification.self, from: extractParams(data)) {
-                oauthURL = nil
-                pendingLoginId = nil
-                isChatGPTLoginInProgress = false
-                if notif.success {
-                    lastAuthError = nil
-                    loginCompleted = true
-                    Task { await self.checkAuth() }
-                } else {
-                    lastAuthError = notif.error ?? "ChatGPT login failed."
-                }
-            }
+            let paramsDict = params as? [String: Any] ?? [:]
+            let success = (paramsDict["success"] as? Bool) ?? false
+            handleAccountLoginCompleted(
+                AccountLoginCompletedNotification(
+                    loginId: paramsDict["loginId"] as? String,
+                    success: success,
+                    error: paramsDict["error"] as? String
+                )
+            )
         case "account/updated":
-            lastAuthError = nil
-            Task { await self.checkAuth() }
+            handleAccountUpdated(
+                AccountUpdatedNotification(
+                    authMode: Self.authMode(from: (params as? [String: Any])?["authMode"] as? String),
+                    planType: PlanType(wireValue: (params as? [String: Any])?["planType"] as? String)
+                )
+            )
         case "account/rateLimits/updated":
-            if let notif = try? JSONDecoder().decode(AccountRateLimitsUpdatedNotification.self, from: extractParams(data)) {
-                rateLimits = notif.rateLimits
+            if let rateLimits = extractRateLimitSnapshot(params: params) {
+                handleAccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification(rateLimits: rateLimits))
             }
         default:
             break
+        }
+    }
+
+    func handleAccountLoginCompleted(_ notification: AccountLoginCompletedNotification) {
+        oauthURL = nil
+        pendingLoginId = nil
+        isChatGPTLoginInProgress = false
+        if notification.success {
+            lastAuthError = nil
+            loginCompleted = true
+            Task { await self.checkAuth() }
+        } else {
+            lastAuthError = notification.error ?? "ChatGPT login failed."
+        }
+    }
+
+    func handleAccountUpdated(_ notification: AccountUpdatedNotification) {
+        _ = notification
+        lastAuthError = nil
+        Task { await self.checkAuth() }
+    }
+
+    func handleAccountRateLimitsUpdated(_ notification: AccountRateLimitsUpdatedNotification) {
+        rateLimits = notification.rateLimits
+    }
+
+    private func extractRateLimitSnapshot(params: Any) -> RateLimitSnapshot? {
+        guard let paramsDict = params as? [String: Any],
+              let rateLimits = paramsDict["rateLimits"] as? [String: Any] else {
+            return nil
+        }
+
+        func window(from value: Any?) -> RateLimitWindow? {
+            guard let dict = value as? [String: Any] else { return nil }
+            let usedPercent = Int32((dict["usedPercent"] as? NSNumber)?.int32Value ?? 0)
+            let windowDurationMins = (dict["windowDurationMins"] as? NSNumber)?.int64Value
+            let resetsAt = (dict["resetsAt"] as? NSNumber)?.int64Value
+            return RateLimitWindow(
+                usedPercent: usedPercent,
+                windowDurationMins: windowDurationMins,
+                resetsAt: resetsAt
+            )
+        }
+
+        let credits: CreditsSnapshot? = {
+            guard let dict = rateLimits["credits"] as? [String: Any] else { return nil }
+            return CreditsSnapshot(
+                hasCredits: (dict["hasCredits"] as? Bool) ?? false,
+                unlimited: (dict["unlimited"] as? Bool) ?? false,
+                balance: dict["balance"] as? String
+            )
+        }()
+
+        return RateLimitSnapshot(
+            limitId: rateLimits["limitId"] as? String,
+            limitName: rateLimits["limitName"] as? String,
+            primary: window(from: rateLimits["primary"]),
+            secondary: window(from: rateLimits["secondary"]),
+            credits: credits,
+            planType: PlanType(wireValue: rateLimits["planType"] as? String)
+        )
+    }
+
+    private static func authModeName(_ mode: AuthMode?) -> String? {
+        switch mode {
+        case .apiKey:
+            return "apiKey"
+        case .chatgpt:
+            return "chatgpt"
+        case .chatgptAuthTokens:
+            return "chatgptAuthTokens"
+        case nil:
+            return nil
+        }
+    }
+
+    private static func authMode(from raw: String?) -> AuthMode? {
+        switch raw {
+        case "apiKey":
+            return .apiKey
+        case "chatgpt":
+            return .chatgpt
+        case "chatgptAuthTokens":
+            return .chatgptAuthTokens
+        default:
+            return nil
         }
     }
 
@@ -782,60 +887,71 @@ final class ServerConnection: Identifiable {
     - Be concise — this is a mobile device.
     """
 
-    // MARK: - Transport Routing
+    // MARK: - Transport (UniFFI CodexClient)
 
-    /// Routes sendRequest to the channel client (local) or WebSocket client (remote).
-    private func routedSendRequest<P: Encodable, R: Decodable>(
-        method: String, params: P, responseType: R.Type
-    ) async throws -> R {
-        if let channelClient {
-            return try await channelClient.sendRequest(method: method, params: params, responseType: responseType)
-        }
-        return try await client.sendRequest(method: method, params: params, responseType: responseType)
-    }
-
-    /// Routes sendResult to the appropriate client.
-    private func routedSendResult(id: String, result: Any) {
-        if let channelClient {
-            Task { await channelClient.sendResult(id: id, result: result) }
-        } else {
-            Task { await self.client.sendResult(id: id, result: result) }
+    /// Respond to a server request.
+    func respondToServerRequest(id: String, result: [String: Any]) {
+        guard let client = codexClient else { return }
+        if let data = try? JSONSerialization.data(withJSONObject: result),
+           let resultJson = String(data: data, encoding: .utf8) {
+            Task { try? await client.rpcRespond(serverId: try self.requireRustServerId(), requestId: id, resultJson: resultJson) }
         }
     }
 
-    private func routedSendError(id: String, code: Int, message: String) {
-        if let channelClient {
-            Task { await channelClient.sendError(id: id, code: code, message: message) }
-        } else {
-            Task { await self.client.sendError(id: id, code: code, message: message) }
+    /// Reject a server request with a JSON-RPC error.
+    func respondToServerRequestError(id: String, message: String, code: Int32 = -32_000) {
+        guard let client = codexClient else { return }
+        Task {
+            try? await client.rpcRespondError(
+                serverId: try self.requireRustServerId(),
+                requestId: id,
+                code: code,
+                message: message
+            )
         }
     }
 
-    private func setupChannelNotifications(_ channel: CodexChannel) async {
-        await channel.setNotificationHandler { [weak self] method, data in
-            Task { @MainActor [weak self] in
-                self?.onNotification?(method, data)
-            }
-        }
-        await channel.setRequestHandler { [weak self] id, method, data in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let handled = self.onServerRequest?(id, method, data) ?? false
-                if !handled {
-                    self.routedSendResult(id: id, result: [:] as [String: String])
+    /// Poll for events from the async CodexClient.
+    @ObservationIgnored private var eventPollTask: Task<Void, Never>?
+    @ObservationIgnored private var eventSubscription: EventSubscription?
+
+    private func startEventPolling(_ client: CodexClient) {
+        eventPollTask?.cancel()
+        let subscription = client.subscribeEvents()
+        eventSubscription = subscription
+        eventPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let event = try await subscription.nextEvent()
+                    guard let self else { break }
+                    self.handleEvent(event)
+                } catch {
+                    break
                 }
             }
         }
     }
 
-    private func setupChannelDisconnect(_ channel: CodexChannel) async {
-        await channel.setDisconnectHandler { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.connectionHealth == .connected || self.connectionHealth == .unresponsive else { return }
-                NSLog("[channel] disconnected, id=%@", self.id)
-                self.connectionHealth = .disconnected
-                self.onDisconnect?()
+    /// Process a typed event from the Rust layer (UniFFI-generated UiEvent enum).
+    private func handleEvent(_ event: UiEvent) {
+        switch event {
+        case .connectionStateChanged(serverId: _, health: let health):
+            switch health {
+            case "connected":
+                if connectionHealth == .connecting || connectionHealth == .unresponsive { connectionHealth = .connected }
+            case "disconnected":
+                if connectionHealth == .connected || connectionHealth == .unresponsive {
+                    connectionHealth = .disconnected
+                    onDisconnect?()
+                }
+            case "unresponsive":
+                if connectionHealth == .connected { connectionHealth = .unresponsive }
+            case "reconnecting":
+                connectionHealth = .connecting
+            default: break
             }
+        default:
+            onTypedEvent?(event)
         }
     }
 
@@ -856,7 +972,7 @@ final class ServerConnection: Identifiable {
         return URL(string: "ws://\(normalized):\(port)")
     }
 
-    private func connectAndInitialize() async throws {
+    private func connectAndInitialize(client: CodexClient) async throws {
         guard let url = serverURL else { throw URLError(.badURL) }
         let policy = retryPolicy()
         var lastError: Error = URLError(.cannotConnectToHost)
@@ -865,12 +981,9 @@ final class ServerConnection: Identifiable {
             if attempt > 0 {
                 try await Task.sleep(for: policy.retryDelay)
             }
-            await client.disconnect()
             do {
                 try await connectAndInitializeOnce(
-                    url: url,
-                    initializeTimeout: policy.initializeTimeout,
-                    attemptTimeout: policy.attemptTimeout
+                    client: client, url: url, attemptTimeout: policy.attemptTimeout
                 )
                 return
             } catch {
@@ -900,17 +1013,25 @@ final class ServerConnection: Identifiable {
     }
 
     private func connectAndInitializeOnce(
+        client: CodexClient,
         url: URL,
-        initializeTimeout: Duration,
         attemptTimeout: Duration
     ) async throws {
+        let host = url.host ?? "127.0.0.1"
+        let port = UInt16(url.port ?? 80)
+        let connId = self.id
+        let displayName = self.server.name
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 await MainActor.run { self.connectionPhase = "client-connect" }
-                try await self.client.connect(url: url)
-                await MainActor.run { self.connectionPhase = "initialize" }
-                try await self.sendInitialize(timeout: initializeTimeout)
-                await MainActor.run { self.connectionPhase = "initialized" }
+                let assignedId = try await client.connectRemote(
+                    serverId: connId, displayName: displayName,
+                    host: host, port: port
+                )
+                await MainActor.run {
+                    self.rustServerId = assignedId
+                    self.connectionPhase = "initialized"
+                }
             }
             group.addTask {
                 try await Task.sleep(for: attemptTimeout)
@@ -921,81 +1042,34 @@ final class ServerConnection: Identifiable {
         }
     }
 
-    private func sendInitialize(timeout: Duration) async throws {
-        try await withThrowingTaskGroup(of: InitializeResponse.self) { group in
-            group.addTask {
-                try await self.client.sendRequest(
-                    method: "initialize",
-                    params: InitializeParams(
-                        clientInfo: .init(name: "litter", version: "1.0", title: nil),
-                        capabilities: .init(experimentalApi: true)
-                    ),
-                    responseType: InitializeResponse.self
-                )
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw URLError(.timedOut)
-            }
-            _ = try await group.next()!
-            group.cancelAll()
-        }
-    }
-
-    private func setupDisconnectHandler() async {
-        await client.setDisconnectHandler { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.connectionHealth == .connected || self.connectionHealth == .unresponsive else {
-                    NSLog("[ws] disconnect handler: already disconnected id=%@", self?.id ?? "?")
-                    return
-                }
-                NSLog("[ws] socket died, auto-reconnecting id=%@", self.id)
-                self.connectionHealth = .connecting
-                self.onDisconnect?()
-                do {
-                    try await self.connectAndInitialize()
-                    await self.configureLocalRealtimeConversationFeatureIfNeeded()
-                    self.connectionHealth = .connected
-                    NSLog("[ws] auto-reconnect SUCCESS id=%@", self.id)
-                } catch {
-                    self.connectionHealth = .disconnected
-                    NSLog("[ws] auto-reconnect FAILED id=%@ err=%@", self.id, error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func setupHealthHandler() async {
-        await client.setHealthChangeHandler { [weak self] healthy in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if healthy {
-                    if self.connectionHealth == .unresponsive {
-                        self.connectionHealth = .connected
-                    }
-                } else {
-                    if self.connectionHealth == .connected {
-                        self.connectionHealth = .unresponsive
-                    }
-                }
-            }
-        }
-    }
-
-    private func setupNotifications() async {
-        await client.setNotificationHandler { [weak self] method, data in
-            Task { @MainActor [weak self] in
-                self?.onNotification?(method, data)
-            }
-        }
-        await client.setRequestHandler { [weak self] id, method, data in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let handled = self.onServerRequest?(id, method, data) ?? false
-                if !handled {
-                    self.routedSendResult(id: id, result: [:] as [String: String])
-                }
-            }
+    private func sshConnectAndBootstrap(
+        client: CodexClient,
+        host: String,
+        credentials: SSHCredentials
+    ) async throws -> FfiSshConnectionResult {
+        switch credentials {
+        case .password(let username, let password):
+            return try await client.sshConnectAndBootstrap(
+                host: host,
+                port: server.resolvedSSHPort,
+                username: username,
+                password: password,
+                privateKeyPem: nil,
+                passphrase: nil,
+                acceptUnknownHost: true,
+                workingDir: nil
+            )
+        case .key(let username, let privateKey, let passphrase):
+            return try await client.sshConnectAndBootstrap(
+                host: host,
+                port: server.resolvedSSHPort,
+                username: username,
+                password: nil,
+                privateKeyPem: privateKey,
+                passphrase: passphrase,
+                acceptUnknownHost: true,
+                workingDir: nil
+            )
         }
     }
 
@@ -1007,159 +1081,4 @@ final class ServerConnection: Identifiable {
         return data
     }
 
-    private func configureLocalRealtimeConversationFeatureIfNeeded() async {
-        guard target == .local else { return }
-
-        do {
-            let didEnableFeature = try await ensureExperimentalFeatureEnabled(
-                named: VoiceSessionControl.realtimeFeatureName,
-                enabled: true
-            )
-            let didConfigureRealtimeDefaults = try await ensureLocalRealtimeDefaultsConfigured()
-            if didEnableFeature || didConfigureRealtimeDefaults {
-                connectionPhase = "local-realtime-ready"
-            }
-        } catch {
-            NSLog(
-                "[ws] failed enabling local realtime defaults id=%@ err=%@",
-                id,
-                error.localizedDescription
-            )
-        }
-    }
-
-    private func ensureExperimentalFeatureEnabled(
-        named featureName: String,
-        enabled: Bool
-    ) async throws -> Bool {
-        let response = try await listExperimentalFeatures(limit: 200)
-        guard let feature = response.data.first(where: { $0.name == featureName }) else {
-            return false
-        }
-        guard feature.enabled != enabled else {
-            return false
-        }
-
-        connectionPhase = "configuring-\(featureName)"
-        _ = try await setExperimentalFeature(
-            named: featureName,
-            enabled: enabled,
-            reloadUserConfig: true
-        )
-
-        let updated = try await listExperimentalFeatures(limit: 200)
-        guard updated.data.contains(where: { $0.name == featureName && $0.enabled == enabled }) else {
-            throw NSError(
-                domain: "Litter",
-                code: 3201,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Failed to enable experimental feature \(featureName)"
-                ]
-            )
-        }
-
-        return true
-    }
-
-    private func ensureLocalRealtimeDefaultsConfigured() async throws -> Bool {
-        let desiredModel = "gpt-realtime-1.5"
-        let desiredRealtimeVersion = "v2"
-        let desiredRealtimeType = "conversational"
-        let currentConfig = try await readConfig(cwd: nil)
-
-        var edits: [ConfigEdit] = []
-        let currentModel = configStringValue(
-            currentConfig.config.value,
-            keyPath: ["experimental_realtime_ws_model"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if currentModel != desiredModel {
-            edits.append(
-                ConfigEdit(
-                    keyPath: "experimental_realtime_ws_model",
-                    value: AnyEncodable(desiredModel),
-                    mergeStrategy: "upsert"
-                )
-            )
-        }
-
-        let currentRealtimeVersion = configStringValue(
-            currentConfig.config.value,
-            keyPath: ["realtime", "version"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if currentRealtimeVersion?.lowercased() != desiredRealtimeVersion {
-            edits.append(
-                ConfigEdit(
-                    keyPath: "realtime.version",
-                    value: AnyEncodable(desiredRealtimeVersion),
-                    mergeStrategy: "upsert"
-                )
-            )
-        }
-
-        let currentRealtimeType = configStringValue(
-            currentConfig.config.value,
-            keyPath: ["realtime", "type"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if currentRealtimeType?.lowercased() != desiredRealtimeType {
-            edits.append(
-                ConfigEdit(
-                    keyPath: "realtime.type",
-                    value: AnyEncodable(desiredRealtimeType),
-                    mergeStrategy: "upsert"
-                )
-            )
-        }
-
-        guard !edits.isEmpty else {
-            return false
-        }
-
-        connectionPhase = "configuring-local-realtime-defaults"
-        _ = try await writeConfigBatch(
-            edits: edits,
-            reloadUserConfig: true
-        )
-
-        let updatedConfig = try await readConfig(cwd: nil)
-        let updatedModel = configStringValue(
-            updatedConfig.config.value,
-            keyPath: ["experimental_realtime_ws_model"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let updatedRealtimeVersion = configStringValue(
-            updatedConfig.config.value,
-            keyPath: ["realtime", "version"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let updatedRealtimeType = configStringValue(
-            updatedConfig.config.value,
-            keyPath: ["realtime", "type"]
-        )?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard updatedModel == desiredModel,
-              updatedRealtimeVersion?.lowercased() == desiredRealtimeVersion,
-              updatedRealtimeType?.lowercased() == desiredRealtimeType else {
-            throw NSError(
-                domain: "Litter",
-                code: 3203,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Failed to configure local realtime defaults"
-                ]
-            )
-        }
-
-        return true
-    }
-
-    private func configStringValue(_ root: Any, keyPath: [String]) -> String? {
-        var current: Any = root
-        for component in keyPath {
-            guard let dictionary = current as? [String: Any],
-                  let next = dictionary[component] else {
-                return nil
-            }
-            current = next
-        }
-        return current as? String
-    }
 }

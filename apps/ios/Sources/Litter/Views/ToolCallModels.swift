@@ -1,0 +1,119 @@
+import Foundation
+
+enum ToolCallKind: String, Equatable {
+    case commandExecution
+    case commandOutput
+    case fileChange
+    case fileDiff
+    case mcpToolCall
+    case mcpToolProgress
+    case webSearch
+    case collaboration
+    case imageView
+    case widget
+
+    var title: String {
+        switch self {
+        case .commandExecution: return "Command Execution"
+        case .commandOutput: return "Command Output"
+        case .fileChange: return "File Change"
+        case .fileDiff: return "File Diff"
+        case .mcpToolCall: return "MCP Tool Call"
+        case .mcpToolProgress: return "MCP Tool Progress"
+        case .webSearch: return "Web Search"
+        case .collaboration: return "Collaboration"
+        case .imageView: return "Image View"
+        case .widget: return "Widget"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .commandExecution, .commandOutput:
+            return "terminal.fill"
+        case .fileChange:
+            return "doc.text.fill"
+        case .fileDiff:
+            return "arrow.left.arrow.right.square.fill"
+        case .mcpToolCall:
+            return "wrench.and.screwdriver.fill"
+        case .mcpToolProgress:
+            return "clock.arrow.trianglehead.counterclockwise.rotate.90"
+        case .webSearch:
+            return "globe"
+        case .collaboration:
+            return "person.2.fill"
+        case .imageView:
+            return "photo.fill"
+        case .widget:
+            return "sparkles"
+        }
+    }
+
+    static func from(title: String) -> ToolCallKind? {
+        let normalized = title
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "[^a-z0-9]+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.contains("command output") { return .commandOutput }
+        if normalized.contains("command execution") || normalized == "command" { return .commandExecution }
+        if normalized.contains("file change") { return .fileChange }
+        if normalized.contains("file diff") || normalized == "diff" { return .fileDiff }
+        if normalized.contains("mcp tool progress") { return .mcpToolProgress }
+        if normalized.contains("mcp tool call") || normalized == "mcp" { return .mcpToolCall }
+        if normalized.contains("web search") { return .webSearch }
+        if normalized.contains("collaboration") || normalized.contains("collab") { return .collaboration }
+        if normalized.contains("image view") || normalized == "image" { return .imageView }
+        if normalized.contains("widget") || normalized.contains("show widget") { return .widget }
+        if normalized.contains("dynamic tool call") { return .mcpToolCall }
+        return nil
+    }
+}
+
+enum ToolCallStatus: Equatable {
+    case inProgress
+    case completed
+    case failed
+    case unknown
+
+    var label: String {
+        switch self {
+        case .inProgress: return "In Progress"
+        case .completed: return "Completed"
+        case .failed: return "Failed"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+struct ToolCallKeyValue: Equatable {
+    let key: String
+    let value: String
+}
+
+enum ToolCallSection: Equatable {
+    case kv(label: String, entries: [ToolCallKeyValue])
+    case code(label: String, language: String, content: String)
+    case json(label: String, content: String)
+    case diff(label: String, content: String)
+    case text(label: String, content: String)
+    case list(label: String, items: [String])
+    case progress(label: String, items: [String])
+}
+
+struct ToolCallCardModel: Equatable {
+    let kind: ToolCallKind
+    let title: String
+    let summary: String
+    let status: ToolCallStatus
+    let duration: String?
+    let sections: [ToolCallSection]
+
+    var defaultExpanded: Bool { status == .failed }
+}
+
+enum ToolCallParseResult: Equatable {
+    case recognized(ToolCallCardModel)
+    case unrecognized
+}

@@ -1,5 +1,4 @@
 import SwiftUI
-import Inject
 import UIKit
 import os
 
@@ -16,6 +15,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        codex_ios_system_init()
         application.registerForRemoteNotifications()
         scheduleKeyboardWarmup()
         return true
@@ -72,7 +72,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 @main
 struct LitterApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var serverManager = ServerManager()
+    @State private var serverManager = ServerManager.shared
     @State private var themeManager = ThemeManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -100,7 +100,6 @@ struct LitterApp: App {
 }
 
 struct ContentView: View {
-    @ObserveInjection var inject
     @Environment(ServerManager.self) private var serverManager
     @Environment(ThemeManager.self) private var themeManager
     @State private var appState = AppState()
@@ -172,7 +171,6 @@ struct ContentView: View {
             appState.reasoningEffort = ""
             appState.showModelSelector = false
         }
-        .enableInjection()
         .sheet(isPresented: $bindableAppState.showServerPicker) {
             NavigationStack {
                 DiscoveryView(onServerSelected: { _ in
@@ -187,19 +185,6 @@ struct ContentView: View {
             SettingsView()
                 .environment(serverManager)
                 .environment(\.textScale, textScale)
-        }
-        .fullScreenCover(
-            isPresented: Binding(
-                get: { serverManager.activeVoiceSession != nil },
-                set: { presented in
-                    guard !presented else { return }
-                    Task { await serverManager.stopActiveVoiceSession() }
-                }
-            )
-        ) {
-            VoiceCallView()
-                .environment(serverManager)
-                .environment(themeManager)
         }
     }
 
@@ -277,8 +262,8 @@ private struct HomeNavigationView: View {
                     LitterTheme.backgroundGradient.ignoresSafeArea()
                 }
             }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if isHomeRouteActive {
+            .overlay(alignment: .bottom) {
+                if isHomeRouteActive, experimentalFeatures.isEnabled(.realtimeVoice) {
                     homeVoiceLauncher
                 }
             }
@@ -402,71 +387,51 @@ private struct HomeNavigationView: View {
     }
 
     private var homeVoiceLauncher: some View {
-        VStack(spacing: 0) {
-            Divider()
-                .overlay(LitterTheme.border.opacity(0.35))
+        HStack {
+            Spacer()
+            HomeVoiceOrbButton(
+                session: serverManager.activeVoiceSession,
+                isAvailable: true,
+                isStarting: isStartingVoice,
+                action: startHomeVoiceSession
+            )
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, max(bottomInset - 12, 6))
+    }
 
-            Button {
-                guard !isStartingVoice else { return }
-                isStartingVoice = true
-                actionErrorMessage = nil
-                Task {
-                    do {
-                        try await serverManager.startPinnedLocalVoiceCall(
-                            cwd: preferredVoiceWorkingDirectory(),
-                            model: normalizedSelectedModel(),
-                            approvalPolicy: appState.approvalPolicy,
-                            sandboxMode: appState.sandboxMode
-                        )
-                    } catch {
-                        await MainActor.run {
-                            actionErrorMessage = error.localizedDescription
-                        }
-                    }
+    private func startHomeVoiceSession() {
+        guard !isStartingVoice else { return }
+        isStartingVoice = true
+        actionErrorMessage = nil
+
+        Task {
+            do {
+                let selectedModel = normalizedSelectedModel()
+                let selectedEffort = appState.reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+                serverManager.handoffModel = selectedModel
+                serverManager.handoffEffort = selectedEffort.isEmpty ? nil : selectedEffort
+                serverManager.handoffFastMode = false
+                try await serverManager.startPinnedLocalVoiceCall(
+                    cwd: preferredVoiceWorkingDirectory(),
+                    model: selectedModel,
+                    approvalPolicy: appState.approvalPolicy,
+                    sandboxMode: appState.sandboxMode
+                )
+                if let voiceKey = await MainActor.run(body: { serverManager.activeVoiceSession?.threadKey }) {
                     await MainActor.run {
-                        isStartingVoice = false
+                        openRealtimeVoice(voiceKey)
                     }
                 }
-            } label: {
-                HStack(spacing: 14) {
-                    ZStack {
-                        Circle()
-                            .fill(LitterTheme.accent.opacity(0.16))
-                            .frame(width: 44, height: 44)
-                        Image(systemName: "waveform.and.mic")
-                            .font(.system(size: 19, weight: .semibold))
-                            .foregroundColor(LitterTheme.accent)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Realtime Voice")
-                            .font(LitterFont.styled(.headline, weight: .semibold))
-                            .foregroundColor(LitterTheme.textPrimary)
-                        Text("Local only. Reuses the same voice thread every time.")
-                            .font(LitterFont.styled(.caption))
-                            .foregroundColor(LitterTheme.textSecondary)
-                    }
-
-                    Spacer(minLength: 12)
-
-                    if isStartingVoice {
-                        ProgressView()
-                            .tint(LitterTheme.accent)
-                    } else {
-                        Text("Start")
-                            .font(LitterFont.styled(.caption, weight: .bold))
-                            .foregroundColor(LitterTheme.textOnAccent)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(Capsule().fill(LitterTheme.accent))
-                    }
+            } catch {
+                await MainActor.run {
+                    actionErrorMessage = error.localizedDescription
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 16)
-                .background(.black.opacity(0.82))
             }
-            .buttonStyle(.plain)
-            .disabled(isStartingVoice || !OnDeviceCodexFeature.isEnabled || serverManager.activeVoiceSession != nil)
+            await MainActor.run {
+                isStartingVoice = false
+            }
         }
     }
 

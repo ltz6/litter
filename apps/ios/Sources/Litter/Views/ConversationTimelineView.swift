@@ -211,7 +211,11 @@ private struct ConversationTimelineItemRow: View {
         case .mcpToolCall(let data):
             ConversationToolCardRow(model: makeMcpModel(data))
         case .dynamicToolCall(let data):
-            ConversationToolCardRow(model: makeDynamicToolModel(data))
+            if CrossServerTools.isRichTool(data.tool) {
+                CrossServerToolResultView(data: data)
+            } else {
+                ConversationToolCardRow(model: makeDynamicToolModel(data))
+            }
         case .multiAgentAction(let data):
             SubagentCardView(
                 data: data,
@@ -299,8 +303,9 @@ private struct ConversationTimelineItemRow: View {
                 if case .image = segment.kind { return true }
                 return false
             }
+            let canUseSingleBubble = parsed.count == 1 && !hasImages
 
-            if !hasImages,
+            if canUseSingleBubble,
                let first = parsed.first,
                case .markdown(let content, let identity) = first.kind {
                 AssistantBubble(

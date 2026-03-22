@@ -12,6 +12,13 @@ private struct DiscoveryCandidate: Hashable {
     let codexPortHint: UInt16?
 }
 
+private struct BonjourDiscoverySeed: Hashable {
+    let name: String
+    let host: String
+    let port: UInt16?
+    let serviceType: String
+}
+
 struct TailscalePeerIdentity: Equatable {
     let ip: String
     let name: String?
@@ -104,11 +111,14 @@ private actor TailscaleDiscoveryDiagnostics {
 final class NetworkDiscovery {
     var servers: [DiscoveredServer] = []
     var isScanning = false
+    var isInitialLoad = false
     var tailscaleDiscoveryNotice: String?
 
     @ObservationIgnored private var scanTask: Task<Void, Never>?
+    @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
     @ObservationIgnored private var activeScanID = UUID()
     @ObservationIgnored private var networkServerLastSeen: [String: Date] = [:]
+    @ObservationIgnored private let discoveryClient = CodexSharedClient.shared
 
     private let cacheKey = "litter.discovery.networkServers.v1"
     private let cacheRetention: TimeInterval = 7 * 24 * 60 * 60
@@ -135,15 +145,22 @@ final class NetworkDiscovery {
         let retainedNetworkServers = servers.filter { $0.source != .local }
         servers = Self.mergeNetworkServers(cachedNetworkServers + retainedNetworkServers)
         isScanning = true
-        if OnDeviceCodexFeature.isEnabled {
-            servers.append(DiscoveredServer(
-                id: "local",
-                name: UIDevice.current.name,
-                hostname: "127.0.0.1",
-                port: nil,
-                source: .local,
-                hasCodexServer: true
-            ))
+        isInitialLoad = true
+        servers.append(DiscoveredServer(
+            id: "local",
+            name: UIDevice.current.name,
+            hostname: "127.0.0.1",
+            port: nil,
+            source: .local,
+            hasCodexServer: true
+        ))
+
+        initialLoadTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.2))
+            await MainActor.run { [weak self] in
+                guard let self, self.activeScanID == scanID else { return }
+                self.isInitialLoad = false
+            }
         }
 
         scanTask = Task.detached(priority: .utility) { [weak self] in
@@ -154,8 +171,11 @@ final class NetworkDiscovery {
 
     func stopScanning() {
         scanTask?.cancel()
+        initialLoadTask?.cancel()
         scanTask = nil
+        initialLoadTask = nil
         isScanning = false
+        isInitialLoad = false
     }
 
     // MARK: - Discovery
@@ -165,6 +185,7 @@ final class NetworkDiscovery {
             Task { @MainActor [weak self] in
                 guard let self, self.activeScanID == scanID else { return }
                 self.isScanning = false
+                self.isInitialLoad = false
             }
         }
         guard !Task.isCancelled else { return }
@@ -174,102 +195,93 @@ final class NetworkDiscovery {
         }
         guard isCurrent else { return }
 
-        let localIPv4 = Self.localIPv4Address()?.0
-        var cumulativeCandidates: [DiscoveryCandidate] = []
+        let client = await MainActor.run { [weak self] in self?.discoveryClient }
+        guard let client else { return }
+
         let tailscaleDiagnostics = TailscaleDiscoveryDiagnostics()
         let tailscaleAppInstalled = await MainActor.run { Self.isTailscaleAppInstalled() }
+        async let tailscaleNoticeProbe: [DiscoveryCandidate] = Self.discoverTailscaleSSHCandidates(
+            timeout: 1.0,
+            appInstalled: tailscaleAppInstalled,
+            diagnostics: tailscaleDiagnostics
+        )
 
-        // Run two passes to reduce discovery misses from transient Bonjour/Tailscale timing.
-        // Within each pass, stream source results and probe completions progressively so
-        // DiscoveryView can render rows as soon as they are found.
-        for pass in 0..<2 {
-            let bonjourTimeout: TimeInterval = pass == 0 ? 5.0 : 3.0
-            let tailscaleTimeout: TimeInterval = pass == 0 ? 1.0 : 0.75
-            let probeTimeout: TimeInterval = pass == 0 ? 1.0 : 1.4
-            let probeAttempts = pass == 0 ? 2 : 3
+        let seeds = await Self.discoverBonjourSeeds(timeout: 5.0)
+        let localIPv4 = Self.localIPv4Address()?.0
+        guard !Task.isCancelled else { return }
 
-            var passCandidates = cumulativeCandidates
-            var probedIPs = Set<String>()
-            var passReachable: [CandidateReachability] = []
+        let rustServers = (try? await client.scanServersWithMdnsContext(
+            seeds: seeds.map {
+                FfiMdnsSeed(name: $0.name, host: $0.host, port: $0.port, serviceType: $0.serviceType)
+            },
+            localIpv4: localIPv4
+        )) ?? []
 
-            func probePendingCandidates() async {
-                let pending = passCandidates.filter { candidate in
-                    probedIPs.insert(candidate.ip).inserted
-                }
-                guard !pending.isEmpty else { return }
+        guard !Task.isCancelled else { return }
+        _ = await tailscaleNoticeProbe
+        let tailscaleNotice = await tailscaleDiagnostics.notice
+        await MainActor.run { [weak self] in
+            guard let self, self.activeScanID == scanID else { return }
+            self.tailscaleDiscoveryNotice = tailscaleNotice
+            self.isInitialLoad = false
+            self.applyRustDiscoveryResults(rustServers)
+        }
+    }
 
-                let reachable = await Self.filterCandidatesWithOpenServices(
-                    pending,
-                    timeout: probeTimeout,
-                    attempts: probeAttempts,
-                    onReachable: { state in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.activeScanID == scanID else { return }
-                            self.applyReachabilityResults([state])
-                        }
-                    }
-                )
-                passReachable.append(contentsOf: reachable)
+    private func applyRustDiscoveryResults(_ discovered: [FfiDiscoveredServer]) {
+        let now = Date()
+        let existingById = Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) })
+        let resolved = discovered.compactMap { rust -> DiscoveredServer? in
+            let existing = existingById[rust.id]
+            guard let server = Self.discoveredServer(from: rust, existing: existing) else {
+                return nil
             }
+            networkServerLastSeen[server.id] = now
+            return server
+        }
 
-            await withTaskGroup(of: [DiscoveryCandidate].self) { group in
-                group.addTask { await Self.discoverBonjourCandidates(timeout: bonjourTimeout) }
-                group.addTask {
-                    await Self.discoverTailscaleSSHCandidates(
-                        timeout: tailscaleTimeout,
-                        appInstalled: tailscaleAppInstalled,
-                        diagnostics: tailscaleDiagnostics
-                    )
-                }
-                group.addTask {
-                    await Self.discoverLocalSubnetCodexCandidates(
-                        localIPv4: localIPv4,
-                        timeout: pass == 0 ? 0.24 : 0.34,
-                        attempts: pass == 0 ? 1 : 2
-                    )
-                }
+        let local = servers.filter { $0.source == .local }
+        let resolvedIDs = Set(resolved.map(\.id))
+        let retained = servers.filter { $0.source != .local && !resolvedIDs.contains($0.id) }
+        servers = local + Self.mergeNetworkServers(resolved + retained)
+        saveCachedNetworkServers()
+    }
 
-                while let sourceCandidates = await group.next() {
-                    guard !Task.isCancelled else { return }
-                    let shouldContinue = await MainActor.run { [weak self] in
-                        guard let self else { return false }
-                        return self.activeScanID == scanID
-                    }
-                    guard shouldContinue else { return }
+    private static func discoveredServer(
+        from rust: FfiDiscoveredServer,
+        existing: DiscoveredServer?
+    ) -> DiscoveredServer? {
+        let host = rust.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty, host != "127.0.0.1" else { return nil }
 
-                    let merged = Self.mergeCandidates(sourceCandidates, excluding: localIPv4)
-                    cumulativeCandidates = Self.mergeCandidates(cumulativeCandidates + merged, excluding: localIPv4)
-                    passCandidates = Self.mergeCandidates(passCandidates + merged, excluding: localIPv4)
+        let id = rust.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = rust.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return DiscoveredServer(
+            id: id.isEmpty ? "network-\(host)" : id,
+            name: name.isEmpty ? host : name,
+            hostname: host,
+            port: rust.codexPort,
+            sshPort: rust.sshPort,
+            source: serverSource(from: rust.source),
+            hasCodexServer: rust.codexPort != nil,
+            wakeMAC: existing?.wakeMAC,
+            sshPortForwardingEnabled: existing?.sshPortForwardingEnabled ?? false,
+            websocketURL: existing?.websocketURL
+        )
+    }
 
-                    await probePendingCandidates()
-                }
-            }
-
-            let tailscaleNotice = await tailscaleDiagnostics.notice
-            await MainActor.run { [weak self] in
-                guard let self, self.activeScanID == scanID else { return }
-                self.tailscaleDiscoveryNotice = tailscaleNotice
-            }
-
-            // Re-probe any candidates carried over from previous pass that were not
-            // exercised in this pass to improve reliability after transient failures.
-            await probePendingCandidates()
-
-            guard !Task.isCancelled else { return }
-            let shouldApply = await MainActor.run { [weak self] in
-                guard let self else { return false }
-                return self.activeScanID == scanID
-            }
-            guard shouldApply else { return }
-            let passReachableSnapshot = passReachable
-            await MainActor.run { [weak self] in
-                guard let self, self.activeScanID == scanID else { return }
-                self.applyReachabilityResults(passReachableSnapshot)
-            }
-
-            if pass == 0 {
-                try? await Task.sleep(for: .milliseconds(700))
-            }
+    private static func serverSource(from raw: String) -> ServerSource {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "tailscale":
+            return .tailscale
+        case "manual":
+            return .manual
+        case "local":
+            return .local
+        case "ssh":
+            return .ssh
+        default:
+            return .bonjour
         }
     }
 
@@ -581,26 +593,23 @@ final class NetworkDiscovery {
         }
     }
 
-    private static func discoverBonjourCandidates(timeout: TimeInterval) async -> [DiscoveryCandidate] {
-        async let ssh = discoverBonjourCandidates(
+    private static func discoverBonjourSeeds(timeout: TimeInterval) async -> [BonjourDiscoverySeed] {
+        async let ssh = discoverBonjourSeeds(
             serviceType: "_ssh._tcp.",
-            timeout: timeout,
-            codexService: false
+            timeout: timeout
         )
-        async let codex = discoverBonjourCandidates(
+        async let codex = discoverBonjourSeeds(
             serviceType: "_codex._tcp.",
-            timeout: timeout,
-            codexService: true
+            timeout: timeout
         )
-        return mergeCandidates(Array((await ssh) + (await codex)), excluding: nil)
+        return Array((await ssh) + (await codex))
     }
 
-    private static func discoverBonjourCandidates(
+    private static func discoverBonjourSeeds(
         serviceType: String,
-        timeout: TimeInterval,
-        codexService: Bool
-    ) async -> [DiscoveryCandidate] {
-        let browser = BonjourServiceDiscoverer(serviceType: serviceType, codexService: codexService)
+        timeout: TimeInterval
+    ) async -> [BonjourDiscoverySeed] {
+        let browser = BonjourServiceDiscoverer(serviceType: serviceType)
         return await browser.discover(timeout: timeout)
     }
 
@@ -712,7 +721,7 @@ final class NetworkDiscovery {
             return candidates
         } catch {
             let responsePreview = (error as NSError).localizedDescription
-            if let notice = tailscaleDiscoveryNotice(for: error, availability: availability) {
+            if let notice = Self.tailscaleDiscoveryNotice(for: error, availability: availability) {
                 await diagnostics.record(notice)
             } else {
                 NSLog("[tailscale] suppressing notice because Tailscale does not look installed or active")
@@ -963,27 +972,25 @@ final class NetworkDiscovery {
 private final class BonjourServiceDiscoverer: NSObject, @preconcurrency NetServiceBrowserDelegate, @preconcurrency NetServiceDelegate {
     private struct ServiceRecord {
         let name: String
-        let codexPortHint: UInt16?
+        let port: UInt16?
     }
 
     private let serviceType: String
-    private let codexService: Bool
     private let browser = NetServiceBrowser()
     private var services: [NetService] = []
     private var results: [String: ServiceRecord] = [:]
     private var pendingServices: Set<ObjectIdentifier> = []
-    private var continuation: CheckedContinuation<[DiscoveryCandidate], Never>?
+    private var continuation: CheckedContinuation<[BonjourDiscoverySeed], Never>?
     private var timeoutTask: Task<Void, Never>?
     private var resolveDrainTask: Task<Void, Never>?
     private var isFinished = false
     private var requestedStop = false
 
-    init(serviceType: String, codexService: Bool) {
+    init(serviceType: String) {
         self.serviceType = serviceType
-        self.codexService = codexService
     }
 
-    func discover(timeout: TimeInterval) async -> [DiscoveryCandidate] {
+    func discover(timeout: TimeInterval) async -> [BonjourDiscoverySeed] {
         await withCheckedContinuation { continuation in
             self.continuation = continuation
             browser.delegate = self
@@ -1027,7 +1034,12 @@ private final class BonjourServiceDiscoverer: NSObject, @preconcurrency NetServi
             service.delegate = nil
         }
         let discovered = results.map {
-            DiscoveryCandidate(ip: $0.key, name: $0.value.name, source: .bonjour, codexPortHint: $0.value.codexPortHint)
+            BonjourDiscoverySeed(
+                name: $0.value.name,
+                host: $0.key,
+                port: $0.value.port,
+                serviceType: serviceType
+            )
         }
         continuation?.resume(returning: discovered)
         continuation = nil
@@ -1058,14 +1070,13 @@ private final class BonjourServiceDiscoverer: NSObject, @preconcurrency NetServi
     func netServiceDidResolveAddress(_ sender: NetService) {
         pendingServices.remove(ObjectIdentifier(sender))
         guard let addresses = sender.addresses else { return }
-        let codexPort: UInt16? = {
-            guard codexService else { return nil }
-            guard sender.port > 0, sender.port <= Int(UInt16.max) else { return 8390 }
+        let resolvedPort: UInt16? = {
+            guard sender.port > 0, sender.port <= Int(UInt16.max) else { return nil }
             return UInt16(sender.port)
         }()
         for address in addresses {
             guard let ip = NetworkDiscovery.ipv4Address(fromSockaddrData: address) else { continue }
-            results[ip] = ServiceRecord(name: sender.name, codexPortHint: codexPort)
+            results[ip] = ServiceRecord(name: sender.name, port: resolvedPort)
             break
         }
         if requestedStop, pendingServices.isEmpty {

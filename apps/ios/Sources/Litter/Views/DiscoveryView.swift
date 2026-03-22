@@ -196,51 +196,9 @@ struct DiscoveryView: View {
         .onAppear { handleAppear() }
         .onDisappear { handleDisappear() }
         .sheet(item: $sshServer) { server in
-            SSHLoginSheet(server: server) { target, detectedWakeMAC in
+            SSHLoginSheet(server: server) { target in
                 sshServer = nil
-                switch target {
-                case .remote(let host, let port):
-                    let resolved = DiscoveredServer(
-                        id: "\(server.id)-remote-\(port)",
-                        name: server.name,
-                        hostname: host,
-                        port: port,
-                        sshPort: server.sshPort,
-                        source: server.source,
-                        hasCodexServer: true,
-                        wakeMAC: detectedWakeMAC ?? server.wakeMAC,
-                        sshPortForwardingEnabled: server.sshPortForwardingEnabled
-                    )
-                    if server.sshPortForwardingEnabled {
-                        let bootstrap = DiscoveredServer(
-                            id: server.id,
-                            name: server.name,
-                            hostname: server.hostname,
-                            port: nil,
-                            sshPort: server.sshPort,
-                            source: server.source,
-                            hasCodexServer: false,
-                            wakeMAC: detectedWakeMAC ?? server.wakeMAC,
-                            sshPortForwardingEnabled: true
-                        )
-                        Task { await connectToServer(bootstrap, targetOverride: target) }
-                    } else {
-                        Task { await connectToServer(resolved, targetOverride: target) }
-                    }
-                default:
-                    let enriched = DiscoveredServer(
-                        id: server.id,
-                        name: server.name,
-                        hostname: server.hostname,
-                        port: server.port,
-                        sshPort: server.sshPort,
-                        source: server.source,
-                        hasCodexServer: server.hasCodexServer,
-                        wakeMAC: detectedWakeMAC ?? server.wakeMAC,
-                        sshPortForwardingEnabled: server.sshPortForwardingEnabled
-                    )
-                    Task { await connectToServer(enriched, targetOverride: target) }
-                }
+                Task { await connectToServer(server, targetOverride: target) }
             }
         }
         .sheet(isPresented: $showManualEntry) {
@@ -267,7 +225,7 @@ struct DiscoveryView: View {
     private var serversSection: some View {
         Section {
             if allServers.isEmpty {
-                if discovery.isScanning {
+                if discovery.isInitialLoad {
                     HStack {
                         ProgressView().tint(LitterTheme.textMuted).scaleEffect(0.7)
                         Text("Scanning...")
@@ -276,10 +234,17 @@ struct DiscoveryView: View {
                     }
                     .listRowBackground(LitterTheme.surface.opacity(0.6))
                 } else {
-                    Text("No servers found")
-                        .litterFont(.footnote)
-                        .foregroundColor(LitterTheme.textMuted)
-                        .listRowBackground(LitterTheme.surface.opacity(0.6))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("No servers found")
+                            .litterFont(.footnote)
+                            .foregroundColor(LitterTheme.textMuted)
+                        if discovery.isScanning {
+                            Text("Still searching network...")
+                                .litterFont(.caption)
+                                .foregroundColor(LitterTheme.textSecondary)
+                        }
+                    }
+                    .listRowBackground(LitterTheme.surface.opacity(0.6))
                 }
             } else {
                 ForEach(allServers) { server in
@@ -790,21 +755,23 @@ struct DiscoveryView: View {
         Task {
             do {
                 NSLog("[AUTO_SSH] connecting to %@ as %@", host, user)
-                let ssh = SSHSessionManager.shared
-                try await ssh.connect(host: host, credentials: .password(username: user, password: pass))
-                let port = try await ssh.startRemoteServer()
-                NSLog("[AUTO_SSH] remote app-server port %d", Int(port))
                 let server = DiscoveredServer(
-                    id: "auto-ssh-\(host):\(port)",
+                    id: "auto-ssh-\(host)",
                     name: host,
                     hostname: host,
-                    port: port,
+                    port: nil,
                     sshPort: 22,
-                    source: .manual,
-                    hasCodexServer: true,
+                    source: .ssh,
+                    hasCodexServer: false,
                     sshPortForwardingEnabled: false
                 )
-                await connectToServer(server)
+                await connectToServer(
+                    server,
+                    targetOverride: .sshThenRemote(
+                        host: host,
+                        credentials: .password(username: user, password: pass)
+                    )
+                )
             } catch {
                 NSLog("[AUTO_SSH] failed: %@", error.localizedDescription)
             }
