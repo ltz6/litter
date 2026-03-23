@@ -19,17 +19,64 @@
 
 ## Architecture
 - **iOS root layout:** `ContentView` uses a `ZStack` with a persistent `HeaderView`, main content area, and a `SidebarOverlay` that slides from the left.
-- **iOS state management:** `ConversationStore` (ObservableObject) manages WebSocket connection, JSON-RPC calls, and message state. `AppState` (ObservableObject) manages UI state (sidebar, server, model/reasoning selection).
-- **iOS server flow:** `DiscoveryView` (sheet) discovers and connects to servers; sidebar/session flows use `thread/list`, `thread/resume`, and `thread/start`.
+- **iOS state management:** `AppStore` (Rust, via UniFFI) is the canonical runtime state owner. `AppModel` is the thin Swift observation shell over Rust snapshots and updates. `AppState` is UI-only state.
+- **iOS server flow:** discovery and SSH are separate utility bridges; thread/session/account operations come from generated Rust RPC plus store updates.
 - **Android root layout:** `LitterAppShell` is the Compose entry; `DefaultLitterAppState` maps backend state into UI state.
-- **Android state/transport:** `ServerManager` handles multi-server threads/models/account state and routes notifications via `BridgeRpcTransport`.
+- **Android state/transport:** Android should converge on the same Rust-owned runtime model as iOS instead of re-implementing shared session/thread/account logic in Kotlin.
 - **Android server flow:** Discovery sheet + SSH login sheet + settings/account sheets drive connection, auth, and server management.
 - **Message rendering parity:** both platforms support reasoning/system sections, code block rendering, and inline image handling.
 
 ### Shared Rust Layer
-- `codex-mobile-client` is the shared client library that owns transport, session management, auth, discovery, and SSH for both platforms.
+- `codex-mobile-client` is the shared client library that owns transport, session management, auth, discovery, SSH, hydration, reconciliation, and canonical app/runtime state for both platforms.
+- `AppStore` is the Rust-owned state surface. It owns snapshots, typed updates, and the small set of truly composite/store-local actions.
+- `AppServerRpc` is the generated public UniFFI RPC surface for direct upstream app-server methods and types.
+- `DiscoveryBridge` and `SshBridge` are separate Rust utility surfaces. Do not move discovery/SSH policy back into Swift/Kotlin.
 - `codex-bridge` wraps `codex-mobile-client` with C FFI entry points so each platform can call into Rust via a thin native bridge.
-- iOS uses Swift bridge files (`Rust*.swift` in `Bridge/`) and Android uses Kotlin bridge files (`Rust*.kt` in `core/bridge/`) to map platform types to the Rust facade.
+- iOS uses UniFFI-generated Swift plus thin bridge helpers; Android uses UniFFI-generated Kotlin plus thin bridge helpers.
+
+## Feature Placement Rules
+- Prefer Rust first. If logic is about session state, thread state, streaming, hydration, approvals, auth/account, discovery merge policy, voice transcript/handoff normalization, or status normalization, it belongs in `shared/rust-bridge/codex-mobile-client/`.
+- Keep Swift/Kotlin thin. Platform code should only own UI, platform persistence, platform permissions, audio/session APIs, notifications, ActivityKit/CarPlay/Android services, and render-only projections.
+- Do not parse upstream wire-format strings in Swift/Kotlin. If a status, event kind, or payload shape matters to both platforms, expose it as a typed UniFFI enum/record from Rust.
+- Do not duplicate merge/reducer/state-machine logic in iOS or Android. Shared reconciliation belongs in Rust reducer/store code.
+- If upstream app-server already has a good method/type, use it through generated `AppServerRpc` instead of adding a handwritten wrapper on `AppStore`.
+- Keep the generator generic. Do not encode per-method reconciliation policy in codegen. Put convergence logic in handwritten Rust reducer/reconcile code.
+- `AppStore` should stay minimal: snapshots, subscriptions, and truly composite/store-local actions only. Plain upstream RPC passthroughs belong on generated `AppServerRpc`.
+- Prefer authoritative updates. Store state should be populated from upstream events first, then targeted refresh/reconcile when upstream events are insufficient. Do not hand-patch platform state after RPC success.
+- New boundary types that cross into Swift/Kotlin should be UniFFI-safe Rust records/enums. Internal Rust-only state can stay richer and non-UniFFI.
+- Generated Rust sources must stay local-only. Use `*.generated.rs` filenames and do not commit generated Rust files; regenerate them via `./shared/rust-bridge/generate-bindings.sh`.
+
+## Where To Implement New Work
+- Add or change upstream protocol coverage:
+  - update `shared/rust-bridge/codegen/src/main.rs`
+  - regenerate bindings
+  - do not hand-maintain parallel RPC wrappers unless the logic is genuinely composite
+- Add canonical runtime state, reducer logic, or reconciliation:
+  - `shared/rust-bridge/codex-mobile-client/src/store/`
+- Add conversation hydration, typed item shaping, or shared status normalization:
+  - `shared/rust-bridge/codex-mobile-client/src/conversation.rs`
+  - `shared/rust-bridge/codex-mobile-client/src/conversation_uniffi.rs`
+  - `shared/rust-bridge/codex-mobile-client/src/uniffi_shared.rs`
+- Add discovery ranking/dedupe/reconciliation:
+  - `shared/rust-bridge/codex-mobile-client/src/discovery.rs`
+  - `shared/rust-bridge/codex-mobile-client/src/discovery_uniffi.rs`
+- Add voice transcript/handoff/shared realtime normalization:
+  - `shared/rust-bridge/codex-mobile-client/src/store/voice.rs`
+  - reducer/update boundary types in `store/`
+- Add iOS-only behavior:
+  - `apps/ios/Sources/Litter/Models/` for controllers/platform services
+  - `apps/ios/Sources/Litter/Views/` for SwiftUI
+  - keep those files free of shared protocol parsing and shared business rules
+- Add Android-only behavior:
+  - `apps/android/app/` and `apps/android/core/`
+  - keep those files free of duplicated Rust-owned state/reducer logic
+
+## Drift Guardrails
+- Before adding new Swift/Kotlin logic, ask: would Android/iOS both need this behavior? If yes, put it in Rust.
+- Before adding a new `String` status field to Swift/Kotlin models, ask: should this be a Rust enum instead? Usually yes.
+- Before adding a new `AppStore` method, ask: is this a real composite/store action, or just an upstream RPC that should be generated on `AppServerRpc`?
+- Before adding a new platform cache, ask: is this canonical runtime data that should live in the Rust store instead?
+- When in doubt, prefer one shared Rust implementation plus a thin platform projection over two parallel native implementations.
 
 ## Dependencies
 ### iOS (SPM via `apps/ios/project.yml`)

@@ -6,7 +6,7 @@ description = "Shared mobile client library for Codex iOS and Android apps"
 
 [lib]
 name = "codex_mobile_client"
-crate-type = ["lib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 uniffi = { version = "0.31.0", features = ["tokio"] }

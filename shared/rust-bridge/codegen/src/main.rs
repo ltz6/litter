@@ -10,8 +10,8 @@
 //! Usage:
 //!   cargo run -p codex-mobile-codegen -- \
 //!     --out ../codex-mobile-client/src/types/codegen_types.generated.rs \
-//!     --rpc-out ../codex-mobile-client/src/rpc/generated_client.rs \
-//!     --ffi-rpc-out ../codex-mobile-client/src/ffi/rpc.rs
+//!     --rpc-out ../codex-mobile-client/src/rpc/generated_client.generated.rs \
+//!     --ffi-rpc-out ../codex-mobile-client/src/ffi/rpc.generated.rs
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

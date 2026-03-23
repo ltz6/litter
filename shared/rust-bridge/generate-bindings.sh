@@ -48,8 +48,8 @@ fi
 UPSTREAM_V2="$WORKSPACE_DIR/../third_party/codex/codex-rs/app-server-protocol/src/protocol/v2.rs"
 UPSTREAM_COMMON="$WORKSPACE_DIR/../third_party/codex/codex-rs/app-server-protocol/src/protocol/common.rs"
 TYPES_OUT="$CRATE_DIR/src/types/codegen_types.generated.rs"
-RPC_OUT="$CRATE_DIR/src/rpc/generated_client.rs"
-FFI_RPC_OUT="$CRATE_DIR/src/ffi/rpc.rs"
+RPC_OUT="$CRATE_DIR/src/rpc/generated_client.generated.rs"
+FFI_RPC_OUT="$CRATE_DIR/src/ffi/rpc.generated.rs"
 
 echo "==> Regenerating protocol wrappers..."
 cargo run -p codex-mobile-codegen -- \

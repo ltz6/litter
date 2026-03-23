@@ -8,6 +8,7 @@ mod app_store;
 mod discovery;
 mod errors;
 mod parser;
+#[path = "rpc.generated.rs"]
 mod rpc;
 mod shared;
 mod ssh;

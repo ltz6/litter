@@ -16,5 +16,5 @@ pub enum RpcClientError {
 
 pub(crate) use generated_client::convert_generated_field;
 
-#[path = "generated_client.rs"]
+#[path = "generated_client.generated.rs"]
 pub(crate) mod generated_client;
