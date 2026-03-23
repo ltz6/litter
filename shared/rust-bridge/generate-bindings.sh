@@ -62,12 +62,7 @@ cargo run -p codex-mobile-codegen -- \
 # ---------------------------------------------------------------------------
 # 1. Build the cdylib so uniffi-bindgen can read its metadata
 # ---------------------------------------------------------------------------
-# Temporarily add cdylib crate-type for uniffi-bindgen (needs a dylib to read metadata).
-# The Cargo.toml normally has only ["lib"] to avoid iOS cross-compilation issues.
 echo "==> Building codex-mobile-client cdylib ($PROFILE)..."
-CARGO_TOML="$CRATE_DIR/Cargo.toml"
-sed -i '' 's/crate-type = \["lib"\]/crate-type = ["lib", "cdylib"]/' "$CARGO_TOML"
-trap 'sed -i "" "s/crate-type = \[\"lib\", \"cdylib\"\]/crate-type = [\"lib\"]/" "$CARGO_TOML"' EXIT
 
 if [[ "$PROFILE" == "release" ]]; then
     cargo build -p codex-mobile-client --release
