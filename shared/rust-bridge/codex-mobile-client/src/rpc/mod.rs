@@ -14,7 +14,7 @@ pub enum RpcClientError {
     Serialization(String),
 }
 
-pub(crate) use generated_client::convert_generated_field;
+pub use generated_client::convert_generated_field;
 
 #[path = "generated_client.generated.rs"]
-pub(crate) mod generated_client;
+pub mod generated_client;

@@ -61,6 +61,69 @@ fn prepare_in_process_config(
         config = prepare_ios_in_process_config(config)?;
     }
 
+    #[cfg(target_os = "android")]
+    {
+        config = prepare_android_in_process_config(config)?;
+    }
+
+    Ok(config)
+}
+
+#[cfg(target_os = "android")]
+fn prepare_android_in_process_config(
+    mut config: InProcessConfig,
+) -> Result<InProcessConfig, TransportError> {
+    // On Android, HOME and CODEX_HOME should already be set by UniffiInit.nativeBridgeInit().
+    // If codex_home is not set in the config, resolve from CODEX_HOME env var.
+    if config.codex_home.is_none() {
+        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+            let path = PathBuf::from(&codex_home);
+            std::fs::create_dir_all(&path).map_err(|e| {
+                TransportError::ConnectionFailed(format!(
+                    "failed to create CODEX_HOME {:?}: {e}",
+                    path
+                ))
+            })?;
+            config.codex_home = Some(path);
+        } else if let Ok(home) = std::env::var("HOME") {
+            let path = PathBuf::from(home).join(".codex");
+            std::fs::create_dir_all(&path).map_err(|e| {
+                TransportError::ConnectionFailed(format!(
+                    "failed to create codex home {:?}: {e}",
+                    path
+                ))
+            })?;
+            unsafe { std::env::set_var("CODEX_HOME", &path); }
+            config.codex_home = Some(path);
+        } else {
+            return Err(TransportError::ConnectionFailed(
+                "Could not find home directory".to_string(),
+            ));
+        }
+    }
+
+    if config.working_directory.is_none() {
+        if let Some(ref codex_home) = config.codex_home {
+            let wd = codex_home.join("workspace");
+            std::fs::create_dir_all(&wd).map_err(|e| {
+                TransportError::ConnectionFailed(format!(
+                    "failed to create workspace {:?}: {e}",
+                    wd
+                ))
+            })?;
+            config.working_directory = Some(wd);
+        }
+    }
+
+    // Set up TLS root certificates for Android
+    if let Some(ref codex_home) = config.codex_home {
+        // Android uses system CAs, but set SSL_CERT_FILE if a bundle exists
+        let pem_path = codex_home.join("cacert.pem");
+        if pem_path.exists() {
+            unsafe { std::env::set_var("SSL_CERT_FILE", &pem_path); }
+        }
+    }
+
     Ok(config)
 }
 

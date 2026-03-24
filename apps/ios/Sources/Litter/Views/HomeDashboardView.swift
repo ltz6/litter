@@ -66,7 +66,7 @@ struct HomeDashboardView: View {
                 }
             }
             ToolbarItem(placement: .principal) {
-                BrandLogo(size: 44)
+                AnimatedLogo(size: 64)
             }
         }
     }

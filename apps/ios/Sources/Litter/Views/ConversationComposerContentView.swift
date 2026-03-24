@@ -21,7 +21,7 @@ struct ConversationComposerContentView: View {
 
     init(
         attachedImage: UIImage?,
-        pendingUserInputRequest: ServerManager.PendingUserInputRequest?,
+        pendingUserInputRequest: PendingUserInputRequest?,
         rateLimits: RateLimitSnapshot?,
         contextPercent: Int64?,
         isTurnActive: Bool,

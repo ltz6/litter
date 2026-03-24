@@ -24,17 +24,20 @@
   - `core/bridge`: native bridge bootstrapping and core RPC client
   - `core/network`: discovery services (Bonjour/Tailscale/LAN probing)
   - `docs/qa-matrix.md`: Android parity QA matrix
-- `shared/rust-bridge/codex-bridge`: shared Rust bridge crate
+- `shared/rust-bridge/codex-mobile-client`: single shared Rust mobile client crate and UniFFI surface
+- `shared/rust-bridge/codex-ios-audio`: iOS-only audio/AEC crate
 - `shared/third_party/codex`: upstream Codex submodule
 - `patches/codex`: local Codex patch set
 - `tools/scripts`: cross-platform helper scripts
 
-Generated iOS framework artifacts under `apps/ios/Frameworks/` are not stored in git.
+Generated iOS build artifacts under `apps/ios/GeneratedRust/` and packaged frameworks under `apps/ios/Frameworks/` are not stored in git.
 Build everything with:
 
 ```bash
-make ios        # full pipeline (rust + frameworks + xcode build)
-make ios-sim    # simulator only (faster)
+make ios              # full package lane + simulator build
+make ios-device       # full package lane + device build
+make ios-device-fast  # fast raw-staticlib device lane
+make ios-sim          # full package lane + simulator build
 ```
 
 ## Prerequisites
@@ -101,9 +104,11 @@ This repo now vendors upstream Codex as a submodule:
 
 - `shared/third_party/codex` -> `https://github.com/openai/codex`
 
-On-device iOS exec hook changes are kept as a local patch:
+Current local Codex patch set:
 
 - `patches/codex/ios-exec-hook.patch`
+- `patches/codex/realtime-transcript-deltas.patch`
+- `patches/codex/client-controlled-handoff.patch`
 
 Sync/apply patch (idempotent):
 
@@ -111,7 +116,7 @@ Sync/apply patch (idempotent):
 ./apps/ios/scripts/sync-codex.sh
 ```
 
-This preserves the current `shared/third_party/codex` checkout by default, applies the iOS patch, and fails if the patch no longer matches that checkout cleanly.
+This preserves the current `shared/third_party/codex` checkout by default, applies the full local patch set, and fails if any patch no longer matches that checkout cleanly.
 Pass `--recorded-gitlink` if you explicitly want to reset the submodule to the commit recorded in the superproject.
 
 ## Build the Rust bridge
@@ -120,13 +125,29 @@ Pass `--recorded-gitlink` if you explicitly want to reset the submodule to the c
 ./apps/ios/scripts/build-rust.sh
 ```
 
-By default this builds device + Apple Silicon simulator slices. Pass `--with-intel-sim` only if you need an Intel Mac simulator slice too.
+Useful modes:
+
+```bash
+./apps/ios/scripts/build-rust.sh --fast-device
+./apps/ios/scripts/build-rust.sh
+```
+
+- `--fast-device` builds the raw device staticlib and generated headers only.
+- Default/package mode builds device + Apple Silicon simulator slices and also creates `apps/ios/Frameworks/codex_mobile_client.xcframework`.
+- Pass `--with-intel-sim` only if you need an Intel Mac simulator slice too.
 
 This script:
 
-1. Preserves the current `shared/third_party/codex` checkout by default, applies the iOS hook patch for the build, and restores the prior patch state afterward
-2. Builds `shared/rust-bridge/codex-bridge` for device + simulator targets
-3. Repackages `apps/ios/Frameworks/codex_bridge.xcframework`
+1. Preserves the current `shared/third_party/codex` checkout by default, applies the local Codex patch set for the build, and restores the prior patch state afterward
+2. Regenerates UniFFI Swift bindings when public Rust boundary inputs change
+3. Builds `shared/rust-bridge/codex-mobile-client` for device and/or simulator targets
+4. Writes raw artifacts to:
+   - `apps/ios/GeneratedRust/Headers`
+   - `apps/ios/GeneratedRust/ios-device/libcodex_mobile_client.a`
+   - `apps/ios/GeneratedRust/ios-sim/libcodex_mobile_client.a`
+5. In package mode, also repackages `apps/ios/Frameworks/codex_mobile_client.xcframework`
+
+Debug/device Xcode builds link the raw `.a` from `apps/ios/GeneratedRust/ios-device/`, not the xcframework.
 
 ## Build and run iOS app
 
@@ -238,9 +259,11 @@ Notes:
 ## Important paths
 
 - `apps/ios/project.yml`: source of truth for Xcode project/schemes
-- `shared/rust-bridge/codex-bridge/`: Rust staticlib wrapper exposing `codex_start_server`/`codex_stop_server`
+- `shared/rust-bridge/codex-mobile-client/`: single Rust mobile client crate and UniFFI surface
+- `shared/rust-bridge/codex-ios-audio/`: iOS-only audio/AEC crate
 - `shared/third_party/codex/`: upstream Codex source (submodule)
-- `patches/codex/ios-exec-hook.patch`: iOS-specific hook patch applied to submodule
+- `patches/codex/`: local Codex patch set applied to the submodule during Rust/iOS builds
+- `apps/ios/GeneratedRust/`: generated UniFFI headers/modulemap and raw iOS staticlibs used by Debug/device builds
 - `apps/ios/Sources/Litter/Bridge/`: Swift bridge + JSON-RPC client
 - `apps/android/app/src/main/java/com/litter/android/ui/`: Android Compose UI shell and screens
 - `apps/android/app/src/main/java/com/litter/android/state/`: Android state, transports, session/server orchestration

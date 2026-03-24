@@ -17,8 +17,6 @@ tokio = { workspace = true }
 [target.'cfg(target_os = "ios")'.dependencies]
 codex-core = { workspace = true }
 codex-apply-patch = { workspace = true }
-sonora = "0.1.0"
-webrtc-audio-processing = { version = "2.0.0", features = ["bundled"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

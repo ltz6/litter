@@ -4,6 +4,7 @@ use crate::conversation::ConversationItem;
 use crate::types::{
     PendingApproval, PendingUserInputRequest, RateLimits, ThreadInfo, ThreadKey, generated,
 };
+use crate::uniffi_shared::{AppVoiceSessionPhase, AppVoiceTranscriptEntry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerHealthSnapshot {
@@ -44,8 +45,10 @@ pub struct ServerSnapshot {
 pub struct VoiceSessionSnapshot {
     pub active_thread: Option<ThreadKey>,
     pub session_id: Option<String>,
-    pub phase: Option<String>,
+    pub phase: Option<AppVoiceSessionPhase>,
     pub last_error: Option<String>,
+    pub transcript_entries: Vec<AppVoiceTranscriptEntry>,
+    pub handoff_thread_key: Option<ThreadKey>,
 }
 
 #[derive(Debug, Clone)]

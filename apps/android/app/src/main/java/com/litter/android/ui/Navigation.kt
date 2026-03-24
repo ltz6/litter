@@ -1,0 +1,13 @@
+package com.litter.android.ui
+
+import uniffi.codex_mobile_client.ThreadKey
+
+/**
+ * Type-safe navigation routes for the app.
+ */
+sealed class Route {
+    data object Home : Route()
+    data class Sessions(val serverId: String, val title: String) : Route()
+    data class Conversation(val key: ThreadKey) : Route()
+    data class RealtimeVoice(val key: ThreadKey) : Route()
+}

@@ -104,6 +104,10 @@ object LitterTheme {
     val toolCallCollaboration = olive
     val toolCallImage = sand
 
+    /** The current monospace font — Berkeley Mono when mono enabled, system mono otherwise. */
+    val monoFont: FontFamily
+        get() = if (LitterThemeManager.monoFontEnabled) BerkeleyMono else FontFamily.Monospace
+
     val backgroundBrush: Brush
         get() =
             Brush.linearGradient(
@@ -122,13 +126,15 @@ object LitterTheme {
             )
 }
 
-private val Mono =
+val BerkeleyMono =
     FontFamily(
         Font(R.font.berkeley_mono_regular, weight = FontWeight.Normal, style = FontStyle.Normal),
         Font(R.font.berkeley_mono_oblique, weight = FontWeight.Normal, style = FontStyle.Italic),
         Font(R.font.berkeley_mono_bold, weight = FontWeight.Bold, style = FontStyle.Normal),
         Font(R.font.berkeley_mono_bold_oblique, weight = FontWeight.Bold, style = FontStyle.Italic),
     )
+
+private val Mono = BerkeleyMono
 
 private fun buildTypography(fontFamily: FontFamily) =
     Typography(

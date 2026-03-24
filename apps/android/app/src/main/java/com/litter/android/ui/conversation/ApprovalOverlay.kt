@@ -1,0 +1,267 @@
+package com.litter.android.ui.conversation
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.material3.OutlinedTextField
+import com.litter.android.ui.BerkeleyMono
+import com.litter.android.ui.LitterTheme
+import kotlinx.coroutines.launch
+import uniffi.codex_mobile_client.AppStore
+import uniffi.codex_mobile_client.ApprovalDecisionValue
+import uniffi.codex_mobile_client.ApprovalKind
+import uniffi.codex_mobile_client.PendingApproval
+import uniffi.codex_mobile_client.PendingUserInputAnswer
+import uniffi.codex_mobile_client.PendingUserInputRequest
+
+/**
+ * Full-screen overlay for pending approvals and user input requests.
+ * Reads typed [PendingApproval] from Rust snapshot — no parsing needed.
+ */
+@Composable
+fun ApprovalOverlay(
+    approvals: List<PendingApproval>,
+    userInputs: List<PendingUserInputRequest>,
+    appStore: AppStore,
+) {
+    val scope = rememberCoroutineScope()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.7f))
+            .clickable(enabled = false) { /* block interaction */ },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            for (approval in approvals) {
+                ApprovalCard(
+                    approval = approval,
+                    onDecision = { decision ->
+                        scope.launch {
+                            appStore.respondToApproval(approval.id, decision)
+                        }
+                    },
+                )
+            }
+
+            for (input in userInputs) {
+                UserInputCard(
+                    request = input,
+                    onSubmit = { answers ->
+                        scope.launch {
+                            appStore.respondToUserInput(input.id, answers)
+                        }
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ApprovalCard(
+    approval: PendingApproval,
+    onDecision: (ApprovalDecisionValue) -> Unit,
+) {
+    val title = when (approval.kind) {
+        ApprovalKind.COMMAND -> "Run command?"
+        ApprovalKind.FILE_CHANGE -> "File change?"
+        ApprovalKind.PERMISSIONS -> "Grant permission?"
+        ApprovalKind.MCP_ELICITATION -> "Tool request"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(LitterTheme.surface, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = title,
+            color = LitterTheme.textPrimary,
+            fontSize = 16.sp,
+        )
+
+        // Command text
+        approval.command?.let { cmd ->
+            Text(
+                text = cmd,
+                color = LitterTheme.accent,
+                fontFamily = LitterTheme.monoFont,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(LitterTheme.codeBackground, RoundedCornerShape(6.dp))
+                    .padding(8.dp),
+            )
+        }
+
+        // CWD
+        approval.cwd?.let { cwd ->
+            Text(
+                text = "in $cwd",
+                color = LitterTheme.textSecondary,
+                fontSize = 12.sp,
+            )
+        }
+
+        // Path (for file changes)
+        approval.path?.let { path ->
+            Text(
+                text = path,
+                color = LitterTheme.textSecondary,
+                fontFamily = LitterTheme.monoFont,
+                fontSize = 12.sp,
+            )
+        }
+
+        // Buttons
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            OutlinedButton(
+                onClick = { onDecision(ApprovalDecisionValue.DECLINE) },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Deny")
+            }
+            OutlinedButton(
+                onClick = { onDecision(ApprovalDecisionValue.ACCEPT_FOR_SESSION) },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Allow session")
+            }
+            Button(
+                onClick = { onDecision(ApprovalDecisionValue.ACCEPT) },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = LitterTheme.accent,
+                    contentColor = Color.Black,
+                ),
+            ) {
+                Text("Allow")
+            }
+        }
+    }
+}
+
+@Composable
+private fun UserInputCard(
+    request: PendingUserInputRequest,
+    onSubmit: (List<PendingUserInputAnswer>) -> Unit,
+) {
+    val answers = remember { mutableMapOf<String, String>() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(LitterTheme.surface, RoundedCornerShape(12.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Requester badge
+        val requester = buildString {
+            request.requesterAgentNickname?.let { append(it) }
+            request.requesterAgentRole?.let {
+                if (isNotEmpty()) append(" ")
+                append("[$it]")
+            }
+        }
+        if (requester.isNotBlank()) {
+            Text(
+                text = requester,
+                color = LitterTheme.accent,
+                fontSize = 11.sp,
+            )
+        }
+
+        for (question in request.questions) {
+            Text(
+                text = question.question,
+                color = LitterTheme.textPrimary,
+                fontSize = 14.sp,
+            )
+
+            if (question.options.isNotEmpty()) {
+                // Options as chips
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (option in question.options) {
+                        val isSelected = answers[question.id] == option.label
+                        Button(
+                            onClick = { answers[question.id] = option.label },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isSelected) LitterTheme.accent else LitterTheme.codeBackground,
+                                contentColor = if (isSelected) Color.Black else LitterTheme.textPrimary,
+                            ),
+                        ) {
+                            Text(option.label, fontSize = 12.sp)
+                        }
+                    }
+                }
+            } else {
+                // Free text input
+                var text by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = {
+                        text = it
+                        answers[question.id] = it
+                    },
+                    label = { Text(question.header ?: "Answer") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                val answerList = request.questions.map { q ->
+                    PendingUserInputAnswer(
+                        questionId = q.id,
+                        answers = listOfNotNull(answers[q.id]),
+                    )
+                }
+                onSubmit(answerList)
+            },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = LitterTheme.accent,
+                contentColor = Color.Black,
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Submit")
+        }
+    }
+}

@@ -32,5 +32,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation(project(":core:network"))
+    api("net.java.dev.jna:jna:5.14.0@aar")
 }

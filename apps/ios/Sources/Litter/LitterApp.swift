@@ -5,6 +5,11 @@ import os
 
 class AppDelegate: NSObject, UIApplicationDelegate {
     private var pendingPushToken: Data?
+    private var splashWindow: UIWindow?
+    private var minTimeElapsed = false
+    private var contentReady = false
+    private var splashDismissed = false
+
     weak var appRuntime: AppRuntimeController? {
         didSet {
             if let token = pendingPushToken {
@@ -17,15 +22,77 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         codex_ios_system_init()
         application.registerForRemoteNotifications()
+        showSplashWindow()
         scheduleKeyboardWarmup()
         return true
     }
 
+    // MARK: - Splash window (sits above keyboard)
+
+    private func showSplashWindow() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+                self.showSplashWindow()
+                return
+            }
+            let window = UIWindow(windowScene: scene)
+            // Keyboard window is typically at level ~10000. Go above it.
+            window.windowLevel = UIWindow.Level(rawValue: 10000002)
+            let hosting = UIHostingController(rootView:
+                AnimatedSplashView(appReady: true) {}
+            )
+            hosting.view.backgroundColor = .clear
+            window.rootViewController = hosting
+            window.makeKeyAndVisible()
+            self.splashWindow = window
+
+            // Minimum display time
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                self.minTimeElapsed = true
+                self.tryDismissSplash()
+            }
+            // Hard max
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                self.forceDismissSplash()
+            }
+        }
+    }
+
+    /// Called by ContentView when the main UI has appeared.
+    func signalContentReady() {
+        contentReady = true
+        tryDismissSplash()
+    }
+
+    private func tryDismissSplash() {
+        guard !splashDismissed, minTimeElapsed, contentReady else { return }
+        dismissSplash()
+    }
+
+    private func forceDismissSplash() {
+        guard !splashDismissed else { return }
+        dismissSplash()
+    }
+
+    private func dismissSplash() {
+        splashDismissed = true
+        guard let window = splashWindow else { return }
+        UIView.animate(withDuration: 0.35, animations: {
+            window.alpha = 0
+        }, completion: { _ in
+            window.isHidden = true
+            window.rootViewController = nil
+            self.splashWindow = nil
+        })
+    }
+
+    // MARK: - Keyboard warmup
+
     private func scheduleKeyboardWarmup() {
+        // Load the real system keyboard while the splash window covers it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                  let window = scene.keyWindow ?? scene.windows.first else {
-                // Window not ready yet, retry
+                  let window = scene.windows.first(where: { $0 !== self.splashWindow }) else {
                 self.scheduleKeyboardWarmup()
                 return
             }
@@ -114,6 +181,7 @@ struct ContentView: View {
     @State private var stableSafeAreaInsets = StableSafeAreaInsets()
     @State private var conversationWarmup = ConversationWarmupCoordinator()
     @State private var composerBottomInset: CGFloat = 0
+    @State private var splashDismissed = false
     @AppStorage("conversationTextSizeStep") private var textSizeStep = ConversationTextSize.large.rawValue
 
     private var textScale: CGFloat {
@@ -134,6 +202,12 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .id(themeManager.themeVersion)
+                .onAppear {
+                    if !splashDismissed {
+                        splashDismissed = true
+                        (UIApplication.shared.delegate as? AppDelegate)?.signalContentReady()
+                    }
+                }
 
                 if let approval = appModel.snapshot?.pendingApprovals.first {
                     ApprovalPromptView(approval: approval) { decision in
@@ -154,6 +228,7 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
+
             }
             .ignoresSafeArea(.container)
             .task {

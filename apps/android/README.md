@@ -1,29 +1,24 @@
 # Android App
 
-Native Android app scaffold with module boundaries aligned to iOS feature flows:
+Android runtime is now on the same Rust-first architecture as iOS:
 
 - `app`: Android entrypoint/activity.
-- `core:network`: discovery/network primitives.
-- `core:bridge`: JSON-RPC bridge surface placeholders.
-- `feature:discovery`: server discovery flow.
-- `feature:sessions`: session listing/resume flow.
-- `feature:conversation`: turn/message flow.
+- `core:bridge`: UniFFI-generated bindings plus Android Rust init/bootstrap.
 
-## Runtime Transport Lanes
+## Runtime Architecture
 
-- Canonical app-runtime websocket transport: `app/src/main/java/com/litter/android/state/BridgeRpcTransport.kt`.
-  - Used by `ServerManager` for session/message/account flows against local or remote Codex servers.
-- On-device bootstrap transport: `core/bridge/src/main/java/com/litter/android/core/bridge/JsonRpcWebSocketClient.kt` via `CodexRpcClient`.
-  - Used to start/connect the embedded on-device bridge server and support legacy callers.
+- Canonical runtime state lives in Rust `AppStore` and is observed from `app/src/main/java/com/litter/android/state/AppModel.kt`.
+- Direct upstream app-server methods come from generated `AppServerRpc`.
+- Discovery uses Android NSD only for mDNS seeds; merge/dedupe/probing live in Rust `DiscoveryBridge`.
+- SSH uses Rust `SshBridge`.
+- Voice runtime uses Rust store/RPC for realtime state and Android-only code for audio capture/playback, AEC, and services.
 
-## Runtime Startup Flavors
+## Local Runtime
 
-- `onDeviceDebug` / `onDeviceRelease`
-  - `BuildConfig.ENABLE_ON_DEVICE_BRIDGE=true`
-  - Startup mode: `hybrid` (remote + on-device startup paths available)
-- `remoteOnlyDebug` / `remoteOnlyRelease`
-  - `BuildConfig.ENABLE_ON_DEVICE_BRIDGE=false`
-  - Startup mode: `remote_only` (on-device startup path is blocked in `CodexRpcClient`)
+- Android local runtime uses the same in-process Rust app-server model as iOS.
+- `MainActivity` connects the default local server through `ServerBridge.connectLocalServer(...)`.
+- There is no separate bundled Android Codex process in the active app path.
+- `codex-bridge` is only the Android bootstrap/JNI shim; `codex-mobile-client` is the runtime surface.
 
 Examples:
 
@@ -57,7 +52,8 @@ QA matrix and regression command list: `apps/android/docs/qa-matrix.md`.
 
 ## Rust Bridge (Android)
 
-The Android bridge module loads a Rust shared library named `libcodex_bridge.so`.
+Android loads the Rust shared library `libcodex_bridge.so` through UniFFI init in `core:bridge`.
+The generated Kotlin bindings live under `shared/rust-bridge/generated/kotlin/` and are consumed directly by `apps/android/core/bridge`.
 
 Build and copy JNI artifacts into `core:bridge`:
 

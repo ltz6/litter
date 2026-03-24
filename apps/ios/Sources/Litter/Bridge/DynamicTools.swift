@@ -10,6 +10,15 @@ struct DynamicToolSpecParams: Encodable {
     enum CodingKeys: String, CodingKey {
         case name, description, inputSchema
     }
+
+    func rpcSpec(deferLoading: Bool = false) throws -> DynamicToolSpec {
+        try DynamicToolSpec(
+            name: name,
+            description: description,
+            inputSchema: JsonValue(encodable: inputSchema),
+            deferLoading: deferLoading
+        )
+    }
 }
 
 // MARK: - Dynamic Tool Call Helpers

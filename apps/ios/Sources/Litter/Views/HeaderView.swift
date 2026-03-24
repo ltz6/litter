@@ -3,6 +3,7 @@ import SwiftUI
 struct HeaderView: View {
     @Environment(AppState.self) private var appState
     @Environment(AppModel.self) private var appModel
+    @Environment(\.openURL) private var openURL
     let thread: AppThreadSnapshot
     let onBack: () -> Void
     @State private var isReloading = false
@@ -212,6 +213,9 @@ struct HeaderView: View {
             Task {
                 isReloading = true
                 defer { isReloading = false }
+                if await handleRemoteLoginIfNeeded() {
+                    return
+                }
                 if server?.account == nil {
                     appState.showSettings = true
                 } else {
@@ -260,6 +264,28 @@ struct HeaderView: View {
         }
         .accessibilityIdentifier("header.reloadButton")
         .disabled(isReloading || server?.isConnected != true)
+    }
+
+    private func handleRemoteLoginIfNeeded() async -> Bool {
+        guard let server, !server.isLocal else {
+            return false
+        }
+        guard server.account == nil || server.requiresOpenaiAuth else {
+            return false
+        }
+        do {
+            let response = try await appModel.rpc.loginAccount(
+                serverId: server.serverId,
+                params: .chatgpt
+            )
+            if case .chatgpt(_, let authURL) = response,
+               let url = URL(string: authURL) {
+                await MainActor.run {
+                    openURL(url)
+                }
+            }
+        } catch {}
+        return true
     }
 
     private func reloadLaunchConfig() -> AppThreadLaunchConfig {

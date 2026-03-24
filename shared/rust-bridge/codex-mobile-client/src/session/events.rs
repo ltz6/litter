@@ -359,6 +359,12 @@ impl EventProcessor {
             // ── Realtime / voice ────────────────────────────────────
             ServerNotification::ThreadRealtimeStarted(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
+                eprintln!(
+                    "[codex-mobile-client] ThreadRealtimeStarted server_id={} thread_id={} session_id={:?}",
+                    server_id,
+                    n.thread_id,
+                    n.session_id
+                );
                 self.emit(UiEvent::RealtimeStarted {
                     key,
                     notification: n.clone(),
@@ -378,7 +384,6 @@ impl EventProcessor {
                     notification: n.clone(),
                 });
             }
-
             // ── Errors ──────────────────────────────────────────────
             ServerNotification::Error(n) => {
                 let key = Some(Self::make_key(server_id, &n.thread_id));
@@ -394,6 +399,12 @@ impl EventProcessor {
             }
             ServerNotification::ThreadRealtimeError(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
+                eprintln!(
+                    "[codex-mobile-client] ThreadRealtimeError server_id={} thread_id={} message={}",
+                    server_id,
+                    n.thread_id,
+                    n.message
+                );
                 self.emit(UiEvent::RealtimeError {
                     key,
                     notification: n.clone(),
@@ -401,6 +412,12 @@ impl EventProcessor {
             }
             ServerNotification::ThreadRealtimeClosed(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
+                eprintln!(
+                    "[codex-mobile-client] ThreadRealtimeClosed server_id={} thread_id={} reason={:?}",
+                    server_id,
+                    n.thread_id,
+                    n.reason
+                );
                 self.emit(UiEvent::RealtimeClosed {
                     key,
                     notification: n.clone(),

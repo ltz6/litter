@@ -261,7 +261,8 @@ object LitterThemeManager {
             val nightModeFlags = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
             val systemIsDarkMode = nightModeFlags == Configuration.UI_MODE_NIGHT_YES
             val hasDarkModePref = preferences?.contains(DARK_MODE_KEY) ?: false
-            val storedDark = if (hasDarkModePref) preferences?.getBoolean(DARK_MODE_KEY, false) ?: false else systemIsDarkMode
+            // Default to dark mode (matching iOS) when no preference is stored
+            val storedDark = if (hasDarkModePref) preferences?.getBoolean(DARK_MODE_KEY, false) ?: false else true
             darkModeEnabled = storedDark
             activeTheme = if (storedDark) darkTheme else lightTheme
             monoFontEnabled = preferences?.getBoolean(FONT_MONO_KEY, true) ?: true

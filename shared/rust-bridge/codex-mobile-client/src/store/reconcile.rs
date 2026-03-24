@@ -14,7 +14,7 @@ impl MobileClient {
     /// - mutations without authoritative payloads trigger targeted refreshes
     /// - event-complete RPCs are no-ops because upstream notifications drive
     ///   the reducer already
-    pub(crate) async fn reconcile_public_rpc<P: Any, R: Any>(
+    pub async fn reconcile_public_rpc<P: Any, R: Any>(
         &self,
         wire_method: &str,
         server_id: &str,

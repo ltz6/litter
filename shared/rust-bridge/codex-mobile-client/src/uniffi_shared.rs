@@ -80,6 +80,23 @@ pub enum AppVoiceSpeaker {
     Assistant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Enum)]
+pub enum AppVoiceSessionPhase {
+    Connecting,
+    Listening,
+    Speaking,
+    Thinking,
+    Handoff,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Record)]
+pub struct AppVoiceTranscriptEntry {
+    pub item_id: String,
+    pub speaker: AppVoiceSpeaker,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Record)]
 pub struct AppVoiceTranscriptUpdate {
     pub item_id: String,

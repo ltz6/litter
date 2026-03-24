@@ -170,6 +170,10 @@ impl AppStore {
     pub fn set_active_thread(&self, key: Option<ThreadKey>) {
         self.inner.set_active_thread(key);
     }
+
+    pub fn set_voice_handoff_thread(&self, key: Option<ThreadKey>) {
+        self.inner.set_voice_handoff_thread(key);
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]

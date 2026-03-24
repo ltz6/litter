@@ -60,14 +60,42 @@ struct RealtimeVoiceScreen: View {
         } ?? []
     }
 
+    private var visibleTranscriptEntries: [VoiceSessionTranscriptEntry] {
+        var entries = transcriptHistory
+        guard let session else { return entries }
+
+        let liveText = session.transcriptText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !liveText.isEmpty else { return entries }
+
+        let speaker = session.transcriptSpeaker?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? session.transcriptSpeaker!
+            : (session.phase == .speaking ? "Codex" : "You")
+        let liveId = session.transcriptLiveMessageID ?? "live-\(speaker.lowercased())"
+        let timestamp = entries.first(where: { $0.id == liveId })?.timestamp ?? Date()
+        let entry = VoiceSessionTranscriptEntry(
+            id: liveId,
+            speaker: speaker,
+            text: liveText,
+            timestamp: timestamp
+        )
+
+        if let existingIndex = entries.firstIndex(where: { $0.id == liveId }) {
+            entries[existingIndex] = entry
+        } else {
+            entries.append(entry)
+        }
+        return entries
+    }
+
     private var transcriptScrollSignature: String? {
-        guard let last = transcriptHistory.last else { return nil }
+        guard let last = visibleTranscriptEntries.last else { return nil }
         return "\(last.id):\(last.text.count)"
     }
 
     private var shouldShowApiKeyPrompt: Bool {
         guard hasCheckedAuth,
               let server,
+              server.isLocal,
               phase == .connecting else {
             return false
         }
@@ -167,7 +195,7 @@ struct RealtimeVoiceScreen: View {
                     .tracking(2)
             }
 
-            if transcriptHistory.isEmpty {
+            if visibleTranscriptEntries.isEmpty {
                 AudioWaveformView(
                     level: Float(phase == .listening ? inputLevel : outputLevel),
                     tint: phaseColor
@@ -179,11 +207,11 @@ struct RealtimeVoiceScreen: View {
                     ScrollViewReader { proxy in
                         ScrollView(.vertical, showsIndicators: false) {
                             VStack(spacing: 18) {
-                                ForEach(Array(transcriptHistory.enumerated()), id: \.element.id) { index, entry in
+                                ForEach(Array(visibleTranscriptEntries.enumerated()), id: \.element.id) { index, entry in
                                     transcriptLine(
                                         entry,
                                         isLive: false,
-                                        recencyIndex: transcriptHistory.count - index - 1
+                                        recencyIndex: visibleTranscriptEntries.count - index - 1
                                     )
                                     .id(entry.id)
                                 }
@@ -192,7 +220,7 @@ struct RealtimeVoiceScreen: View {
                             .frame(minHeight: geometry.size.height, alignment: .center)
                         }
                         .onChange(of: transcriptScrollSignature) { _, _ in
-                            guard let next = transcriptHistory.last?.id else { return }
+                            guard let next = visibleTranscriptEntries.last?.id else { return }
                             withAnimation(.easeOut(duration: 0.18)) {
                                 proxy.scrollTo(next, anchor: .bottom)
                             }
@@ -311,6 +339,10 @@ struct RealtimeVoiceScreen: View {
 
     private func saveApiKeyAndRetry() {
         guard !trimmedApiKey.isEmpty, !isSavingApiKey else { return }
+        guard server?.isLocal == true else {
+            apiKeyError = "Realtime API keys are only saved on the local server."
+            return
+        }
 
         isSavingApiKey = true
         apiKeyError = nil

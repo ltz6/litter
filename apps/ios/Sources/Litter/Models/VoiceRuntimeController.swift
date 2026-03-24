@@ -260,13 +260,15 @@ final class VoiceRuntimeController: VoiceActions {
         syncVoiceCallActivity()
 
         do {
+            let dynamicTools = try CrossServerTools.buildDynamicToolSpecs().map { try $0.rpcSpec() }
             _ = try await appModel.rpc.threadRealtimeStart(
                 serverId: key.serverId,
                 params: ThreadRealtimeStartParams(
                     threadId: key.threadId,
                     prompt: realtimePrompt(),
                     sessionId: runtimeSessionId,
-                    clientControlledHandoff: true
+                    clientControlledHandoff: true,
+                    dynamicTools: dynamicTools
                 )
             )
         } catch {
@@ -328,10 +330,8 @@ final class VoiceRuntimeController: VoiceActions {
     private func handleRealtimeStarted(key: ThreadKey, notification: ThreadRealtimeStartedNotification) {
         guard var session = activeVoiceSession, session.threadKey == key else { return }
         session.sessionId = notification.sessionId
-        session.phase = .listening
         session.isListening = true
         activeVoiceSession = session
-        syncVoiceCallActivity()
 
         do {
             try voiceSessionCoordinator.start { [weak self] chunk in
@@ -340,54 +340,18 @@ final class VoiceRuntimeController: VoiceActions {
             }
         } catch {
             failVoiceSession(error.localizedDescription)
+            return
         }
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func handleRealtimeTranscriptUpdated(key: ThreadKey, update: AppVoiceTranscriptUpdate) {
-        guard var session = activeVoiceSession, session.threadKey == key else { return }
-
-        let speaker = voiceSpeakerLabel(update.speaker)
-        let entry = VoiceSessionTranscriptEntry(
-            id: update.itemId,
-            speaker: speaker,
-            text: update.text,
-            timestamp: existingTranscriptTimestamp(id: update.itemId, in: session) ?? Date()
-        )
-
-        if let existingIndex = session.transcriptHistory.firstIndex(where: { $0.id == update.itemId }) {
-            session.transcriptHistory[existingIndex] = entry
-        } else {
-            session.transcriptHistory.append(entry)
-        }
-
-        if update.isFinal {
-            if session.transcriptLiveMessageID == update.itemId || session.transcriptSpeaker == speaker {
-                session.transcriptText = nil
-                session.transcriptSpeaker = nil
-                session.transcriptLiveMessageID = nil
-            }
-            if update.speaker == .assistant, !session.isSpeaking {
-                session.phase = .thinking
-            }
-        } else {
-            session.transcriptText = update.text
-            session.transcriptSpeaker = speaker
-            session.transcriptLiveMessageID = update.itemId
-            session.phase = voiceSpeakerPhase(update.speaker)
-        }
-
-        activeVoiceSession = session
-        syncVoiceCallActivity()
+        guard activeVoiceSession?.threadKey == key else { return }
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func handleRealtimeHandoffRequested(key: ThreadKey, request: AppVoiceHandoffRequest) {
-        guard var session = activeVoiceSession, session.threadKey == key else { return }
-
-        session.transcriptText = nil
-        session.transcriptSpeaker = nil
-        session.transcriptLiveMessageID = nil
-        activeVoiceSession = session
-        syncVoiceCallActivity()
+        guard activeVoiceSession?.threadKey == key else { return }
 
         syncHandoffServers()
         handoffManager.handleHandoffRequest(
@@ -400,21 +364,13 @@ final class VoiceRuntimeController: VoiceActions {
             fallbackTranscript: request.fallbackTranscript
         )
         processHandoffActions()
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func handleRealtimeSpeechStarted(key: ThreadKey) {
-        guard var session = activeVoiceSession, session.threadKey == key else { return }
+        guard activeVoiceSession?.threadKey == key else { return }
         voiceSessionCoordinator.flushPlayback()
-        if session.transcriptSpeaker == "Codex" || session.transcriptSpeaker == nil {
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-        }
-        if session.phase != .error {
-            session.phase = .listening
-        }
-        activeVoiceSession = session
-        syncVoiceCallActivity()
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func handleRealtimeOutputAudioDelta(key: ThreadKey, notification: ThreadRealtimeOutputAudioDeltaNotification) {
@@ -427,18 +383,21 @@ final class VoiceRuntimeController: VoiceActions {
         if notification.message.contains("active response in progress") {
             return
         }
-        failVoiceSession(notification.message)
+        voiceSessionCoordinator.stop()
+        voiceInputDecayToken = nil
+        voiceOutputDecayToken = nil
+        if var session = activeVoiceSession {
+            session.isListening = false
+            session.isSpeaking = false
+            session.inputLevel = 0
+            session.outputLevel = 0
+            activeVoiceSession = session
+        }
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func handleRealtimeClosed(key: ThreadKey, notification: ThreadRealtimeClosedNotification) {
         guard activeVoiceSession?.threadKey == key else { return }
-
-        if var session = activeVoiceSession, session.threadKey == key {
-            session.transcriptText = nil
-            session.transcriptSpeaker = nil
-            session.transcriptLiveMessageID = nil
-            activeVoiceSession = session
-        }
 
         let reason = notification.reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if voiceStopRequestedThreadKey == key || reason == "requested" {
@@ -446,7 +405,17 @@ final class VoiceRuntimeController: VoiceActions {
             endVoiceSessionImmediately()
             return
         }
-        failVoiceSession(reason.isEmpty ? "Voice session closed" : reason)
+        voiceSessionCoordinator.stop()
+        voiceInputDecayToken = nil
+        voiceOutputDecayToken = nil
+        if var session = activeVoiceSession {
+            session.isListening = false
+            session.isSpeaking = false
+            session.inputLevel = 0
+            session.outputLevel = 0
+            activeVoiceSession = session
+        }
+        scheduleSharedVoiceSessionSync(for: key)
     }
 
     private func processHandoffActions() {
@@ -497,10 +466,8 @@ final class VoiceRuntimeController: VoiceActions {
             appModel.store.setActiveThread(key: key)
             await appModel.refreshSnapshot()
             handoffManager.reportThreadCreated(handoffId: handoffId, serverId: serverId, threadId: key.threadId)
-            if var session = activeVoiceSession {
-                session.handoffRemoteThreadKey = key
-                activeVoiceSession = session
-            }
+            appModel.store.setVoiceHandoffThread(key: key)
+            await syncSharedVoiceSessionFromStore(for: activeVoiceSession?.threadKey)
             processHandoffActions()
         } catch {
             handoffManager.reportThreadFailed(handoffId: handoffId, error: error.localizedDescription)
@@ -555,6 +522,7 @@ final class VoiceRuntimeController: VoiceActions {
                 outputText: text
             )
         )
+        processHandoffActions()
     }
 
     private func executeHandoffFinalize(
@@ -570,13 +538,9 @@ final class VoiceRuntimeController: VoiceActions {
             )
         )
         handoffManager.reportFinalized(handoffId: handoffId)
+        requireAppModel().store.setVoiceHandoffThread(key: nil)
+        await syncSharedVoiceSessionFromStore(for: activeVoiceSession?.threadKey)
         processHandoffActions()
-        if var session = activeVoiceSession {
-            session.phase = .listening
-            session.handoffRemoteThreadKey = nil
-            activeVoiceSession = session
-            syncVoiceCallActivity()
-        }
     }
 
     private func startHandoffStreamPolling(handoffId: String, key: ThreadKey) {
@@ -614,9 +578,6 @@ final class VoiceRuntimeController: VoiceActions {
         case .inputLevel(let level):
             session.inputLevel = level
             session.isListening = true
-            if level > 0.05, !session.isSpeaking {
-                session.phase = .listening
-            }
             activeVoiceSession = session
             syncVoiceCallActivity()
 
@@ -631,9 +592,7 @@ final class VoiceRuntimeController: VoiceActions {
                     return
                 }
                 current.inputLevel = 0
-                if !current.isSpeaking && current.phase != .error {
-                    current.phase = .thinking
-                }
+                current.isListening = false
                 self.activeVoiceSession = current
                 self.syncVoiceCallActivity()
             }
@@ -641,9 +600,6 @@ final class VoiceRuntimeController: VoiceActions {
         case .outputLevel(let level):
             session.outputLevel = level
             session.isSpeaking = level > 0.02
-            if session.isSpeaking {
-                session.phase = .speaking
-            }
             activeVoiceSession = session
             syncVoiceCallActivity()
 
@@ -659,9 +615,6 @@ final class VoiceRuntimeController: VoiceActions {
                 }
                 current.outputLevel = 0
                 current.isSpeaking = false
-                if current.phase != .error {
-                    current.phase = .listening
-                }
                 self.activeVoiceSession = current
                 self.syncVoiceCallActivity()
             }
@@ -672,9 +625,7 @@ final class VoiceRuntimeController: VoiceActions {
             syncVoiceCallActivity()
 
         case .interrupted:
-            session.phase = .thinking
-            activeVoiceSession = session
-            syncVoiceCallActivity()
+            break
 
         case .failure(let message):
             failVoiceSession(message)
@@ -727,7 +678,6 @@ final class VoiceRuntimeController: VoiceActions {
 
     private func updateVoiceSessionForPendingStop(_ key: ThreadKey) {
         guard var session = activeVoiceSession, session.threadKey == key else { return }
-        session.phase = .thinking
         session.isListening = false
         session.isSpeaking = false
         session.inputLevel = 0
@@ -843,24 +793,81 @@ final class VoiceRuntimeController: VoiceActions {
         lastHandledVoiceEndRequestToken = token
         Task { await stopActiveVoiceSession() }
     }
+
+    private func scheduleSharedVoiceSessionSync(for key: ThreadKey?) {
+        Task { @MainActor [weak self] in
+            await self?.syncSharedVoiceSessionFromStore(for: key)
+        }
+    }
+
+    private func syncSharedVoiceSessionFromStore(for key: ThreadKey?) async {
+        guard let appModel else { return }
+        let expectedKey = key ?? activeVoiceSession?.threadKey
+        await appModel.refreshSnapshot()
+        guard var session = activeVoiceSession else { return }
+        guard expectedKey == nil || session.threadKey == expectedKey else { return }
+
+        let shared = appModel.snapshot?.voiceSession
+        if shared?.activeThread == session.threadKey || shared?.phase == .error {
+            applySharedVoiceSession(shared, to: &session)
+            activeVoiceSession = session
+            syncVoiceCallActivity()
+        }
+    }
 }
 
 private extension VoiceRuntimeController {
+    func applySharedVoiceSession(_ shared: AppVoiceSessionSnapshot?, to session: inout VoiceSessionState) {
+        session.phase = shared?.phase.map(voiceSessionPhase) ?? .connecting
+        session.lastError = shared?.lastError
+        session.handoffRemoteThreadKey = shared?.handoffThreadKey
+
+        let entries = (shared?.transcriptEntries ?? []).map {
+            VoiceSessionTranscriptEntry(
+                id: $0.itemId,
+                speaker: voiceSpeakerLabel($0.speaker),
+                text: $0.text,
+                timestamp: existingTranscriptTimestamp(id: $0.itemId, in: session) ?? Date()
+            )
+        }
+        session.transcriptHistory = entries.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        if let last = session.transcriptHistory.last {
+            session.transcriptText = last.text
+            session.transcriptSpeaker = last.speaker
+            session.transcriptLiveMessageID = last.id
+        } else {
+            session.transcriptText = nil
+            session.transcriptSpeaker = nil
+            session.transcriptLiveMessageID = nil
+        }
+    }
+
+    func voiceSessionPhase(_ phase: AppVoiceSessionPhase) -> VoiceSessionPhase {
+        switch phase {
+        case .connecting:
+            return .connecting
+        case .listening:
+            return .listening
+        case .speaking:
+            return .speaking
+        case .thinking:
+            return .thinking
+        case .handoff:
+            return .handoff
+        case .error:
+            return .error
+        }
+    }
+
     func voiceSpeakerLabel(_ speaker: AppVoiceSpeaker) -> String {
         switch speaker {
         case .user:
             return "You"
         case .assistant:
             return "Codex"
-        }
-    }
-
-    func voiceSpeakerPhase(_ speaker: AppVoiceSpeaker) -> VoiceSessionPhase {
-        switch speaker {
-        case .user:
-            return .listening
-        case .assistant:
-            return .speaking
         }
     }
 

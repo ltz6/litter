@@ -33,7 +33,7 @@ Current automated checks:
 | Connect local/on-device | Success (`ServerConfig.local`) | Expected failure with clear "disabled" error |
 | Connect remote server | Success | Success |
 | Local transport drop | Reconnect and one-time reinitialize before next non-initialize RPC | N/A (local startup disabled) |
-| Remote transport drop | Reconnect behavior via `BridgeRpcTransport` and resumed RPC notifications | Same |
+| Remote transport drop | Reconnect behavior via Rust `AppStore` updates and resumed RPC notifications | Same |
 | Thread start/resume fallback sandbox | `workspace-write` with `danger-full-access` fallback when linux sandbox missing | Same |
 
 ## Suggested Smoke Steps

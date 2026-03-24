@@ -44,20 +44,9 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "8BF6D89AC27372E86DCE83EC"
-               BuildableName = "CodexIOSTests.xctest"
-               BlueprintName = "CodexIOSTests"
-               ReferencedContainer = "container:Litter.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "5756C56A34DBBD0841611B1B"
-               BuildableName = "CodexIOSUITests.xctest"
-               BlueprintName = "CodexIOSUITests"
+               BlueprintIdentifier = "7BB0106D190F10717D781234"
+               BuildableName = "LitterUITests.xctest"
+               BlueprintName = "LitterUITests"
                ReferencedContainer = "container:Litter.xcodeproj">
             </BuildableReference>
          </TestableReference>

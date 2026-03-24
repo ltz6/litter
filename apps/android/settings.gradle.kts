@@ -16,8 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "LitterAndroid"
 include(":app")
-include(":core:network")
 include(":core:bridge")
-include(":feature:conversation")
-include(":feature:sessions")
-include(":feature:discovery")

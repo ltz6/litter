@@ -5,16 +5,17 @@
 - `apps/ios/Sources/Litter/Views/` holds SwiftUI screens, `Models/` contains app state/session logic, and `Bridge/` contains JSON-RPC + C FFI bridge code.
 - `apps/android/app/src/main/java/com/litter/android/ui/` contains Android Compose shell/screens.
 - `apps/android/app/src/main/java/com/litter/android/state/` contains Android app state, server/session manager, SSH, and websocket transport.
-- `apps/android/core/bridge/` contains Android core native bridge bootstrap and websocket client.
-- `apps/android/core/network/` contains Android discovery services (Bonjour/Tailscale/LAN probing).
+- `apps/android/core/bridge/` contains Android UniFFI bootstrap and generated Rust bindings.
 - `apps/android/app/src/test/java/` contains Android unit tests.
 - `apps/android/docs/qa-matrix.md` tracks Android parity QA coverage.
-- `shared/rust-bridge/codex-mobile-client/` is the shared Rust client library consumed by both iOS and Android. Modules: `types/` (protocol types), `transport/` (WebSocket + in-process channel + JSON-RPC), `session/` (connection, threads, events, voice handoff), `auth.rs`, `discovery.rs`, `ssh.rs`, `parser.rs`, `hydration.rs`. `MobileClient` is the top-level facade both platforms interact with.
-- `shared/rust-bridge/codex-bridge/` has C FFI entry points (`codex_mobile_client_init/call/destroy/subscribe_events`) exposed through `shared/rust-bridge/codex-bridge/include/codex_bridge.h`.
+- `shared/rust-bridge/codex-mobile-client/` is the single shared Rust client library consumed by both iOS and Android. It owns the public UniFFI surface, generated upstream RPC coverage, canonical store/reducer state, hydration, discovery, SSH, and shared runtime logic. `MobileClient` is the top-level internal Rust facade.
+- `shared/rust-bridge/codex-ios-audio/` contains the iOS-only audio/AEC implementation used by `codex-mobile-client`.
+- `shared/rust-bridge/codex-bridge/` is legacy C-FFI support that should not be used for new mobile runtime features.
 - `apps/ios/Sources/Litter/Bridge/Rust*.swift` — iOS bridge files mapping Swift to the shared Rust layer.
-- `apps/android/core/bridge/.../Rust*.kt` — Android bridge files mapping Kotlin to the shared Rust layer.
+- `apps/android/core/bridge/.../Rust*.kt` — Android bridge files mapping Kotlin to the shared Rust layer. UniFFI Kotlin sources are generated into `shared/rust-bridge/generated/kotlin/` and consumed directly from there; do not maintain copied binding files under Android source roots.
 - `shared/third_party/codex/` is the upstream Codex submodule.
-- `apps/ios/Frameworks/` contains generated/downloaded iOS XCFrameworks (`codex_bridge.xcframework` and `ios_system/*`); these artifacts are not committed.
+- `apps/ios/GeneratedRust/` contains local generated Rust artifacts for iOS builds: UniFFI headers/modulemap plus raw device/simulator staticlibs. These artifacts are not committed.
+- `apps/ios/Frameworks/` contains downloaded/package-lane iOS XCFrameworks (`codex_mobile_client.xcframework` in package builds and `ios_system/*`). These artifacts are not committed.
 - `apps/ios/project.yml` is the source of truth for project generation; regenerate `apps/ios/Litter.xcodeproj` instead of hand-editing project files.
 
 ## Architecture
@@ -22,17 +23,18 @@
 - **iOS state management:** `AppStore` (Rust, via UniFFI) is the canonical runtime state owner. `AppModel` is the thin Swift observation shell over Rust snapshots and updates. `AppState` is UI-only state.
 - **iOS server flow:** discovery and SSH are separate utility bridges; thread/session/account operations come from generated Rust RPC plus store updates.
 - **Android root layout:** `LitterAppShell` is the Compose entry; `DefaultLitterAppState` maps backend state into UI state.
-- **Android state/transport:** Android should converge on the same Rust-owned runtime model as iOS instead of re-implementing shared session/thread/account logic in Kotlin.
-- **Android server flow:** Discovery sheet + SSH login sheet + settings/account sheets drive connection, auth, and server management.
+- **Android state/transport:** Android should use the same Rust-owned runtime model as iOS instead of re-implementing shared session/thread/account logic in Kotlin.
+- **Android server flow:** discovery seeds come from Android NSD, but discovery merge/probe policy lives in Rust; connection, auth, and thread/account flows go through Rust RPC + store updates.
 - **Message rendering parity:** both platforms support reasoning/system sections, code block rendering, and inline image handling.
 
 ### Shared Rust Layer
-- `codex-mobile-client` is the shared client library that owns transport, session management, auth, discovery, SSH, hydration, reconciliation, and canonical app/runtime state for both platforms.
+- `codex-mobile-client` is the single public Rust mobile crate. Keep one generated Swift/Kotlin binding surface; do not split UniFFI across multiple mobile crates again.
+- `codex-ios-audio` is the separate iOS-only audio/AEC crate. Keep heavy audio processing there, not in Swift and not in a second UniFFI crate.
 - `AppStore` is the Rust-owned state surface. It owns snapshots, typed updates, and the small set of truly composite/store-local actions.
 - `AppServerRpc` is the generated public UniFFI RPC surface for direct upstream app-server methods and types.
 - `DiscoveryBridge` and `SshBridge` are separate Rust utility surfaces. Do not move discovery/SSH policy back into Swift/Kotlin.
-- `codex-bridge` wraps `codex-mobile-client` with C FFI entry points so each platform can call into Rust via a thin native bridge.
 - iOS uses UniFFI-generated Swift plus thin bridge helpers; Android uses UniFFI-generated Kotlin plus thin bridge helpers.
+- iOS Debug/device links the raw static library in `apps/ios/GeneratedRust/ios-device/libcodex_mobile_client.a`. Package/release lanes may still create `apps/ios/Frameworks/codex_mobile_client.xcframework`, but that is not the default debug/device artifact.
 
 ## Feature Placement Rules
 - Prefer Rust first. If logic is about session state, thread state, streaming, hydration, approvals, auth/account, discovery merge policy, voice transcript/handoff normalization, or status normalization, it belongs in `shared/rust-bridge/codex-mobile-client/`.
@@ -68,7 +70,7 @@
   - `apps/ios/Sources/Litter/Views/` for SwiftUI
   - keep those files free of shared protocol parsing and shared business rules
 - Add Android-only behavior:
-  - `apps/android/app/` and `apps/android/core/`
+  - `apps/android/app/` and `apps/android/core/bridge/`
   - keep those files free of duplicated Rust-owned state/reducer logic
 
 ## Drift Guardrails
@@ -96,21 +98,34 @@
 - **lru**, **base64**, **regex** — utility crates.
 
 ## Build System
-The root `Makefile` is the primary build interface. It orchestrates submodule sync, patching, UniFFI binding generation, Rust cross-compilation, xcframework packaging, Xcode project generation, and platform builds — with stamp-file caching in `.build-stamps/` so repeated runs skip completed steps. If `sccache` is installed it is used automatically (`RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`).
+The root `Makefile` is the primary build interface. It orchestrates submodule sync, patching, UniFFI binding generation, Rust cross-compilation, raw staticlib generation, optional xcframework packaging, Xcode project generation, and platform builds — with stamp-file caching in `.build-stamps/` so repeated runs skip completed steps. If `sccache` is installed it is used automatically via `RUSTC_WRAPPER=sccache`.
+
+There are two distinct iOS Rust lanes:
+- Fast dev lane: raw staticlib + generated headers in `apps/ios/GeneratedRust/`, used by Debug/device builds (`make rust-ios-device-fast`, `make ios-device-fast`).
+- Package lane: device+sim Rust build plus `codex_mobile_client.xcframework` packaging (`make rust-ios-package`, `make ios`, `make ios-device`, `make ios-sim`).
+
+Incremental policy:
+- Package targets run with `CARGO_INCREMENTAL=0`.
+- Dev targets intentionally unset `CARGO_INCREMENTAL` rather than forcing it on, because this repo’s `sccache` setup rejects explicit incremental compilation.
 
 ### Common targets
 | Target | Description |
 |---|---|
-| `make ios` | Full iOS pipeline: sync → patch → bindings → rust (device+sim) → xcframework → ios_system → xcgen → xcodebuild |
-| `make ios-sim` | iOS for simulator only (arm64-sim, faster) |
-| `make ios-device` | iOS for device only |
+| `make ios` | Full iOS package lane: sync → patch → bindings → rust (device+sim) → xcframework → ios_system → xcgen → simulator build |
+| `make ios-sim` | Full iOS package lane + simulator build |
+| `make ios-device` | Full iOS package lane + device build |
+| `make ios-device-fast` | Fast iOS device lane using raw staticlib outputs in `GeneratedRust/` |
 | `make ios-run` | Full iOS build then opens Xcode |
 | `make android` | Full Android pipeline: sync → kotlin bindings → rust JNI → gradle assemble |
 | `make android-remote` | Android remote-only debug APK |
 | `make android-install` | Build + install remote-only APK to emulator |
 | `make all` | Both platforms |
-| `make rust-ios` | Just the Rust xcframework |
+| `make rust-ios` | Alias for the full Rust iOS package lane |
+| `make rust-ios-package` | Build/package Rust for iOS (device+sim + xcframework) |
+| `make rust-ios-device-fast` | Build raw Rust device staticlib + headers only |
 | `make rust-android` | Just the Android JNI `.so` files |
+| `make rust-check` | Host `cargo check` for shared Rust crates |
+| `make rust-test` | Host `cargo test` for shared Rust crates |
 | `make bindings` | Regenerate UniFFI Swift + Kotlin bindings |
 | `make xcgen` | Regenerate `Litter.xcodeproj` from `project.yml` |
 | `make test` | Run Rust + iOS + Android tests |
@@ -129,7 +144,7 @@ The root `Makefile` is the primary build interface. It orchestrates submodule sy
 - `IOS_DEPLOYMENT_TARGET` — minimum iOS version (default: `18.0`)
 
 ### Individual scripts (called by Make, can also be run standalone)
-- `./apps/ios/scripts/build-rust.sh` — cross-compile Rust for iOS, create `codex_mobile_client.xcframework`
+- `./apps/ios/scripts/build-rust.sh` — cross-compile Rust for iOS; in fast mode it emits raw staticlibs + headers to `apps/ios/GeneratedRust/`, and in package mode it also creates `codex_mobile_client.xcframework`
 - `./apps/ios/scripts/download-ios-system.sh` — download `ios_system` XCFrameworks
 - `./apps/ios/scripts/sync-codex.sh` — sync codex submodule + apply patches
 - `./apps/ios/scripts/regenerate-project.sh` — regenerate Xcode project via xcodegen

@@ -10,8 +10,6 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 uniffi = { version = "0.31.0", features = ["tokio"] }
-
-# Upstream Codex crates
 codex-app-server = { workspace = true }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
@@ -21,19 +19,11 @@ codex-config = { workspace = true }
 codex-cloud-requirements = { workspace = true }
 codex-feedback = { workspace = true }
 codex-arg0 = { workspace = true }
-
-# Runtime & async
 tokio = { workspace = true }
 async-trait = { workspace = true }
-
-# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# Transport
 tokio-tungstenite = { workspace = true }
-
-# Utilities
 thiserror = { workspace = true }
 tracing = { workspace = true }
 lru = { workspace = true }
@@ -52,4 +42,7 @@ rpc-trace = []
 uniffi = { version = "0.31.0", features = ["build"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-sonora = "0.1.0"
+codex-ios-audio = { path = "../codex-ios-audio" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }

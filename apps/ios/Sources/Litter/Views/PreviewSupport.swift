@@ -382,7 +382,9 @@ enum LitterPreviewData {
                 activeThread: nil,
                 sessionId: nil,
                 phase: nil,
-                lastError: nil
+                lastError: nil,
+                transcriptEntries: [],
+                handoffThreadKey: nil
             )
         )
     }

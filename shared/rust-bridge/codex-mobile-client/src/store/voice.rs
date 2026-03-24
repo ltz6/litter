@@ -80,9 +80,14 @@ impl VoiceRealtimeThreadState {
                 self.handle_transcript_delta(item, AppVoiceSpeaker::Assistant)
             }
             "speech_started" => {
+                let mut updates = Vec::new();
+                if let Some(update) = self.flush_live_transcript(AppVoiceSpeaker::Assistant) {
+                    updates.push(update);
+                }
                 self.pending_user_item_id = None;
                 self.live_user_text.clear();
-                vec![VoiceDerivedUpdate::SpeechStarted]
+                updates.push(VoiceDerivedUpdate::SpeechStarted);
+                updates
             }
             _ => Vec::new(),
         }
@@ -95,25 +100,40 @@ impl VoiceRealtimeThreadState {
         } else {
             AppVoiceSpeaker::Assistant
         };
+        let previous_speaker = match speaker {
+            AppVoiceSpeaker::User => AppVoiceSpeaker::Assistant,
+            AppVoiceSpeaker::Assistant => AppVoiceSpeaker::User,
+        };
         let upstream_item_id = json_string_for_keys(item, &["id"]);
         let text = parse_message_text(item);
-        let display_item_id = self.resolve_display_item_id(speaker, upstream_item_id.as_deref());
+        let mut updates = Vec::new();
+
+        if let Some(update) = self.flush_live_transcript(previous_speaker) {
+            updates.push(update);
+        }
+
+        let display_item_id = self.resolve_display_item_id(
+            speaker,
+            upstream_item_id.as_deref(),
+            !text.trim().is_empty(),
+        );
 
         if text.trim().is_empty() {
             self.set_pending_item_id(speaker, Some(display_item_id));
-            return Vec::new();
+            return updates;
         }
 
         let merged = merge_text(self.live_text(speaker), &text);
         self.set_live_text(speaker, String::new());
         self.set_pending_item_id(speaker, None);
 
-        vec![VoiceDerivedUpdate::Transcript(AppVoiceTranscriptUpdate {
+        updates.push(VoiceDerivedUpdate::Transcript(AppVoiceTranscriptUpdate {
             item_id: display_item_id,
             speaker,
             text: merged,
             is_final: true,
-        })]
+        }));
+        updates
     }
 
     fn handle_transcript_delta(
@@ -126,7 +146,7 @@ impl VoiceRealtimeThreadState {
             return Vec::new();
         }
 
-        let display_item_id = self.resolve_display_item_id(speaker, None);
+        let display_item_id = self.resolve_display_item_id(speaker, None, false);
         let merged = merge_text(self.live_text(speaker), &delta);
         self.set_live_text(speaker, merged.clone());
         self.set_pending_item_id(speaker, Some(display_item_id.clone()));
@@ -161,18 +181,46 @@ impl VoiceRealtimeThreadState {
         &mut self,
         speaker: AppVoiceSpeaker,
         upstream_item_id: Option<&str>,
+        prefer_upstream_id: bool,
     ) -> String {
-        self.pending_item_id(speaker)
-            .or_else(|| {
-                upstream_item_id.and_then(|value| {
-                    let trimmed = value.trim();
-                    (!trimmed.is_empty()).then_some(trimmed.to_string())
-                })
-            })
+        let upstream_item_id = upstream_item_id.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        });
+        let pending_item_id = self.pending_item_id(speaker);
+
+        (prefer_upstream_id.then_some(upstream_item_id.clone()).flatten())
+            .or(pending_item_id)
+            .or(upstream_item_id)
             .unwrap_or_else(|| self.next_virtual_item_id(match speaker {
                 AppVoiceSpeaker::User => "user",
                 AppVoiceSpeaker::Assistant => "assistant",
             }))
+    }
+
+    fn flush_live_transcript(&mut self, speaker: AppVoiceSpeaker) -> Option<VoiceDerivedUpdate> {
+        let text = self.live_text(speaker).trim().to_string();
+        if text.is_empty() {
+            self.set_live_text(speaker, String::new());
+            return None;
+        }
+
+        let item_id = self.pending_item_id(speaker).unwrap_or_else(|| {
+            self.next_virtual_item_id(match speaker {
+                AppVoiceSpeaker::User => "user",
+                AppVoiceSpeaker::Assistant => "assistant",
+            })
+        });
+
+        self.set_live_text(speaker, String::new());
+        self.set_pending_item_id(speaker, None);
+
+        Some(VoiceDerivedUpdate::Transcript(AppVoiceTranscriptUpdate {
+            item_id,
+            speaker,
+            text,
+            is_final: true,
+        }))
     }
 
     fn pending_item_id(&self, speaker: AppVoiceSpeaker) -> Option<String> {
@@ -231,7 +279,7 @@ fn parse_message_text(item: &JsonValue) -> String {
         .into_iter()
         .flatten()
         .filter_map(|part| {
-            (json_string_for_keys(part, &["type"]).as_deref() == Some("text"))
+            is_message_text_part(part)
                 .then(|| json_string_for_keys(part, &["text"]))
                 .flatten()
         })
@@ -239,6 +287,13 @@ fn parse_message_text(item: &JsonValue) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+fn is_message_text_part(part: &JsonValue) -> bool {
+    matches!(
+        json_string_for_keys(part, &["type"]).as_deref(),
+        Some("text" | "input_text" | "output_text")
+    )
 }
 
 fn parse_active_transcript(item: &JsonValue) -> String {
@@ -383,6 +438,118 @@ mod tests {
         assert_eq!(first.item_id, second.item_id);
         assert_eq!(second.text, "Tool result");
         assert!(second.is_final);
+    }
+
+    #[test]
+    fn final_user_message_accepts_input_text_content() {
+        let state = VoiceRealtimeState::default();
+        let key = ThreadKey {
+            server_id: "local".into(),
+            thread_id: "voice-thread".into(),
+        };
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({"type": "input_transcript_delta", "delta": "Hello"})),
+        );
+        let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
+            panic!("expected transcript update");
+        };
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({
+                "type": "message",
+                "role": "user",
+                "id": "item_user_123",
+                "content": [{"type": "input_text", "text": "Hello there"}]
+            })),
+        );
+        let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
+            panic!("expected final user message update");
+        };
+        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(second.speaker, crate::uniffi_shared::AppVoiceSpeaker::User);
+        assert_eq!(second.text, "Hello there");
+        assert!(second.is_final);
+    }
+
+    #[test]
+    fn final_assistant_message_accepts_output_text_content() {
+        let state = VoiceRealtimeState::default();
+        let key = ThreadKey {
+            server_id: "local".into(),
+            thread_id: "voice-thread".into(),
+        };
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({"type": "output_transcript_delta", "delta": "Hi"})),
+        );
+        let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
+            panic!("expected transcript update");
+        };
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "id": "item_assistant_123",
+                "content": [{"type": "output_text", "text": "Hi there"}]
+            })),
+        );
+        let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
+            panic!("expected final assistant message update");
+        };
+        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(second.speaker, crate::uniffi_shared::AppVoiceSpeaker::Assistant);
+        assert_eq!(second.text, "Hi there");
+        assert!(second.is_final);
+    }
+
+    #[test]
+    fn switching_speakers_flushes_previous_live_transcript() {
+        let state = VoiceRealtimeState::default();
+        let key = ThreadKey {
+            server_id: "local".into(),
+            thread_id: "voice-thread".into(),
+        };
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({"type": "input_transcript_delta", "delta": "Search docs"})),
+        );
+        let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
+            panic!("expected live user transcript");
+        };
+        assert!(!first.is_final);
+
+        let updates = state.handle_item(
+            &key,
+            &json_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "id": "item_assistant_456",
+                "content": [{"type": "output_text", "text": "Looking now"}]
+            })),
+        );
+        assert_eq!(updates.len(), 2);
+        let VoiceDerivedUpdate::Transcript(flushed_user) = &updates[0] else {
+            panic!("expected flushed user transcript");
+        };
+        let VoiceDerivedUpdate::Transcript(assistant_final) = &updates[1] else {
+            panic!("expected assistant final transcript");
+        };
+        assert_eq!(flushed_user.speaker, crate::uniffi_shared::AppVoiceSpeaker::User);
+        assert_eq!(flushed_user.text, "Search docs");
+        assert!(flushed_user.is_final);
+        assert_eq!(
+            assistant_final.speaker,
+            crate::uniffi_shared::AppVoiceSpeaker::Assistant
+        );
+        assert_eq!(assistant_final.text, "Looking now");
+        assert!(assistant_final.is_final);
     }
 
     #[test]

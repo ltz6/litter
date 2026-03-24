@@ -2,7 +2,10 @@ use std::hash::{Hash, Hasher};
 
 use crate::conversation_uniffi::HydratedConversationItem;
 use crate::types::{PendingApproval, PendingUserInputRequest, ThreadInfo, ThreadKey};
-use crate::uniffi_shared::{AppSubagentStatus, AppVoiceHandoffRequest, AppVoiceTranscriptUpdate};
+use crate::uniffi_shared::{
+    AppSubagentStatus, AppVoiceHandoffRequest, AppVoiceSessionPhase, AppVoiceTranscriptEntry,
+    AppVoiceTranscriptUpdate,
+};
 
 use super::snapshot::{AppSnapshot, ServerHealthSnapshot};
 use super::updates::AppUpdate;
@@ -69,8 +72,10 @@ pub struct AppSessionSummary {
 pub struct AppVoiceSessionSnapshot {
     pub active_thread: Option<ThreadKey>,
     pub session_id: Option<String>,
-    pub phase: Option<String>,
+    pub phase: Option<AppVoiceSessionPhase>,
     pub last_error: Option<String>,
+    pub transcript_entries: Vec<AppVoiceTranscriptEntry>,
+    pub handoff_thread_key: Option<ThreadKey>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -227,6 +232,8 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
                 session_id: snapshot.voice_session.session_id,
                 phase: snapshot.voice_session.phase,
                 last_error: snapshot.voice_session.last_error,
+                transcript_entries: snapshot.voice_session.transcript_entries,
+                handoff_thread_key: snapshot.voice_session.handoff_thread_key,
             },
         })
     }

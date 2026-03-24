@@ -8,17 +8,30 @@ RUST_BRIDGE_DIR="$REPO_DIR/shared/rust-bridge"
 FRAMEWORKS_DIR="$IOS_DIR/Frameworks"
 GENERATED_SWIFT_DIR="$RUST_BRIDGE_DIR/generated/swift"
 UNIFFI_OUT="$IOS_DIR/Sources/Litter/Bridge/UniFFICodexClient.generated.swift"
+GENERATED_RUST_DIR="$IOS_DIR/GeneratedRust"
+GENERATED_HEADERS_DIR="$GENERATED_RUST_DIR/Headers"
+GENERATED_DEVICE_DIR="$GENERATED_RUST_DIR/ios-device"
+GENERATED_SIM_DIR="$GENERATED_RUST_DIR/ios-sim"
+BINDINGS_HASH_FILE="$GENERATED_RUST_DIR/.swift-bindings.hash"
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-18.0}"
 SUBMODULE_DIR="$REPO_DIR/shared/third_party/codex"
 IOS_CLANGXX_WRAPPER="$SCRIPT_DIR/ios-clangxx-wrapper.sh"
 PATCH_FILES=(
   "$REPO_DIR/patches/codex/ios-exec-hook.patch"
+  "$REPO_DIR/patches/codex/realtime-transcript-deltas.patch"
+  "$REPO_DIR/patches/codex/client-controlled-handoff.patch"
 )
 
 SYNC_MODE="--preserve-current"
 BUILD_INTEL_SIM=0
 DEVICE_ONLY=0
+FAST_DEVICE=0
+FORCE_BINDINGS=0
+SKIP_BINDINGS=0
 CARGO_FEATURES=""
+PROFILE="release"
+CARGO_PROFILE_FLAG="--release"
+
 for arg in "$@"; do
   case "$arg" in
     --preserve-current|--recorded-gitlink)
@@ -30,11 +43,23 @@ for arg in "$@"; do
     --device-only)
       DEVICE_ONLY=1
       ;;
+    --fast-device)
+      FAST_DEVICE=1
+      DEVICE_ONLY=1
+      PROFILE="debug"
+      CARGO_PROFILE_FLAG=""
+      ;;
+    --force-bindings)
+      FORCE_BINDINGS=1
+      ;;
+    --skip-bindings)
+      SKIP_BINDINGS=1
+      ;;
     --rpc-trace)
       CARGO_FEATURES="--features rpc-trace"
       ;;
     *)
-      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--with-intel-sim] [--device-only] [--rpc-trace]" >&2
+      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--with-intel-sim] [--device-only] [--fast-device] [--force-bindings] [--skip-bindings] [--rpc-trace]" >&2
       exit 1
       ;;
   esac
@@ -65,22 +90,97 @@ cleanup_patch() {
 
 trap cleanup_patch EXIT
 
-mkdir -p "$FRAMEWORKS_DIR"
+mkdir -p "$FRAMEWORKS_DIR" "$GENERATED_HEADERS_DIR" "$GENERATED_DEVICE_DIR" "$GENERATED_SIM_DIR"
 
 export CXX_aarch64_apple_ios="$IOS_CLANGXX_WRAPPER"
 export CXX_aarch64_apple_ios_sim="$IOS_CLANGXX_WRAPPER"
 export CXX_x86_64_apple_ios="$IOS_CLANGXX_WRAPPER"
+export IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET"
+
+bindings_inputs() {
+  cat <<EOF
+$RUST_BRIDGE_DIR/codegen/src/main.rs
+$RUST_BRIDGE_DIR/codex-mobile-client/src/lib.rs
+$RUST_BRIDGE_DIR/codex-mobile-client/src/conversation_uniffi.rs
+$RUST_BRIDGE_DIR/codex-mobile-client/src/discovery_uniffi.rs
+$RUST_BRIDGE_DIR/codex-mobile-client/src/uniffi_shared.rs
+$RUST_BRIDGE_DIR/codex-mobile-client/Cargo.toml
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/app-server-protocol/src/protocol/common.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/app-server-protocol/src/protocol/v1.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/app-server-protocol/src/protocol/v2.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/account.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/config_types.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/models.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/openai_models.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/parse_command.rs
+$RUST_BRIDGE_DIR/../third_party/codex/codex-rs/protocol/src/protocol.rs
+EOF
+  find "$RUST_BRIDGE_DIR/codex-mobile-client/src/ffi" -type f -name '*.rs' | sort
+}
+
+compute_bindings_hash() {
+  local file
+  {
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      shasum -a 256 "$file"
+    done < <(bindings_inputs | sort)
+  } | shasum -a 256 | awk '{print $1}'
+}
+
+sync_generated_headers() {
+  cp "$GENERATED_SWIFT_DIR/codex_mobile_clientFFI.h" "$GENERATED_HEADERS_DIR/codex_mobile_clientFFI.h"
+  cp "$GENERATED_SWIFT_DIR/codex_mobile_clientFFI.modulemap" "$GENERATED_HEADERS_DIR/codex_mobile_clientFFI.modulemap"
+  cp "$GENERATED_SWIFT_DIR/module.modulemap" "$GENERATED_HEADERS_DIR/module.modulemap"
+}
+
+maybe_generate_swift_bindings() {
+  local current_hash existing_hash
+  if [ "$SKIP_BINDINGS" -eq 1 ]; then
+    echo "==> Skipping UniFFI Swift bindings (--skip-bindings)"
+    return
+  fi
+
+  current_hash="$(compute_bindings_hash)"
+  existing_hash=""
+  if [ -f "$BINDINGS_HASH_FILE" ]; then
+    existing_hash="$(cat "$BINDINGS_HASH_FILE")"
+  fi
+
+  if [ "$FORCE_BINDINGS" -eq 0 ] &&
+    [ "$current_hash" = "$existing_hash" ] &&
+    [ -f "$GENERATED_SWIFT_DIR/codex_mobile_client.swift" ] &&
+    [ -f "$GENERATED_SWIFT_DIR/codex_mobile_clientFFI.h" ] &&
+    [ -f "$UNIFFI_OUT" ]; then
+    echo "==> Swift bindings unchanged; reusing generated output"
+    sync_generated_headers
+    return
+  fi
+
+  echo "==> Regenerating UniFFI Swift bindings -> $UNIFFI_OUT"
+  cd "$RUST_BRIDGE_DIR"
+  "$RUST_BRIDGE_DIR/generate-bindings.sh" --swift-only
+  cp "$GENERATED_SWIFT_DIR/codex_mobile_client.swift" "$UNIFFI_OUT"
+  sync_generated_headers
+  printf '%s\n' "$current_hash" >"$BINDINGS_HASH_FILE"
+}
+
+copy_device_artifact() {
+  cp "$RUST_BRIDGE_DIR/target/aarch64-apple-ios/$PROFILE/libcodex_mobile_client.a" \
+    "$GENERATED_DEVICE_DIR/libcodex_mobile_client.a"
+}
+
+copy_sim_artifact() {
+  local sim_lib="$1"
+  cp "$sim_lib" "$GENERATED_SIM_DIR/libcodex_mobile_client.a"
+}
 
 echo "==> Preparing codex submodule..."
 "$SCRIPT_DIR/sync-codex.sh" "$SYNC_MODE"
 
-echo "==> Regenerating UniFFI Swift bindings -> $UNIFFI_OUT"
-cd "$RUST_BRIDGE_DIR"
-"$RUST_BRIDGE_DIR/generate-bindings.sh" --swift-only
-cp "$GENERATED_SWIFT_DIR/codex_mobile_client.swift" "$UNIFFI_OUT"
+maybe_generate_swift_bindings
 
 echo "==> Installing iOS targets..."
-export IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET"
 if [ "$DEVICE_ONLY" -eq 1 ]; then
   rustup target add aarch64-apple-ios
 elif [ "$BUILD_INTEL_SIM" -eq 1 ]; then
@@ -89,43 +189,58 @@ else
   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 fi
 
-echo "==> Building codex-mobile-client for aarch64-apple-ios (device)..."
-cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client --release --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
+echo "==> Building codex-mobile-client for aarch64-apple-ios ($PROFILE)..."
+cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
+copy_device_artifact
 
 if [ "$DEVICE_ONLY" -eq 0 ]; then
-  echo "==> Building codex-mobile-client for aarch64-apple-ios-sim (Apple Silicon simulator)..."
-  cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client --release --target aarch64-apple-ios-sim --crate-type staticlib $CARGO_FEATURES
+  echo "==> Building codex-mobile-client for aarch64-apple-ios-sim ($PROFILE)..."
+  cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios-sim --crate-type staticlib $CARGO_FEATURES
 
-  SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/release/libcodex_mobile_client.a"
+  SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a"
   if [ "$BUILD_INTEL_SIM" -eq 1 ]; then
-    echo "==> Building codex-mobile-client for x86_64-apple-ios (Intel simulator)..."
-    cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client --release --target x86_64-apple-ios --crate-type staticlib $CARGO_FEATURES
+    echo "==> Building codex-mobile-client for x86_64-apple-ios ($PROFILE)..."
+    cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target x86_64-apple-ios --crate-type staticlib $CARGO_FEATURES
 
     echo "==> Creating fat simulator lib..."
-    mkdir -p "$RUST_BRIDGE_DIR/target/ios-sim-fat/release"
+    mkdir -p "$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE"
     lipo -create \
-      "$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/release/libcodex_mobile_client.a" \
-      "$RUST_BRIDGE_DIR/target/x86_64-apple-ios/release/libcodex_mobile_client.a" \
-      -output "$RUST_BRIDGE_DIR/target/ios-sim-fat/release/libcodex_mobile_client.a"
-    SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/ios-sim-fat/release/libcodex_mobile_client.a"
+      "$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a" \
+      "$RUST_BRIDGE_DIR/target/x86_64-apple-ios/$PROFILE/libcodex_mobile_client.a" \
+      -output "$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE/libcodex_mobile_client.a"
+    SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE/libcodex_mobile_client.a"
   fi
+  copy_sim_artifact "$SIMULATOR_LIB"
+fi
+
+if [ "$FAST_DEVICE" -eq 1 ]; then
+  echo "==> Fast device build complete"
+  echo "==> Device staticlib: $GENERATED_DEVICE_DIR/libcodex_mobile_client.a"
+  echo "==> Headers: $GENERATED_HEADERS_DIR"
+  echo "==> Swift bindings: $UNIFFI_OUT"
+  exit 0
 fi
 
 echo "==> Creating xcframework..."
 rm -rf "$FRAMEWORKS_DIR/codex_bridge.xcframework" "$FRAMEWORKS_DIR/codex_mobile_client.xcframework"
 if [ "$DEVICE_ONLY" -eq 1 ]; then
   xcodebuild -create-xcframework \
-    -library "$RUST_BRIDGE_DIR/target/aarch64-apple-ios/release/libcodex_mobile_client.a" \
-    -headers "$GENERATED_SWIFT_DIR" \
+    -library "$GENERATED_DEVICE_DIR/libcodex_mobile_client.a" \
+    -headers "$GENERATED_HEADERS_DIR" \
     -output "$FRAMEWORKS_DIR/codex_mobile_client.xcframework"
 else
   xcodebuild -create-xcframework \
-    -library "$RUST_BRIDGE_DIR/target/aarch64-apple-ios/release/libcodex_mobile_client.a" \
-    -headers "$GENERATED_SWIFT_DIR" \
-    -library "$SIMULATOR_LIB" \
-    -headers "$GENERATED_SWIFT_DIR" \
+    -library "$GENERATED_DEVICE_DIR/libcodex_mobile_client.a" \
+    -headers "$GENERATED_HEADERS_DIR" \
+    -library "$GENERATED_SIM_DIR/libcodex_mobile_client.a" \
+    -headers "$GENERATED_HEADERS_DIR" \
     -output "$FRAMEWORKS_DIR/codex_mobile_client.xcframework"
 fi
 
 echo "==> Done: $FRAMEWORKS_DIR/codex_mobile_client.xcframework"
-echo "==> Done: $UNIFFI_OUT"
+echo "==> Raw device staticlib: $GENERATED_DEVICE_DIR/libcodex_mobile_client.a"
+if [ "$DEVICE_ONLY" -eq 0 ]; then
+  echo "==> Raw simulator staticlib: $GENERATED_SIM_DIR/libcodex_mobile_client.a"
+fi
+echo "==> Headers: $GENERATED_HEADERS_DIR"
+echo "==> Swift bindings: $UNIFFI_OUT"

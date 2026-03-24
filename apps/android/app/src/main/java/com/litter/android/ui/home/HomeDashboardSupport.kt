@@ -1,0 +1,80 @@
+package com.litter.android.ui.home
+
+import uniffi.codex_mobile_client.AppServerHealth
+import uniffi.codex_mobile_client.AppServerSnapshot
+import uniffi.codex_mobile_client.AppSessionSummary
+import uniffi.codex_mobile_client.AppSnapshotRecord
+
+/**
+ * Pure functions for deriving home dashboard data from Rust snapshots.
+ * No business logic duplication — just UI-specific sorting/filtering.
+ */
+object HomeDashboardSupport {
+
+    /**
+     * Connected servers sorted by: active server first, then alphabetical.
+     * Deduplicates by normalized host.
+     */
+    fun sortedConnectedServers(snapshot: AppSnapshotRecord): List<AppServerSnapshot> {
+        val seen = mutableSetOf<String>()
+        return snapshot.servers
+            .filter { it.health == AppServerHealth.CONNECTED }
+            .sortedWith(compareBy<AppServerSnapshot> {
+                // Active server (has active thread on it) sorts first
+                val activeServerId = snapshot.activeThread?.let { key ->
+                    key.serverId
+                }
+                if (it.serverId == activeServerId) 0 else 1
+            }.thenBy { it.displayName.lowercase() })
+            .filter { server ->
+                val hostKey = "${server.host.lowercase()}:${server.port}"
+                seen.add(hostKey)
+            }
+    }
+
+    /**
+     * Most recent sessions from connected servers, limited to [limit].
+     * Uses pre-computed fields from Rust's AppSessionSummary.
+     */
+    fun recentSessions(
+        snapshot: AppSnapshotRecord,
+        limit: Int = 3,
+    ): List<AppSessionSummary> {
+        val connectedServerIds = snapshot.servers
+            .filter { it.health == AppServerHealth.CONNECTED }
+            .map { it.serverId }
+            .toSet()
+
+        return snapshot.sessionSummaries
+            .filter { it.key.serverId in connectedServerIds }
+            .filter { !it.isSubagent }
+            .sortedByDescending { it.updatedAt ?: 0L }
+            .take(limit)
+    }
+
+    /**
+     * Extracts the last path component as a workspace label.
+     */
+    fun workspaceLabel(cwd: String?): String {
+        if (cwd.isNullOrBlank()) return "~"
+        val trimmed = cwd.trimEnd('/')
+        if (trimmed.isEmpty()) return "/"
+        return trimmed.substringAfterLast('/')
+    }
+
+    /**
+     * Format a relative timestamp from epoch seconds.
+     */
+    fun relativeTime(epochSeconds: Long?): String {
+        if (epochSeconds == null || epochSeconds <= 0L) return ""
+        val now = System.currentTimeMillis() / 1000
+        val delta = now - epochSeconds
+        return when {
+            delta < 60 -> "just now"
+            delta < 3600 -> "${delta / 60}m ago"
+            delta < 86400 -> "${delta / 3600}h ago"
+            delta < 604800 -> "${delta / 86400}d ago"
+            else -> "${delta / 604800}w ago"
+        }
+    }
+}

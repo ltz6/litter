@@ -1350,7 +1350,7 @@ fn generate_rpc_methods(
     out.push_str("use crate::{MobileClient, types::generated};\n");
     out.push_str("use super::{RpcClientError, next_request_id};\n\n");
     out.push_str(
-        "pub(crate) fn convert_generated_field<T, U>(value: T) -> Result<U, RpcClientError>\n",
+        "pub fn convert_generated_field<T, U>(value: T) -> Result<U, RpcClientError>\n",
     );
     out.push_str("where\n");
     out.push_str("    T: serde::Serialize,\n");
@@ -1440,7 +1440,7 @@ fn generate_rpc_methods(
             "\n    /// `{}` — auto-generated typed RPC.\n",
             method.wire_method
         ));
-        out.push_str(&format!("    pub(crate) async fn {}(\n", method_name));
+        out.push_str(&format!("    pub async fn {}(\n", method_name));
         out.push_str("        &self,\n");
         out.push_str("        server_id: &str,\n");
         if has_params {

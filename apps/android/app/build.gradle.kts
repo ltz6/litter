@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.kapt")
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
     id("com.github.triplet.play")
 }
@@ -26,26 +25,12 @@ android {
         targetSdk = 35
         versionCode = 5
         versionName = "0.1.0"
-    }
-
-    flavorDimensions += "runtime"
-    productFlavors {
-        create("onDevice") {
-            dimension = "runtime"
-            buildConfigField("boolean", "ENABLE_ON_DEVICE_BRIDGE", "true")
-            buildConfigField("String", "RUNTIME_STARTUP_MODE", "\"hybrid\"")
-            buildConfigField("String", "APP_RUNTIME_TRANSPORT", "\"app_bridge_rpc_transport\"")
-            manifestPlaceholders["runtimeStartupMode"] = "hybrid"
-            manifestPlaceholders["enableOnDeviceBridge"] = "true"
-        }
-        create("remoteOnly") {
-            dimension = "runtime"
-            buildConfigField("boolean", "ENABLE_ON_DEVICE_BRIDGE", "false")
-            buildConfigField("String", "RUNTIME_STARTUP_MODE", "\"remote_only\"")
-            buildConfigField("String", "APP_RUNTIME_TRANSPORT", "\"app_bridge_rpc_transport\"")
-            manifestPlaceholders["runtimeStartupMode"] = "remote_only"
-            manifestPlaceholders["enableOnDeviceBridge"] = "false"
-        }
+        buildConfigField("boolean", "ENABLE_ON_DEVICE_BRIDGE", "true")
+        buildConfigField("String", "RUNTIME_STARTUP_MODE", "\"hybrid\"")
+        buildConfigField("String", "APP_RUNTIME_TRANSPORT", "\"app_bridge_rpc_transport\"")
+        manifestPlaceholders["runtimeStartupMode"] = "hybrid"
+        manifestPlaceholders["enableOnDeviceBridge"] = "true"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     if (hasUploadSigning) {
@@ -88,6 +73,7 @@ android {
 
     sourceSets {
         getByName("main") {
+            java.srcDir("../../../shared/rust-bridge/generated/kotlin")
             assets.srcDir("../../ios/Sources/Litter/Resources/Themes")
         }
     }
@@ -112,7 +98,6 @@ play {
 
 dependencies {
     implementation(project(":core:bridge"))
-    implementation(project(":core:network"))
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
@@ -133,7 +118,6 @@ dependencies {
     implementation("io.noties:prism4j:2.0.0") {
         exclude(group = "org.jetbrains", module = "annotations-java5")
     }
-    kapt("io.noties:prism4j-bundler:2.0.0")
     // MIGRATION: JSch can be removed once RustSshBridge replaces SshSessionManager.
     // See: core/bridge/.../RustSshBridge.kt and state/SshSessionManager.kt
     implementation("com.github.mwiede:jsch:0.2.22")
@@ -143,11 +127,13 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
-}
-
-val downloadBundledAssets by tasks.registering(Exec::class) {
-    workingDir = rootProject.projectDir
-    commandLine("bash", "scripts/download-bundled-assets.sh")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.09.00"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    androidTestImplementation("tools.fastlane:screengrab:2.1.1")
 }

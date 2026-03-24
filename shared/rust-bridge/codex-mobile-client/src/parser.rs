@@ -129,8 +129,8 @@ pub enum FfiToolCallSectionContent {
     Json { content: String },
     Diff { content: String },
     Text { content: String },
-    List { items: Vec<String> },
-    Progress { items: Vec<String> },
+    ItemList { items: Vec<String> },
+    ProgressList { items: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -213,7 +213,7 @@ impl From<&SectionContent> for FfiToolCallSectionContent {
             SectionContent::Text(value) => Self::Text {
                 content: value.clone(),
             },
-            SectionContent::List(items) => Self::List {
+            SectionContent::List(items) => Self::ItemList {
                 items: items.clone(),
             },
             SectionContent::Progress {
@@ -225,7 +225,7 @@ impl From<&SectionContent> for FfiToolCallSectionContent {
                     .as_ref()
                     .map(|label| format!("{label}: "))
                     .unwrap_or_default();
-                Self::Progress {
+                Self::ProgressList {
                     items: vec![format!("{prefix}{current}/{total}")],
                 }
             }

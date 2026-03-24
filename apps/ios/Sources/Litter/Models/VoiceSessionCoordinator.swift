@@ -89,12 +89,11 @@ final class VoiceSessionCoordinator {
 
         try applyAudioSessionCategory()
         try session.setActive(true)
-        try applyPreferredOutputRoute()
 
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         let playerFormat = AVAudioFormat(
-            standardFormatWithSampleRate: VoiceSessionAudioCodec.aecProcessingSampleRate,
+            standardFormatWithSampleRate: VoiceSessionAudioCodec.targetSampleRate,
             channels: 1
         )
         guard let playerFormat else {
@@ -194,24 +193,20 @@ final class VoiceSessionCoordinator {
                 chunk.data,
                 numChannels: Int(chunk.numChannels)
               ) else {
-            NSLog("[voice] dropped output audio chunk during decode bytes=%d rate=%u channels=%u", chunk.data.count, chunk.sampleRate, chunk.numChannels)
-            return
-        }
-        let playbackSampleRate = VoiceSessionAudioCodec.aecProcessingSampleRate
-        let playbackSamples = VoiceSessionAudioCodec.resampleForAec(
-            samples: samples,
-            sampleRate: Double(chunk.sampleRate)
-        )
-        guard !playbackSamples.isEmpty,
-              let buffer = VoiceSessionAudioCodec.makePlaybackBuffer(
-                samples: playbackSamples,
-                sampleRate: playbackSampleRate
-              ) else {
-            NSLog("[voice] dropped output audio chunk during buffer build samples=%d rate=%u", samples.count, chunk.sampleRate)
             return
         }
         captureWarmupState.refreshStartupCaptureSuppressionForOutput(at: CFAbsoluteTimeGetCurrent())
-        aecBridge?.analyzeRender(playbackSamples)
+        let aecSamples = VoiceSessionAudioCodec.resampleForAec(
+            samples: samples,
+            sampleRate: Double(chunk.sampleRate)
+        )
+        aecBridge?.analyzeRender(aecSamples)
+        guard let buffer = VoiceSessionAudioCodec.makePlaybackBuffer(
+            samples: samples,
+            sampleRate: Double(chunk.sampleRate)
+        ) else {
+            return
+        }
         let outputLevel = VoiceSessionAudioCodec.rmsLevel(samples: samples)
 
         if !engine.isRunning {
@@ -219,7 +214,6 @@ final class VoiceSessionCoordinator {
             do {
                 try applyAudioSessionCategory()
                 try session.setActive(true)
-                try applyPreferredOutputRoute()
                 try engine.start()
             } catch {
                 NSLog("[voice] failed to restart engine: %@", error.localizedDescription)
@@ -246,12 +240,11 @@ final class VoiceSessionCoordinator {
         speakerModeEnabled.toggle()
         try applyAudioSessionCategory()
         try session.setActive(true)
-        try applyPreferredOutputRoute()
         emitRoute()
     }
 
     private func applyAudioSessionCategory() throws {
-        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP]
+        var options: AVAudioSession.CategoryOptions = [.mixWithOthers, .allowBluetooth]
         if speakerModeEnabled {
             options.insert(.defaultToSpeaker)
         }
@@ -264,15 +257,6 @@ final class VoiceSessionCoordinator {
         try session.setPreferredIOBufferDuration(0.005)
     }
 
-    private func applyPreferredOutputRoute() throws {
-        let route = currentRoute()
-        guard route.supportsSpeakerToggle else {
-            try session.overrideOutputAudioPort(.none)
-            return
-        }
-        try session.overrideOutputAudioPort(speakerModeEnabled ? .speaker : .none)
-    }
-
     private func installAudioNotifications() {
         let center = NotificationCenter.default
         notificationObservers = [
@@ -281,27 +265,21 @@ final class VoiceSessionCoordinator {
                 object: session,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.emitRoute()
-                }
+                self?.emitRoute()
             },
             center.addObserver(
                 forName: AVAudioSession.interruptionNotification,
                 object: session,
                 queue: .main
             ) { [weak self] notification in
-                Task { @MainActor [weak self] in
-                    self?.handleInterruption(notification)
-                }
+                self?.handleInterruption(notification)
             },
             center.addObserver(
                 forName: AVAudioSession.mediaServicesWereResetNotification,
                 object: session,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.onEvent?(.failure("Audio services reset"))
-                }
+                self?.onEvent?(.failure("Audio services reset"))
             }
         ]
     }
@@ -327,7 +305,6 @@ final class VoiceSessionCoordinator {
             do {
                 try applyAudioSessionCategory()
                 try session.setActive(true)
-                try applyPreferredOutputRoute()
                 if let engine = audioEngine, !engine.isRunning {
                     try engine.start()
                 }

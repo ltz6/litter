@@ -11,6 +11,9 @@ struct SettingsView: View {
            let activeServer = appModel.snapshot?.servers.first(where: { $0.serverId == activeServerId }) {
             return activeServer
         }
+        if let localServer = appModel.snapshot?.servers.first(where: \.isLocal) {
+            return localServer
+        }
         return appModel.snapshot?.servers.first
     }
 
@@ -232,7 +235,7 @@ private struct SettingsConnectionAccountSection: View {
                     }
                 }
                 Spacer()
-                if server.account != nil {
+                if server.isLocal, server.account != nil {
                     Button("Logout") {
                         Task { await logout() }
                     }
@@ -242,7 +245,7 @@ private struct SettingsConnectionAccountSection: View {
             }
             .listRowBackground(LitterTheme.surface.opacity(0.6))
 
-            if server.account == nil {
+            if server.isLocal, server.account == nil {
                 Button {
                     Task {
                         isAuthWorking = true
@@ -264,11 +267,11 @@ private struct SettingsConnectionAccountSection: View {
                 .listRowBackground(LitterTheme.surface.opacity(0.6))
             }
 
-            if connection.target == .local, authStatus == .notLoggedIn || authStatus.isChatGPT {
+            if server.isLocal, allowsLocalRealtimeApiKey {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 6) {
-                        if authStatus.isChatGPT {
-                            Text(connection.hasOpenAIApiKey ? "Update API key for local realtime" : "Save API key for local realtime")
+                        if isChatGPTAccount {
+                            Text("Save an API key for local realtime while keeping your ChatGPT login.")
                                 .litterFont(.caption)
                                 .foregroundColor(LitterTheme.textSecondary)
                         }
@@ -276,6 +279,7 @@ private struct SettingsConnectionAccountSection: View {
                             .litterFont(.footnote)
                             .foregroundColor(LitterTheme.textPrimary)
                             .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
                     }
                     Button("Save") {
                         let key = apiKey.trimmingCharacters(in: .whitespaces)
@@ -293,6 +297,13 @@ private struct SettingsConnectionAccountSection: View {
                 .listRowBackground(LitterTheme.surface.opacity(0.6))
             }
 
+            if !server.isLocal {
+                Text("Remote servers use their own OAuth flow when authentication is needed. Settings login and API key entry stay local-only.")
+                    .litterFont(.caption)
+                    .foregroundColor(LitterTheme.textSecondary)
+                    .listRowBackground(LitterTheme.surface.opacity(0.6))
+            }
+
             if let authError {
                 Text(authError)
                     .litterFont(.caption)
@@ -303,6 +314,22 @@ private struct SettingsConnectionAccountSection: View {
             Text("Account")
                 .foregroundColor(LitterTheme.textSecondary)
         }
+    }
+
+    private var allowsLocalRealtimeApiKey: Bool {
+        switch server.account {
+        case nil, .chatgpt?:
+            return true
+        case .apiKey?:
+            return false
+        }
+    }
+
+    private var isChatGPTAccount: Bool {
+        if case .chatgpt? = server.account {
+            return true
+        }
+        return false
     }
 
     private var authColor: Color {
@@ -339,6 +366,10 @@ private struct SettingsConnectionAccountSection: View {
     }
 
     private func loginWithChatGPT() async {
+        guard server.isLocal else {
+            authError = "Settings login is only available for the local server."
+            return
+        }
         do {
             authError = nil
             let tokens = try await ChatGPTOAuth.login()
@@ -359,6 +390,10 @@ private struct SettingsConnectionAccountSection: View {
     }
 
     private func saveApiKey(_ key: String) async {
+        guard server.isLocal else {
+            authError = "API keys can only be saved for the local server."
+            return
+        }
         do {
             authError = nil
             _ = try await appModel.rpc.loginAccount(
@@ -372,6 +407,10 @@ private struct SettingsConnectionAccountSection: View {
     }
 
     private func logout() async {
+        guard server.isLocal else {
+            authError = "Settings logout is only available for the local server."
+            return
+        }
         do {
             try? ChatGPTOAuthTokenStore.shared.clear()
             _ = try await appModel.rpc.logoutAccount(serverId: server.serverId)
@@ -380,15 +419,6 @@ private struct SettingsConnectionAccountSection: View {
         } catch {
             authError = error.localizedDescription
         }
-    }
-}
-
-private extension AuthStatus {
-    var isChatGPT: Bool {
-        if case .chatgpt = self {
-            return true
-        }
-        return false
     }
 }
 

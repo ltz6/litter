@@ -83,9 +83,9 @@ private extension FfiToolCallSectionContent {
             return .diff(label: label, content: content)
         case .text(let content):
             return .text(label: label, content: content)
-        case .list(let items):
+        case .itemList(let items):
             return .list(label: label, items: items)
-        case .progress(let items):
+        case .progressList(let items):
             return .progress(label: label, items: items)
         }
     }
