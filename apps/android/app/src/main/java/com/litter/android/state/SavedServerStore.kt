@@ -17,7 +17,7 @@ data class SavedServer(
     val hostname: String,
     val port: Int,
     val sshPort: Int? = null,
-    val source: String = "manual", // local, bonjour, tailscale, ssh, manual
+    val source: String = "manual", // local, bonjour, tailscale, lanProbe, arpScan, ssh, manual
     val hasCodexServer: Boolean = false,
     val wakeMAC: String? = null,
     val sshPortForwardingEnabled: Boolean = false,
@@ -25,11 +25,16 @@ data class SavedServer(
 ) {
     /** Stable key for deduplication across discovery cycles. */
     val deduplicationKey: String
-        get() = websocketURL ?: normalizedHostKey()
+        get() = websocketURL ?: normalizedHostKey(hostname)
 
-    private fun normalizedHostKey(): String {
-        val h = hostname.lowercase().trimStart('[').trimEnd(']')
-        return "$h:$port"
+    private fun normalizedHostKey(host: String): String {
+        val trimmed = host.trim().trimStart('[').trimEnd(']')
+        val withoutScope = if (!trimmed.contains(":")) {
+            trimmed.substringBefore('%')
+        } else {
+            trimmed
+        }
+        return withoutScope.lowercase()
     }
 
     fun toJson(): JSONObject = JSONObject().apply {
@@ -54,9 +59,9 @@ data class SavedServer(
             sshPort = if (obj.has("sshPort")) obj.getInt("sshPort") else null,
             source = obj.optString("source", "manual"),
             hasCodexServer = obj.optBoolean("hasCodexServer", false),
-            wakeMAC = obj.optString("wakeMAC", null),
+            wakeMAC = if (obj.has("wakeMAC")) obj.getString("wakeMAC") else null,
             sshPortForwardingEnabled = obj.optBoolean("sshPortForwardingEnabled", false),
-            websocketURL = obj.optString("websocketURL", null),
+            websocketURL = if (obj.has("websocketURL")) obj.getString("websocketURL") else null,
         )
 
         fun from(server: FfiDiscoveredServer): SavedServer = SavedServer(
@@ -68,8 +73,8 @@ data class SavedServer(
             source = when (server.source) {
                 FfiDiscoverySource.BONJOUR -> "bonjour"
                 FfiDiscoverySource.TAILSCALE -> "tailscale"
-                FfiDiscoverySource.LAN_PROBE -> "manual"
-                FfiDiscoverySource.ARP_SCAN -> "manual"
+                FfiDiscoverySource.LAN_PROBE -> "lanProbe"
+                FfiDiscoverySource.ARP_SCAN -> "arpScan"
                 FfiDiscoverySource.MANUAL -> "manual"
                 FfiDiscoverySource.LOCAL -> "local"
             },

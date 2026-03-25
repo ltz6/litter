@@ -124,19 +124,13 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| thread.get("preview").and_then(|p| p.as_str()))
             .unwrap_or("(untitled)");
         let id = thread.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-        let cwd = thread
-            .get("cwd")
-            .and_then(|c| c.as_str())
-            .unwrap_or("~");
+        let cwd = thread.get("cwd").and_then(|c| c.as_str()).unwrap_or("~");
         let model = thread
             .get("source")
             .and_then(|s| s.get("model"))
             .and_then(|m| m.as_str())
             .unwrap_or("");
-        let status = thread
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let status = thread.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let turn_count = thread
             .get("turns")
             .and_then(|t| t.as_array())
@@ -177,10 +171,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Fetch full thread data (with turns/conversation) for selected sessions
-    eprintln!(
-        "\nExporting {} session(s)...",
-        selected_indices.len()
-    );
+    eprintln!("\nExporting {} session(s)...", selected_indices.len());
 
     let mut exported_threads = Vec::new();
     for &idx in &selected_indices {

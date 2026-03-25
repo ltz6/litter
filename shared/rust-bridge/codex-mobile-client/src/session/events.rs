@@ -199,6 +199,13 @@ impl EventProcessor {
         }
     }
 
+    pub fn emit_connection_state(&self, server_id: &str, health: &str) {
+        self.emit(UiEvent::ConnectionStateChanged {
+            server_id: server_id.to_string(),
+            health: health.to_string(),
+        });
+    }
+
     // ── Notification processing ────────────────────────────────────────
 
     /// Process a typed upstream `ServerNotification`.
@@ -242,6 +249,10 @@ impl EventProcessor {
                 });
             }
             ServerNotification::TurnStarted(n) => {
+                eprintln!(
+                    "[codex-mobile-client] process_notification TurnStarted server_id={} thread_id={} turn_id={}",
+                    server_id, n.thread_id, n.turn.id
+                );
                 let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnStarted {
                     key,
@@ -249,6 +260,10 @@ impl EventProcessor {
                 });
             }
             ServerNotification::TurnCompleted(n) => {
+                eprintln!(
+                    "[codex-mobile-client] process_notification TurnCompleted server_id={} thread_id={} turn_id={}",
+                    server_id, n.thread_id, n.turn.id
+                );
                 let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnCompleted {
                     key,
@@ -256,6 +271,10 @@ impl EventProcessor {
                 });
             }
             ServerNotification::TurnDiffUpdated(n) => {
+                eprintln!(
+                    "[codex-mobile-client] process_notification TurnDiffUpdated server_id={} thread_id={} turn_id={}",
+                    server_id, n.thread_id, n.turn_id
+                );
                 let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnDiffUpdated {
                     key,
@@ -361,9 +380,7 @@ impl EventProcessor {
                 let key = Self::make_key(server_id, &n.thread_id);
                 eprintln!(
                     "[codex-mobile-client] ThreadRealtimeStarted server_id={} thread_id={} session_id={:?}",
-                    server_id,
-                    n.thread_id,
-                    n.session_id
+                    server_id, n.thread_id, n.session_id
                 );
                 self.emit(UiEvent::RealtimeStarted {
                     key,
@@ -401,9 +418,7 @@ impl EventProcessor {
                 let key = Self::make_key(server_id, &n.thread_id);
                 eprintln!(
                     "[codex-mobile-client] ThreadRealtimeError server_id={} thread_id={} message={}",
-                    server_id,
-                    n.thread_id,
-                    n.message
+                    server_id, n.thread_id, n.message
                 );
                 self.emit(UiEvent::RealtimeError {
                     key,
@@ -414,9 +429,7 @@ impl EventProcessor {
                 let key = Self::make_key(server_id, &n.thread_id);
                 eprintln!(
                     "[codex-mobile-client] ThreadRealtimeClosed server_id={} thread_id={} reason={:?}",
-                    server_id,
-                    n.thread_id,
-                    n.reason
+                    server_id, n.thread_id, n.reason
                 );
                 self.emit(UiEvent::RealtimeClosed {
                     key,
@@ -1236,8 +1249,8 @@ mod tests {
 
     #[test]
     fn account_rate_limits_updated() {
-        let notification =
-            ServerNotification::AccountRateLimitsUpdated(proto::AccountRateLimitsUpdatedNotification {
+        let notification = ServerNotification::AccountRateLimitsUpdated(
+            proto::AccountRateLimitsUpdatedNotification {
                 rate_limits: proto::RateLimitSnapshot {
                     limit_id: Some("primary".to_string()),
                     limit_name: Some("Primary".to_string()),
@@ -1254,7 +1267,8 @@ mod tests {
                     }),
                     plan_type: Some(codex_protocol::account::PlanType::Plus),
                 },
-            });
+            },
+        );
         let evt = process_and_recv("srv1", &notification).expect("should emit");
         match evt {
             UiEvent::AccountRateLimitsUpdated {
@@ -1262,8 +1276,18 @@ mod tests {
                 notification,
             } => {
                 assert_eq!(server_id, "srv1");
-                assert_eq!(notification.rate_limits.limit_id.as_deref(), Some("primary"));
-                assert_eq!(notification.rate_limits.primary.as_ref().map(|w| w.used_percent), Some(42));
+                assert_eq!(
+                    notification.rate_limits.limit_id.as_deref(),
+                    Some("primary")
+                );
+                assert_eq!(
+                    notification
+                        .rate_limits
+                        .primary
+                        .as_ref()
+                        .map(|w| w.used_percent),
+                    Some(42)
+                );
             }
             other => panic!("expected AccountRateLimitsUpdated, got {other:?}"),
         }

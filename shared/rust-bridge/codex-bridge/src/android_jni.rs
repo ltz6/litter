@@ -31,7 +31,10 @@ pub extern "system" fn Java_com_litter_android_core_bridge_UniffiInit_nativeBrid
         }
     }
     crate::init_tls_roots();
-    eprintln!("[codex-bridge] Android init: HOME={}, CODEX_HOME={}", home, codex_home);
+    eprintln!(
+        "[codex-bridge] Android init: HOME={}, CODEX_HOME={}",
+        home, codex_home
+    );
 }
 
 /// Legacy stubs — kept so NativeCodexBridge.kt doesn't crash on load.

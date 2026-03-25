@@ -83,6 +83,7 @@ fun ConversationScreen(
     }
     val items = thread?.hydratedConversationItems ?: emptyList()
     val isThinking = thread?.hasActiveTurn == true
+    val timelineEntries = remember(items, isThinking) { buildTimelineEntries(items, isThinking) }
 
     // Load thread content on first open — resume it so Rust hydrates conversation items
     LaunchedEffect(threadKey) {
@@ -145,9 +146,9 @@ fun ConversationScreen(
         }
     }
 
-    LaunchedEffect(items.size, isAtBottom) {
-        if (isAtBottom && items.isNotEmpty()) {
-            listState.animateScrollToItem(items.size - 1)
+    LaunchedEffect(timelineEntries.size, isAtBottom) {
+        if (isAtBottom && timelineEntries.isNotEmpty()) {
+            listState.animateScrollToItem(timelineEntries.size)
         }
     }
 
@@ -183,29 +184,46 @@ fun ConversationScreen(
                 ) {
                     item { Spacer(Modifier.height(16.dp)) }
 
-                    items(items = items, key = { it.id }) { item ->
-                        ConversationTimelineItem(
-                            item = item,
-                            onEditMessage = { turnIndex ->
-                                scope.launch {
-                                    val prefill = appModel.store.editMessage(threadKey, turnIndex)
-                                    appModel.queueComposerPrefill(prefill)
-                                }
-                            },
-                            onForkFromMessage = { turnIndex ->
-                                scope.launch {
-                                    try {
-                                        val config = com.litter.android.state.AppThreadLaunchConfig(model = thread.model)
-                                        val cwd = thread.info.cwd ?: "~"
-                                        val newKey = appModel.store.forkThreadFromMessage(
-                                            threadKey, turnIndex, config.toThreadForkParams(threadKey.threadId, cwd),
-                                        )
-                                        appModel.store.setActiveThread(newKey)
-                                        appModel.refreshSnapshot()
-                                    } catch (_: Exception) {}
-                                }
-                            },
-                        )
+                    items(
+                        items = timelineEntries,
+                        key = { entry ->
+                            when (entry) {
+                                is TimelineEntry.Single -> entry.item.id
+                                is TimelineEntry.Exploration -> entry.group.id
+                            }
+                        },
+                    ) { entry ->
+                        when (entry) {
+                            is TimelineEntry.Single -> {
+                                ConversationTimelineItem(
+                                    item = entry.item,
+                                    isLiveTurn = isThinking,
+                                    onEditMessage = { turnIndex ->
+                                        scope.launch {
+                                            val prefill = appModel.store.editMessage(threadKey, turnIndex)
+                                            appModel.queueComposerPrefill(prefill)
+                                        }
+                                    },
+                                    onForkFromMessage = { turnIndex ->
+                                        scope.launch {
+                                            try {
+                                                val config = com.litter.android.state.AppThreadLaunchConfig(model = thread.model)
+                                                val cwd = thread.info.cwd ?: "~"
+                                                val newKey = appModel.store.forkThreadFromMessage(
+                                                    threadKey, turnIndex, config.toThreadForkParams(threadKey.threadId, cwd),
+                                                )
+                                                appModel.store.setActiveThread(newKey)
+                                                appModel.refreshSnapshot()
+                                            } catch (_: Exception) {}
+                                        }
+                                    },
+                                )
+                            }
+
+                            is TimelineEntry.Exploration -> {
+                                ExplorationGroupRow(group = entry.group)
+                            }
+                        }
                         Spacer(Modifier.height(4.dp))
                     }
 
@@ -221,11 +239,11 @@ fun ConversationScreen(
             }
 
             // Scroll-to-bottom FAB
-            if (!isAtBottom && items.isNotEmpty()) {
+            if (!isAtBottom && timelineEntries.isNotEmpty()) {
                 SmallFloatingActionButton(
                     onClick = {
                         scope.launch {
-                            listState.animateScrollToItem(items.size - 1)
+                            listState.animateScrollToItem(timelineEntries.size)
                         }
                     },
                     modifier = Modifier

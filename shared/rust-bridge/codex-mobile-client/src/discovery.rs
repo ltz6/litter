@@ -9,15 +9,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::join_all;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::task::JoinSet;
 
 /// Default ports to probe for Codex servers.
 const DEFAULT_SCAN_PORTS: &[u16] = &[8390, 4222, 9234];
 
 /// Maximum concurrent TCP probes during subnet scans.
-const MAX_CONCURRENT_PROBES: usize = 32;
+const MAX_CONCURRENT_PROBES: usize = 64;
 
 /// Interval between continuous scan sweeps.
 const CONTINUOUS_SCAN_INTERVAL: Duration = Duration::from_secs(30);
@@ -75,6 +77,20 @@ pub enum DiscoveryEvent {
     ServerLost(String),
     ServerUpdated(DiscoveredServer),
     ScanComplete { source: DiscoverySource },
+}
+
+/// Progressive result batches emitted during a one-shot discovery sweep.
+#[derive(Debug, Clone)]
+pub struct ProgressiveDiscoveryUpdate {
+    pub kind: ProgressiveDiscoveryUpdateKind,
+    pub source: Option<DiscoverySource>,
+    pub servers: Vec<DiscoveredServer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressiveDiscoveryUpdateKind {
+    PartialResults,
+    ScanComplete,
 }
 
 /// Configuration for the discovery service.
@@ -162,10 +178,11 @@ pub struct DiscoveryService {
 pub fn reconcile_discovered_servers(candidates: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
     let mut map: HashMap<String, DiscoveredServer> = HashMap::new();
     for server in candidates {
-        match map.get_mut(&server.id) {
+        let key = discovery_identity_key(&server);
+        match map.get_mut(&key) {
             Some(existing) => merge_server(existing, server),
             None => {
-                map.insert(server.id.clone(), server);
+                map.insert(key, server);
             }
         }
     }
@@ -244,37 +261,98 @@ impl DiscoveryService {
         all.extend(arp_res);
         all.extend(manual_res);
 
-        // Deduplicate by id, merging per-source details while preferring
-        // higher-priority display/source metadata.
-        let mut map: HashMap<String, DiscoveredServer> = HashMap::new();
-        for server in all {
-            match map.get_mut(&server.id) {
-                Some(existing) => merge_server(existing, server),
-                None => {
-                    map.insert(server.id.clone(), server);
-                }
-            }
-        }
-
-        // Update internal cache.
-        {
-            let mut servers = self.servers.lock().unwrap();
-            for (id, srv) in &map {
-                servers.insert(id.clone(), srv.clone());
-            }
-        }
-
-        let mut results: Vec<DiscoveredServer> = map.into_values().collect();
-        results.sort_by(|a, b| {
-            source_rank(a.source)
-                .cmp(&source_rank(b.source))
-                .then_with(|| {
-                    a.display_name
-                        .to_lowercase()
-                        .cmp(&b.display_name.to_lowercase())
-                })
-        });
+        let results = reconcile_discovered_servers(all);
+        self.update_cached_servers(&results);
         results
+    }
+
+    /// Run a single discovery sweep and emit reconciled partial results as each
+    /// source finishes.
+    pub async fn scan_once_progressive_with_context(
+        &self,
+        mdns_seeds: &[MdnsSeed],
+        local_ipv4_hint: Option<&str>,
+        tx: &broadcast::Sender<ProgressiveDiscoveryUpdate>,
+    ) -> Vec<DiscoveredServer> {
+        let local_ipv4_hint = local_ipv4_hint.and_then(parse_ipv4_hint);
+        let mut join_set = JoinSet::new();
+
+        {
+            let svc = self.clone_for_one_shot();
+            join_set.spawn(async move {
+                (
+                    DiscoverySource::LanProbe,
+                    svc.scan_lan_probe(local_ipv4_hint).await,
+                )
+            });
+        }
+
+        {
+            let svc = self.clone_for_one_shot();
+            join_set.spawn(async move { (DiscoverySource::Tailscale, svc.scan_tailscale().await) });
+        }
+
+        {
+            let svc = self.clone_for_one_shot();
+            let seeds = mdns_seeds.to_vec();
+            join_set.spawn(async move {
+                (
+                    DiscoverySource::Bonjour,
+                    svc.scan_bonjour_with_seeds(&seeds).await,
+                )
+            });
+        }
+
+        {
+            let svc = self.clone_for_one_shot();
+            join_set.spawn(async move { (DiscoverySource::ArpScan, svc.scan_arp().await) });
+        }
+
+        {
+            let svc = self.clone_for_one_shot();
+            join_set.spawn(async move { (DiscoverySource::Manual, svc.scan_manual().await) });
+        }
+
+        let mut cumulative = Vec::new();
+        let mut latest_results = Vec::new();
+
+        while let Some(result) = join_set.join_next().await {
+            let Ok((source, servers)) = result else {
+                continue;
+            };
+            cumulative.extend(servers);
+            latest_results = reconcile_discovered_servers(cumulative.clone());
+            let _ = tx.send(ProgressiveDiscoveryUpdate {
+                kind: ProgressiveDiscoveryUpdateKind::PartialResults,
+                source: Some(source),
+                servers: latest_results.clone(),
+            });
+        }
+
+        self.update_cached_servers(&latest_results);
+        let _ = tx.send(ProgressiveDiscoveryUpdate {
+            kind: ProgressiveDiscoveryUpdateKind::ScanComplete,
+            source: None,
+            servers: latest_results.clone(),
+        });
+        latest_results
+    }
+
+    pub(crate) fn clone_for_one_shot(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            mdns_browser: Arc::clone(&self.mdns_browser),
+            servers: Arc::clone(&self.servers),
+            manual_servers: Arc::clone(&self.manual_servers),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn update_cached_servers(&self, results: &[DiscoveredServer]) {
+        let mut servers = self.servers.lock().unwrap();
+        for server in results {
+            servers.insert(server.id.clone(), server.clone());
+        }
     }
 
     /// Start continuous scanning. Returns a broadcast receiver for events.
@@ -430,21 +508,19 @@ impl DiscoveryService {
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let host_str = ip.to_string();
-                for &port in &ports {
-                    if tcp_probe(&host_str, port, timeout).await {
-                        return Some(DiscoveredServer {
-                            id: format!("network-{}", host_str),
-                            display_name: host_str.clone(),
-                            host: host_str,
-                            port,
-                            codex_port: Some(port),
-                            ssh_port: None,
-                            source: DiscoverySource::LanProbe,
-                            metadata: HashMap::new(),
-                            last_seen: Instant::now(),
-                            reachable: true,
-                        });
-                    }
+                if let Some(port) = first_reachable_port(&host_str, &ports, timeout).await {
+                    return Some(DiscoveredServer {
+                        id: format!("network-{}", host_str),
+                        display_name: host_str.clone(),
+                        host: host_str,
+                        port,
+                        codex_port: Some(port),
+                        ssh_port: None,
+                        source: DiscoverySource::LanProbe,
+                        metadata: HashMap::new(),
+                        last_seen: Instant::now(),
+                        reachable: true,
+                    });
                 }
                 None
             }));
@@ -481,32 +557,30 @@ impl DiscoveryService {
         for (ip, hostname) in peers {
             let ports = ports.clone();
             handles.push(tokio::spawn(async move {
-                for &port in &ports {
-                    if tcp_probe(&ip, port, timeout).await {
-                        let display = if hostname.is_empty() {
-                            ip.clone()
-                        } else {
-                            hostname.clone()
-                        };
-                        return Some(DiscoveredServer {
-                            id: format!("network-{}", ip),
-                            display_name: display,
-                            host: ip,
-                            port,
-                            codex_port: Some(port),
-                            ssh_port: None,
-                            source: DiscoverySource::Tailscale,
-                            metadata: {
-                                let mut m = HashMap::new();
-                                if !hostname.is_empty() {
-                                    m.insert("hostname".to_string(), hostname);
-                                }
-                                m
-                            },
-                            last_seen: Instant::now(),
-                            reachable: true,
-                        });
-                    }
+                if let Some(port) = first_reachable_port(&ip, &ports, timeout).await {
+                    let display = if hostname.is_empty() {
+                        ip.clone()
+                    } else {
+                        hostname.clone()
+                    };
+                    return Some(DiscoveredServer {
+                        id: format!("network-{}", ip),
+                        display_name: display,
+                        host: ip,
+                        port,
+                        codex_port: Some(port),
+                        ssh_port: None,
+                        source: DiscoverySource::Tailscale,
+                        metadata: {
+                            let mut m = HashMap::new();
+                            if !hostname.is_empty() {
+                                m.insert("hostname".to_string(), hostname);
+                            }
+                            m
+                        },
+                        last_seen: Instant::now(),
+                        reachable: true,
+                    });
                 }
                 None
             }));
@@ -558,7 +632,8 @@ impl DiscoveryService {
                                     txt,
                                 });
                             }
-                            Some(MdnsServiceEvent::Lost { .. }) | None => {}
+                            Some(MdnsServiceEvent::Lost { .. }) => {}
+                            None => break,
                         }
                     }
                     _ = &mut deadline => break,
@@ -590,20 +665,19 @@ impl DiscoveryService {
             };
 
             let mut reachable = false;
-            if let Some(port) = codex_port {
-                reachable |= tcp_probe(&host, port, self.config.probe_timeout).await;
-            }
-            if let Some(port) = ssh_port {
-                reachable |= tcp_probe(&host, port, self.config.probe_timeout).await;
+            let known_ports: Vec<u16> = [codex_port, ssh_port].into_iter().flatten().collect();
+            if !known_ports.is_empty() {
+                reachable =
+                    any_reachable_port(&host, &known_ports, self.config.probe_timeout).await;
             }
 
             if codex_port.is_none() {
-                for &port in &self.config.scan_ports {
-                    if tcp_probe(&host, port, self.config.probe_timeout).await {
-                        codex_port = Some(port);
-                        reachable = true;
-                        break;
-                    }
+                if let Some(port) =
+                    first_reachable_port(&host, &self.config.scan_ports, self.config.probe_timeout)
+                        .await
+                {
+                    codex_port = Some(port);
+                    reachable = true;
                 }
             }
 
@@ -660,21 +734,19 @@ impl DiscoveryService {
             let ports = ports.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                for &port in &ports {
-                    if tcp_probe(&ip, port, timeout).await {
-                        return Some(DiscoveredServer {
-                            id: format!("network-{}", ip),
-                            display_name: ip.clone(),
-                            host: ip,
-                            port,
-                            codex_port: Some(port),
-                            ssh_port: None,
-                            source: DiscoverySource::ArpScan,
-                            metadata: HashMap::new(),
-                            last_seen: Instant::now(),
-                            reachable: true,
-                        });
-                    }
+                if let Some(port) = first_reachable_port(&ip, &ports, timeout).await {
+                    return Some(DiscoveredServer {
+                        id: format!("network-{}", ip),
+                        display_name: ip.clone(),
+                        host: ip,
+                        port,
+                        codex_port: Some(port),
+                        ssh_port: None,
+                        source: DiscoverySource::ArpScan,
+                        metadata: HashMap::new(),
+                        last_seen: Instant::now(),
+                        reachable: true,
+                    });
                 }
                 None
             }));
@@ -736,8 +808,45 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
         .unwrap_or(false)
 }
 
+async fn any_reachable_port(host: &str, ports: &[u16], timeout: Duration) -> bool {
+    let probes = ports.iter().map(|&port| tcp_probe(host, port, timeout));
+    join_all(probes)
+        .await
+        .into_iter()
+        .any(|reachable| reachable)
+}
+
+async fn first_reachable_port(host: &str, ports: &[u16], timeout: Duration) -> Option<u16> {
+    let probes = ports.iter().map(|&port| tcp_probe(host, port, timeout));
+    let results = join_all(probes).await;
+    ports
+        .iter()
+        .copied()
+        .zip(results.into_iter())
+        .find_map(|(port, reachable)| reachable.then_some(port))
+}
+
 fn primary_port(codex_port: Option<u16>, ssh_port: Option<u16>) -> u16 {
     codex_port.or(ssh_port).unwrap_or_default()
+}
+
+fn discovery_identity_key(server: &DiscoveredServer) -> String {
+    normalized_host_key(&server.host).unwrap_or_else(|| server.id.clone())
+}
+
+fn normalized_host_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unbracketed = trimmed.trim_start_matches('[').trim_end_matches(']');
+    let without_scope = match unbracketed.split_once('%') {
+        Some((host, _)) => host,
+        None => unbracketed,
+    };
+    let normalized = without_scope.trim().to_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn merge_server(existing: &mut DiscoveredServer, candidate: DiscoveredServer) {

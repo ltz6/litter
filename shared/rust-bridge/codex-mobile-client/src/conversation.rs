@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::types::generated::MessagePhase;
 use codex_app_server_protocol::{
     CollabAgentStatus, CollabAgentTool, CollabAgentToolCallStatus, CommandAction,
     CommandExecutionStatus, DynamicToolCallOutputContentItem, DynamicToolCallStatus,
@@ -44,11 +45,13 @@ pub enum ConversationItemContent {
     ProposedPlan(ProposedPlanData),
     CommandExecution(CommandExecutionData),
     FileChange(FileChangeData),
+    TurnDiff(TurnDiffData),
     McpToolCall(McpToolCallData),
     DynamicToolCall(DynamicToolCallData),
     MultiAgentAction(MultiAgentActionData),
     WebSearch(WebSearchData),
     Divider(DividerData),
+    Error(ErrorData),
     Note(NoteData),
 }
 
@@ -71,6 +74,8 @@ pub struct AssistantMessageData {
     pub agent_nickname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<MessagePhase>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +151,12 @@ pub struct FileChangeData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct TurnDiffData {
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct McpToolCallData {
     pub server: String,
     pub tool: String,
@@ -162,6 +173,8 @@ pub struct McpToolCallData {
     pub raw_output_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -212,9 +225,20 @@ pub struct WebSearchData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DividerData {
-    ContextCompaction { is_complete: bool },
-    ReviewEntered { review: String },
-    ReviewExited { review: String },
+    ContextCompaction {
+        is_complete: bool,
+    },
+    ModelRerouted {
+        from_model: Option<String>,
+        to_model: String,
+        reason: Option<String>,
+    },
+    ReviewEntered {
+        review: String,
+    },
+    ReviewExited {
+        review: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,6 +246,15 @@ pub enum DividerData {
 pub struct NoteData {
     pub title: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorData {
+    pub title: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +303,15 @@ pub fn hydrate_thread_item(
     convert_thread_item(item, item.id(), source_turn_id, source_turn_index, opts)
 }
 
+fn hydrate_message_phase(
+    phase: Option<codex_protocol::models::MessagePhase>,
+) -> Option<MessagePhase> {
+    phase.map(|phase| match phase {
+        codex_protocol::models::MessagePhase::Commentary => MessagePhase::Commentary,
+        codex_protocol::models::MessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
+    })
+}
+
 /// Convert a single [`ThreadItem`] into a [`ConversationItem`].
 ///
 /// Returns `None` for items that should be suppressed (empty text, etc.).
@@ -295,7 +337,7 @@ fn convert_thread_item(
                 true,
             )
         }
-        ThreadItem::AgentMessage { text, .. } => {
+        ThreadItem::AgentMessage { text, phase, .. } => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 return None;
@@ -305,6 +347,7 @@ fn convert_thread_item(
                     text: trimmed.to_string(),
                     agent_nickname: opts.default_agent_nickname.clone(),
                     agent_role: opts.default_agent_role.clone(),
+                    phase: hydrate_message_phase(phase.clone()),
                 }),
                 false,
             )
@@ -405,6 +448,7 @@ fn convert_thread_item(
                     structured_content_json: structured_json,
                     raw_output_json,
                     error_message: error.as_ref().map(|e| e.message.clone()),
+                    progress_messages: Vec::new(),
                 }),
                 false,
             )
@@ -626,6 +670,61 @@ fn convert_command_action(action: &CommandAction) -> CommandActionData {
     }
 }
 
+pub fn make_turn_diff_item(
+    turn_id: &str,
+    diff: String,
+    source_turn_id: Option<&str>,
+) -> ConversationItem {
+    ConversationItem {
+        id: format!("turn-diff-{turn_id}"),
+        content: ConversationItemContent::TurnDiff(TurnDiffData { diff }),
+        source_turn_id: source_turn_id
+            .map(String::from)
+            .or_else(|| Some(turn_id.to_string())),
+        source_turn_index: None,
+        timestamp: None,
+        is_from_user_turn_boundary: false,
+    }
+}
+
+pub fn make_model_rerouted_item(
+    turn_id: &str,
+    from_model: Option<String>,
+    to_model: String,
+    reason: Option<String>,
+    source_turn_id: Option<&str>,
+) -> ConversationItem {
+    ConversationItem {
+        id: format!("model-rerouted-{turn_id}"),
+        content: ConversationItemContent::Divider(DividerData::ModelRerouted {
+            from_model,
+            to_model,
+            reason,
+        }),
+        source_turn_id: source_turn_id
+            .map(String::from)
+            .or_else(|| Some(turn_id.to_string())),
+        source_turn_index: None,
+        timestamp: None,
+        is_from_user_turn_boundary: false,
+    }
+}
+
+pub fn make_error_item(id: String, message: String, code: Option<i64>) -> ConversationItem {
+    ConversationItem {
+        id,
+        content: ConversationItemContent::Error(ErrorData {
+            title: "Error".to_string(),
+            message,
+            details: code.map(|value| format!("Code: {value}")),
+        }),
+        source_turn_id: None,
+        source_turn_index: None,
+        timestamp: None,
+        is_from_user_turn_boundary: false,
+    }
+}
+
 fn convert_file_change(change: &FileUpdateChange) -> FileChangeEntryData {
     let kind = match &change.kind {
         PatchChangeKind::Add => "add",
@@ -806,6 +905,7 @@ mod tests {
                 assert_eq!(data.text, "Response text");
                 assert_eq!(data.agent_nickname.as_deref(), Some("bob"));
                 assert_eq!(data.agent_role.as_deref(), Some("coder"));
+                assert_eq!(data.phase, None);
             }
             _ => panic!("expected Assistant content"),
         }
@@ -1005,6 +1105,7 @@ mod tests {
                 text: "Hello".into(),
                 agent_nickname: None,
                 agent_role: None,
+                phase: Some(MessagePhase::Commentary),
             }),
             source_turn_id: Some("t1".into()),
             source_turn_index: Some(0),

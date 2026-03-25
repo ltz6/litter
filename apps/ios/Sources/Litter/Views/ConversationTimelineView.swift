@@ -26,7 +26,9 @@ struct ConversationTurnTimeline: View {
     }
 
     private var rowDescriptors: [ConversationTimelineRowDescriptor] {
-        ConversationTimelineRowDescriptor.build(from: items)
+        let rows = ConversationTimelineRowDescriptor.build(from: items)
+        guard isLive else { return rows }
+        return ConversationTimelineRowDescriptor.mergeLiveExplorationRows(rows)
     }
 
     private var streamingAssistantItemId: String? {
@@ -43,6 +45,7 @@ struct ConversationTurnTimeline: View {
                 serverId: serverId,
                 agentDirectoryVersion: agentDirectoryVersion,
                 renderMode: renderMode,
+                isLiveTurn: isLive,
                 isStreamingMessage: item.id == streamingAssistantItemId,
                 messageActionsDisabled: messageActionsDisabled,
                 onStreamingSnapshotRendered: item.id == streamingAssistantItemId ? onStreamingSnapshotRendered : nil,
@@ -166,6 +169,49 @@ private enum ConversationTimelineRowDescriptor: Identifiable, Equatable {
         flushSubagentBuffer()
         return rows
     }
+
+    static func mergeLiveExplorationRows(
+        _ rows: [ConversationTimelineRowDescriptor]
+    ) -> [ConversationTimelineRowDescriptor] {
+        var mergedRows: [ConversationTimelineRowDescriptor] = []
+        var explorationAccumulator: (id: String, items: [ConversationItem])?
+
+        func flushAccumulator() {
+            guard let accumulator = explorationAccumulator else { return }
+            mergedRows.append(
+                .exploration(
+                    id: accumulator.id,
+                    items: accumulator.items
+                )
+            )
+            explorationAccumulator = nil
+        }
+
+        for row in rows {
+            switch row {
+            case .exploration(let id, let items):
+                if var existing = explorationAccumulator {
+                    existing.items.append(contentsOf: items)
+                    explorationAccumulator = existing
+                } else {
+                    explorationAccumulator = (id: id, items: items)
+                }
+            case .item(let item) where item.isExplorationCommandItem:
+                if var existing = explorationAccumulator {
+                    existing.items.append(item)
+                    explorationAccumulator = existing
+                } else {
+                    explorationAccumulator = (id: "exploration-\(item.id)", items: [item])
+                }
+            default:
+                flushAccumulator()
+                mergedRows.append(row)
+            }
+        }
+
+        flushAccumulator()
+        return mergedRows
+    }
 }
 
 enum ConversationTurnRenderMode {
@@ -181,6 +227,7 @@ private struct ConversationTimelineItemRow: View {
     let serverId: String
     let agentDirectoryVersion: UInt64
     let renderMode: ConversationTurnRenderMode
+    let isLiveTurn: Bool
     let isStreamingMessage: Bool
     let messageActionsDisabled: Bool
     let onStreamingSnapshotRendered: (() -> Void)?
@@ -231,7 +278,7 @@ private struct ConversationTimelineItemRow: View {
         case .userInputResponse(let data):
             ConversationUserInputResponseRow(data: data)
         case .divider(let kind):
-            ConversationDividerRow(kind: kind)
+            ConversationDividerRow(kind: kind, isLiveTurn: isLiveTurn)
         case .error(let data):
             ConversationSystemCardRow(
                 title: data.title.isEmpty ? "Error" : data.title,
@@ -315,29 +362,30 @@ private struct ConversationTimelineItemRow: View {
                     themeVersion: themeManager.themeVersion
                 )
             } else {
-                HStack(alignment: .top, spacing: 0) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let assistantLabel {
-                            Text(assistantLabel)
-                                .litterFont(.caption2, weight: .semibold)
-                                .foregroundColor(LitterTheme.textSecondary)
-                        }
-                        ForEach(parsed) { segment in
-                            switch segment.kind {
-                            case .markdown(let content, _):
-                                StructuredText(markdown: content)
-                                    .litterContentMarkdown()
-                            case .image(let image):
-                                Image(uiImage: image)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(maxHeight: 300)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                InlineSelectableMarkdownMessage(markdown: data.text) {
+                    HStack(alignment: .top, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let assistantLabel {
+                                Text(assistantLabel)
+                                    .litterFont(.caption2, weight: .semibold)
+                                    .foregroundColor(LitterTheme.textSecondary)
+                            }
+                            ForEach(parsed) { segment in
+                                switch segment.kind {
+                                case .markdown(let content, _):
+                                    LitterMarkdownView(markdown: content)
+                                case .image(let image):
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(maxHeight: 300)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                                }
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 20)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    Spacer(minLength: 20)
                 }
             }
         }
@@ -472,6 +520,8 @@ private struct ConversationTimelineItemRow: View {
 }
 
 private struct ConversationExplorationGroupRow: View {
+    @Environment(\.textScale) private var textScale
+
     let id: String
     let items: [ConversationItem]
 
@@ -483,10 +533,11 @@ private struct ConversationExplorationGroupRow: View {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .litterFont(size: 12, weight: .semibold)
-                        .foregroundColor(LitterTheme.textSecondary)
+                        .foregroundColor(isActive ? LitterTheme.warning : LitterTheme.textSecondary)
                     Text(summaryText)
                         .litterFont(.caption)
                         .foregroundColor(LitterTheme.textSystem)
+                        .modifier(ConversationExplorationHeaderShimmer(active: isActive))
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .litterFont(size: 11, weight: .medium)
@@ -502,8 +553,8 @@ private struct ConversationExplorationGroupRow: View {
                         HStack(alignment: .top, spacing: 8) {
                             Circle()
                                 .fill(data.isInProgress ? LitterTheme.warning : LitterTheme.textMuted)
-                                .frame(width: 6, height: 6)
-                                .padding(.top, 5)
+                                .frame(width: explorationBulletSize, height: explorationBulletSize)
+                                .padding(.top, explorationBulletTopPadding)
                             Text(explorationLabel(for: data))
                                 .litterFont(.caption)
                                 .foregroundColor(LitterTheme.textSecondary)
@@ -525,12 +576,26 @@ private struct ConversationExplorationGroupRow: View {
 
     private var summaryText: String {
         let count = items.count
-        if let first = items.first,
-           case .commandExecution(let data) = first.content {
-            let prefix = data.isInProgress ? "Exploring" : "Explored"
+        let prefix = isActive ? "Exploring" : "Explored"
+        if items.contains(where: \.isExplorationCommandItem) {
             return count == 1 ? "\(prefix) 1 location" : "\(prefix) \(count) locations"
         }
         return count == 1 ? "Exploration" : "\(count) exploration steps"
+    }
+
+    private var explorationBulletSize: CGFloat {
+        6 * textScale
+    }
+
+    private var explorationBulletTopPadding: CGFloat {
+        5 * textScale
+    }
+
+    private var isActive: Bool {
+        items.contains { item in
+            guard case .commandExecution(let data) = item.content else { return false }
+            return data.isInProgress
+        }
     }
 
     private func toggleExpanded() {
@@ -559,6 +624,253 @@ private struct ConversationExplorationGroupRow: View {
             }
         }
         return data.command
+    }
+}
+
+private extension ConversationItem {
+    var isExplorationCommandItem: Bool {
+        guard case .commandExecution(let data) = content else { return false }
+        return data.isPureExploration
+    }
+}
+
+private struct ConversationExplorationHeaderShimmer: ViewModifier {
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        if active {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                let t = timeline.date.timeIntervalSinceReferenceDate
+                let phase = CGFloat(t.truncatingRemainder(dividingBy: 2.0) / 2.0)
+
+                content
+                    .overlay {
+                        GeometryReader { geo in
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .white.opacity(0), location: max(0, phase - 0.2)),
+                                    .init(color: .white.opacity(0.35), location: phase),
+                                    .init(color: .white.opacity(0), location: min(1, phase + 0.2))
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                            .frame(width: geo.size.width, height: geo.size.height)
+                        }
+                        .blendMode(.sourceAtop)
+                    }
+                    .compositingGroup()
+            }
+        } else {
+            content
+        }
+    }
+}
+
+private struct ConversationReasoningRow: View {
+    let data: ConversationReasoningData
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Text(reasoningText)
+                .litterFont(.footnote)
+                .italic()
+                .foregroundColor(LitterTheme.textSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 20)
+        }
+    }
+
+    private var reasoningText: String {
+        (data.summary + data.content)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+    }
+}
+
+private struct ConversationTodoListRow: View {
+    let data: ConversationTodoListData
+    private let bodySize: CGFloat = 13
+    private let codeSize: CGFloat = 12
+    @State private var expanded = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: toggleExpanded) {
+                HStack(spacing: 8) {
+                    Image(systemName: headerIconName)
+                        .litterFont(size: 12, weight: .semibold)
+                        .foregroundColor(headerTint)
+                    Text("To Do")
+                        .litterFont(.caption, weight: .semibold)
+                        .foregroundColor(LitterTheme.textPrimary)
+                    Text(summaryText)
+                        .litterFont(.caption2, weight: .semibold)
+                        .foregroundColor(progressTint)
+                    Spacer(minLength: 8)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .litterFont(size: 11, weight: .medium)
+                        .foregroundColor(LitterTheme.textMuted)
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            if expanded {
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(data.steps.enumerated()), id: \.offset) { index, step in
+                            HStack(alignment: .top, spacing: 8) {
+                                todoStatusView(for: step.status)
+                                    .padding(.top, 2)
+                                Text("\(index + 1).")
+                                    .litterFont(.caption, weight: .semibold)
+                                    .foregroundColor(LitterTheme.textMuted)
+                                    .padding(.top, 1)
+                                LitterMarkdownView(
+                                    markdown: step.step,
+                                    style: .content,
+                                    bodySize: bodySize,
+                                    codeSize: codeSize
+                                )
+                                    .strikethrough(step.status == .completed, color: LitterTheme.textMuted)
+                                    .opacity(step.status == .completed ? 0.78 : 1.0)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .padding(10)
+                }
+                .frame(maxHeight: 160)
+                .background(LitterTheme.surface.opacity(0.45))
+                .mask {
+                    VStack(spacing: 0) {
+                        Rectangle().fill(.black)
+                        LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                            .frame(height: 18)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    private var completedCount: Int {
+        data.completedCount
+    }
+
+    private var hasInProgressStep: Bool {
+        data.steps.contains { $0.status == .inProgress }
+    }
+
+    private var headerIconName: String {
+        if data.isComplete { return "checkmark.circle.fill" }
+        if hasInProgressStep { return "checklist.checked" }
+        return "checklist"
+    }
+
+    private var headerTint: Color {
+        if data.isComplete { return LitterTheme.success }
+        if hasInProgressStep { return LitterTheme.warning }
+        return LitterTheme.accent
+    }
+
+    private var summaryText: String {
+        "\(completedCount) out of \(data.steps.count) task\(data.steps.count == 1 ? "" : "s") completed"
+    }
+
+    private var progressTint: Color {
+        data.isComplete ? LitterTheme.success : (hasInProgressStep ? LitterTheme.warning : LitterTheme.textSecondary)
+    }
+
+    private func toggleExpanded() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            expanded.toggle()
+        }
+    }
+
+    @ViewBuilder
+    private func todoStatusView(for status: HydratedPlanStepStatus) -> some View {
+        switch status {
+        case .pending:
+            Image(systemName: "circle")
+                .litterFont(size: 11, weight: .semibold)
+                .foregroundColor(LitterTheme.textMuted)
+        case .inProgress:
+            ProgressView()
+                .controlSize(.mini)
+                .tint(LitterTheme.warning)
+                .frame(width: 11, height: 11)
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .litterFont(size: 11, weight: .semibold)
+                .foregroundColor(LitterTheme.success)
+        }
+    }
+}
+
+private struct ConversationProposedPlanRow: View {
+    let data: ConversationProposedPlanData
+    let renderMode: ConversationTurnRenderMode
+
+    private var trimmedContent: String? {
+        let trimmed = data.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var body: some View {
+        if let trimmedContent {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "list.bullet.rectangle.portrait.fill")
+                        .litterFont(size: 12, weight: .semibold)
+                        .foregroundColor(LitterTheme.accent)
+                    Text("Plan")
+                        .litterFont(.caption, weight: .semibold)
+                        .foregroundColor(LitterTheme.textPrimary)
+                }
+
+                if renderMode == .rich {
+                    LitterMarkdownView(
+                        markdown: trimmedContent,
+                        style: .system
+                    )
+                } else {
+                    ConversationPlainTextBlock(
+                        text: trimmedContent,
+                        font: .caption,
+                        foregroundColor: LitterTheme.textSecondary
+                    )
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+    }
+}
+
+private struct ConversationTurnDiffRow: View {
+    let data: ConversationTurnDiffData
+    @State private var showingDetails = false
+
+    var body: some View {
+        Button {
+            showingDetails = true
+        } label: {
+            DiffIndicatorLabel(diff: data.diff)
+        }
+        .buttonStyle(.plain)
+        .sheet(isPresented: $showingDetails) {
+            ConversationDiffDetailSheet(
+                title: "Turn Diff",
+                diff: data.diff
+            )
+        }
     }
 }
 
@@ -712,207 +1024,6 @@ private struct ConversationCommandOutputViewport: View {
     }
 }
 
-private struct ConversationReasoningRow: View {
-    let data: ConversationReasoningData
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            Text(reasoningText)
-                .litterFont(.footnote)
-                .italic()
-                .foregroundColor(LitterTheme.textSecondary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Spacer(minLength: 20)
-        }
-    }
-
-    private var reasoningText: String {
-        (data.summary + data.content)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .joined(separator: "\n\n")
-    }
-}
-
-private struct ConversationTodoListRow: View {
-    let data: ConversationTodoListData
-    private let bodySize: CGFloat = 13
-    private let codeSize: CGFloat = 12
-    @State private var expanded = true
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button(action: toggleExpanded) {
-                HStack(spacing: 8) {
-                    Image(systemName: headerIconName)
-                        .litterFont(size: 12, weight: .semibold)
-                        .foregroundColor(headerTint)
-                    Text("To Do")
-                        .litterFont(.caption, weight: .semibold)
-                        .foregroundColor(LitterTheme.textPrimary)
-                    Text(summaryText)
-                        .litterFont(.caption2, weight: .semibold)
-                        .foregroundColor(progressTint)
-                    Spacer(minLength: 8)
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .litterFont(size: 11, weight: .medium)
-                        .foregroundColor(LitterTheme.textMuted)
-                }
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-
-            if expanded {
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(Array(data.steps.enumerated()), id: \.offset) { index, step in
-                            HStack(alignment: .top, spacing: 8) {
-                                todoStatusView(for: step.status)
-                                    .padding(.top, 2)
-                                Text("\(index + 1).")
-                                    .litterFont(.caption, weight: .semibold)
-                                    .foregroundColor(LitterTheme.textMuted)
-                                    .padding(.top, 1)
-                                StructuredText(markdown: step.step)
-                                    .litterContentMarkdown(bodySize: bodySize, codeSize: codeSize)
-                                    .strikethrough(step.status == .completed, color: LitterTheme.textMuted)
-                                    .opacity(step.status == .completed ? 0.78 : 1.0)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-                    .padding(10)
-                }
-                .frame(maxHeight: 160)
-                .background(LitterTheme.surface.opacity(0.45))
-                .mask {
-                    VStack(spacing: 0) {
-                        Rectangle().fill(.black)
-                        LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
-                            .frame(height: 18)
-                    }
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-    }
-
-    private var completedCount: Int {
-        data.completedCount
-    }
-
-    private var hasInProgressStep: Bool {
-        data.steps.contains { $0.status == .inProgress }
-    }
-
-    private var headerIconName: String {
-        if data.isComplete { return "checkmark.circle.fill" }
-        if hasInProgressStep { return "checklist.checked" }
-        return "checklist"
-    }
-
-    private var headerTint: Color {
-        if data.isComplete { return LitterTheme.success }
-        if hasInProgressStep { return LitterTheme.warning }
-        return LitterTheme.accent
-    }
-
-    private var summaryText: String {
-        "\(completedCount) out of \(data.steps.count) task\(data.steps.count == 1 ? "" : "s") completed"
-    }
-
-    private var progressTint: Color {
-        data.isComplete ? LitterTheme.success : (hasInProgressStep ? LitterTheme.warning : LitterTheme.textSecondary)
-    }
-
-    private func toggleExpanded() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            expanded.toggle()
-        }
-    }
-
-    @ViewBuilder
-    private func todoStatusView(for status: HydratedPlanStepStatus) -> some View {
-        switch status {
-        case .pending:
-            Image(systemName: "circle")
-                .litterFont(size: 11, weight: .semibold)
-                .foregroundColor(LitterTheme.textMuted)
-        case .inProgress:
-            ProgressView()
-                .controlSize(.mini)
-                .tint(LitterTheme.warning)
-                .frame(width: 11, height: 11)
-        case .completed:
-            Image(systemName: "checkmark.circle.fill")
-                .litterFont(size: 11, weight: .semibold)
-                .foregroundColor(LitterTheme.success)
-        }
-    }
-}
-
-private struct ConversationProposedPlanRow: View {
-    let data: ConversationProposedPlanData
-    let renderMode: ConversationTurnRenderMode
-
-    private var trimmedContent: String? {
-        let trimmed = data.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    var body: some View {
-        if let trimmedContent {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: "list.bullet.rectangle.portrait.fill")
-                        .litterFont(size: 12, weight: .semibold)
-                        .foregroundColor(LitterTheme.accent)
-                    Text("Plan")
-                        .litterFont(.caption, weight: .semibold)
-                        .foregroundColor(LitterTheme.textPrimary)
-                }
-
-                if renderMode == .rich {
-                    StructuredText(markdown: trimmedContent)
-                        .litterSystemMarkdown()
-                } else {
-                    ConversationPlainTextBlock(
-                        text: trimmedContent,
-                        font: .caption,
-                        foregroundColor: LitterTheme.textSecondary
-                    )
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-        }
-    }
-}
-
-private struct ConversationTurnDiffRow: View {
-    let data: ConversationTurnDiffData
-    @State private var showingDetails = false
-
-    var body: some View {
-        Button {
-            showingDetails = true
-        } label: {
-            DiffIndicatorLabel(diff: data.diff)
-        }
-        .buttonStyle(.plain)
-        .sheet(isPresented: $showingDetails) {
-            ConversationDiffDetailSheet(
-                title: "Turn Diff",
-                diff: data.diff
-            )
-        }
-    }
-}
-
 private struct ConversationToolCardRow: View {
     let model: ToolCallCardModel
 
@@ -959,6 +1070,7 @@ private struct ConversationUserInputResponseRow: View {
 
 private struct ConversationDividerRow: View {
     let kind: ConversationDividerKind
+    let isLiveTurn: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -978,9 +1090,9 @@ private struct ConversationDividerRow: View {
     @ViewBuilder
     private var dividerContent: some View {
         switch kind {
-        case .contextCompaction(let isComplete):
+        case .contextCompaction:
             HStack(spacing: 6) {
-                if isComplete {
+                if effectiveContextCompactionComplete {
                     Image(systemName: "checkmark.circle.fill")
                         .litterFont(size: 10, weight: .semibold)
                         .foregroundColor(LitterTheme.success)
@@ -992,7 +1104,9 @@ private struct ConversationDividerRow: View {
 
                 Text(title)
                     .litterFont(.caption2, weight: .semibold)
-                    .foregroundColor(isComplete ? LitterTheme.textMuted : LitterTheme.warning)
+                    .foregroundColor(
+                        effectiveContextCompactionComplete ? LitterTheme.textMuted : LitterTheme.warning
+                    )
                     .lineLimit(1)
             }
         default:
@@ -1005,8 +1119,8 @@ private struct ConversationDividerRow: View {
 
     private var title: String {
         switch kind {
-        case .contextCompaction(let isComplete):
-            return isComplete ? "Context compacted" : "Compacting context"
+        case .contextCompaction:
+            return effectiveContextCompactionComplete ? "Context compacted" : "Compacting context"
         case .modelRerouted(let fromModel, let toModel, let reason):
             let base = fromModel.map { "\($0) -> \(toModel)" } ?? "Routed to \(toModel)"
             if let reason, !reason.isEmpty {
@@ -1025,6 +1139,11 @@ private struct ConversationDividerRow: View {
             }
             return title
         }
+    }
+
+    private var effectiveContextCompactionComplete: Bool {
+        guard case .contextCompaction(let isComplete) = kind else { return true }
+        return isComplete && !isLiveTurn
     }
 }
 
@@ -1047,8 +1166,10 @@ private struct ConversationSystemCardRow: View {
             }
             if !content.isEmpty {
                 if renderMode == .rich {
-                    StructuredText(markdown: content)
-                        .litterSystemMarkdown()
+                    LitterMarkdownView(
+                        markdown: content,
+                        style: .system
+                    )
                 } else {
                     ConversationPlainTextBlock(
                         text: content,
@@ -1161,8 +1282,12 @@ struct ConversationPinnedContextStrip: View {
                             HStack(alignment: .top, spacing: 8) {
                                 compactTodoStatusView(for: step.status)
                                     .padding(.top, 2)
-                                StructuredText(markdown: step.step)
-                                    .litterContentMarkdown(bodySize: 12, codeSize: 11)
+                                LitterMarkdownView(
+                                    markdown: step.step,
+                                    style: .content,
+                                    bodySize: 12,
+                                    codeSize: 11
+                                )
                                     .strikethrough(step.status == .completed, color: LitterTheme.textMuted)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }

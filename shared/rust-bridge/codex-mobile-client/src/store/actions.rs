@@ -29,6 +29,8 @@ pub(crate) fn thread_info_from_upstream_status_change(
     }
 }
 
-pub(crate) fn conversation_item_from_upstream(item: upstream::ThreadItem) -> Option<ConversationItem> {
+pub(crate) fn conversation_item_from_upstream(
+    item: upstream::ThreadItem,
+) -> Option<ConversationItem> {
     hydrate_thread_item(&item, None, None, &Default::default())
 }

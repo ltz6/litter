@@ -14,7 +14,7 @@ mod shared;
 mod ssh;
 
 pub use app_store::{AppStore, AppStoreSubscription};
-pub use discovery::{DiscoveryBridge, ServerBridge};
+pub use discovery::{DiscoveryBridge, DiscoveryScanSubscription, ServerBridge};
 pub use errors::ClientError;
 pub use parser::MessageParser;
 pub use rpc::AppServerRpc;

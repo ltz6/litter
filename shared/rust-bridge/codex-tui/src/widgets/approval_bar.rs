@@ -1,9 +1,9 @@
 use codex_mobile_client::types::PendingApproval;
 use ratatui::{
+    Frame,
     layout::Rect,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 use crate::theme;

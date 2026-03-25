@@ -1,6 +1,8 @@
 import Foundation
 
 struct TranscriptTurn: Identifiable, Equatable {
+    private static let collapsedExcerptLimit = 180
+
     struct Preview: Equatable {
         let primaryText: String
         let secondaryText: String?
@@ -23,14 +25,14 @@ struct TranscriptTurn: Identifiable, Equatable {
         threadStatus: ConversationStatus,
         expandedRecentTurnCount: Int = 3
     ) -> [TranscriptTurn] {
-        let groupedItems = group(items)
-        guard !groupedItems.isEmpty else { return [] }
         let isStreaming: Bool
         if case .thinking = threadStatus {
             isStreaming = true
         } else {
             isStreaming = false
         }
+        let groupedItems = mergeTrailingStreamingGroups(in: group(items), isStreaming: isStreaming)
+        guard !groupedItems.isEmpty else { return [] }
 
         let lastIndex = groupedItems.index(before: groupedItems.endIndex)
 
@@ -101,6 +103,28 @@ struct TranscriptTurn: Identifiable, Equatable {
         return groups
     }
 
+    private static func mergeTrailingStreamingGroups(
+        in groups: [[ConversationItem]],
+        isStreaming: Bool
+    ) -> [[ConversationItem]] {
+        guard isStreaming, groups.count > 1 else { return groups }
+        guard let liveTurnStartIndex = groups.lastIndex(where: containsLiveTurnBoundary) else {
+            return groups
+        }
+        guard liveTurnStartIndex < groups.index(before: groups.endIndex) else {
+            return groups
+        }
+
+        let mergedLiveTurn = groups[liveTurnStartIndex...].flatMap { $0 }
+        return Array(groups[..<liveTurnStartIndex]) + [mergedLiveTurn]
+    }
+
+    private static func containsLiveTurnBoundary(_ items: [ConversationItem]) -> Bool {
+        items.contains { item in
+            item.isFromUserTurnBoundary || item.isUserItem
+        }
+    }
+
     private static func turnIdentifier(for items: [ConversationItem], ordinal: Int) -> String {
         if let first = items.first {
             if let sourceTurnId = items.first(where: { $0.sourceTurnId != nil })?.sourceTurnId {
@@ -123,22 +147,113 @@ struct TranscriptTurn: Identifiable, Equatable {
     }
 
     private static func makePreview(from items: [ConversationItem]) -> Preview {
-        let primaryItem = items.first(where: \.isUserItem) ?? items.first
-        let secondaryItem =
-            items.first {
-                guard let primaryItem else { return true }
-                return $0.id != primaryItem.id && ($0.isAssistantItem || isPreviewSecondary($0))
-            }
+        let previewMetrics = collectPreviewMetrics(from: items)
+        let primaryItem = previewMetrics.userItem ?? previewMetrics.finalAnswerItem ?? items.first
+        let preferredAssistantItem = previewMetrics.finalAnswerItem ?? previewMetrics.assistantItem
+        let secondaryItem = secondaryPreviewItem(
+            in: items,
+            primaryItem: primaryItem,
+            preferredAssistantItem: preferredAssistantItem
+        )
 
         return Preview(
             primaryText: previewText(for: primaryItem),
             secondaryText: secondaryItem.map(previewText(for:)),
-            durationText: formattedDuration(for: items),
-            imageCount: items.reduce(0) { $0 + $1.userImages.count },
-            toolCallCount: toolCallCount(in: items),
-            eventCount: eventCount(in: items),
-            widgetCount: items.filter { $0.widgetState != nil }.count
+            durationText: formattedDuration(from: previewMetrics),
+            imageCount: previewMetrics.imageCount,
+            toolCallCount: previewMetrics.toolCallCount,
+            eventCount: previewMetrics.eventCount,
+            widgetCount: previewMetrics.widgetCount
         )
+    }
+
+    private struct PreviewMetrics {
+        var userItem: ConversationItem?
+        var finalAnswerItem: ConversationItem?
+        var assistantItem: ConversationItem?
+        var imageCount = 0
+        var toolCallCount = 0
+        var eventCount = 0
+        var widgetCount = 0
+        var boundaryUserTimestamp: Date?
+        var userTimestamp: Date?
+        var assistantTimestamp: Date?
+        var explicitDurationMillis = 0
+        var hasExplicitDuration = false
+    }
+
+    private static func collectPreviewMetrics(from items: [ConversationItem]) -> PreviewMetrics {
+        var metrics = PreviewMetrics()
+
+        for item in items {
+            if metrics.userItem == nil, item.isUserItem {
+                metrics.userItem = item
+            }
+            if metrics.finalAnswerItem == nil, item.isFinalAnswerAssistantItem {
+                metrics.finalAnswerItem = item
+            }
+            if metrics.assistantItem == nil, item.isAssistantItem {
+                metrics.assistantItem = item
+            }
+            if metrics.boundaryUserTimestamp == nil, item.isUserItem && item.isFromUserTurnBoundary {
+                metrics.boundaryUserTimestamp = item.timestamp
+            }
+            if metrics.userTimestamp == nil, item.isUserItem {
+                metrics.userTimestamp = item.timestamp
+            }
+            if item.isAssistantItem {
+                metrics.assistantTimestamp = item.timestamp
+            }
+
+            metrics.imageCount += item.userImages.count
+            if item.widgetState != nil {
+                metrics.widgetCount += 1
+            }
+
+            switch item.content {
+            case .commandExecution(let data):
+                metrics.toolCallCount += 1
+                if let durationMs = data.durationMs {
+                    metrics.explicitDurationMillis += durationMs
+                    metrics.hasExplicitDuration = true
+                }
+            case .fileChange, .turnDiff, .multiAgentAction, .webSearch:
+                metrics.toolCallCount += 1
+            case .mcpToolCall(let data):
+                metrics.toolCallCount += 1
+                if let durationMs = data.durationMs {
+                    metrics.explicitDurationMillis += durationMs
+                    metrics.hasExplicitDuration = true
+                }
+            case .dynamicToolCall(let data):
+                metrics.toolCallCount += 1
+                if let durationMs = data.durationMs {
+                    metrics.explicitDurationMillis += durationMs
+                    metrics.hasExplicitDuration = true
+                }
+            case .divider, .error, .note, .userInputResponse:
+                metrics.eventCount += 1
+            default:
+                break
+            }
+        }
+
+        return metrics
+    }
+
+    private static func secondaryPreviewItem(
+        in items: [ConversationItem],
+        primaryItem: ConversationItem?,
+        preferredAssistantItem: ConversationItem?
+    ) -> ConversationItem? {
+        if let primaryItem, let preferredAssistantItem, preferredAssistantItem.id != primaryItem.id {
+            return preferredAssistantItem
+        }
+
+        return items.first { item in
+            guard let primaryItem else { return true }
+            return item.id != primaryItem.id && (item.isAssistantItem || isPreviewSecondary(item))
+        }
     }
 
     private static func isPreviewSecondary(_ item: ConversationItem) -> Bool {
@@ -245,48 +360,22 @@ struct TranscriptTurn: Identifiable, Equatable {
         }
     }
 
-    private static func formattedDuration(for items: [ConversationItem]) -> String? {
-        let userTimestamp =
-            items.first(where: { $0.isUserItem && $0.isFromUserTurnBoundary })?.timestamp ??
-            items.first(where: \.isUserItem)?.timestamp
-        let assistantTimestamp = items.last(where: \.isAssistantItem)?.timestamp
+    private static func formattedDuration(from metrics: PreviewMetrics) -> String? {
+        let userTimestamp = metrics.boundaryUserTimestamp ?? metrics.userTimestamp
 
         if let userTimestamp,
-           let assistantTimestamp {
+           let assistantTimestamp = metrics.assistantTimestamp {
             let interval = max(0, assistantTimestamp.timeIntervalSince(userTimestamp))
             if interval >= 0.05 {
                 return formatDuration(seconds: interval)
             }
         }
 
-        if let explicitMillis = explicitDurationMillis(in: items) {
-            return formatDuration(milliseconds: explicitMillis)
+        if metrics.hasExplicitDuration {
+            return formatDuration(milliseconds: metrics.explicitDurationMillis)
         }
 
         return nil
-    }
-
-    private static func explicitDurationMillis(in items: [ConversationItem]) -> Int? {
-        let total = items.reduce(into: 0) { runningTotal, item in
-            switch item.content {
-            case .commandExecution(let data):
-                if let durationMs = data.durationMs {
-                    runningTotal += durationMs
-                }
-            case .mcpToolCall(let data):
-                if let durationMs = data.durationMs {
-                    runningTotal += durationMs
-                }
-            case .dynamicToolCall(let data):
-                if let durationMs = data.durationMs {
-                    runningTotal += durationMs
-                }
-            default:
-                break
-            }
-        }
-
-        return total > 0 ? total : nil
     }
 
     private static func formatDuration(milliseconds: Int) -> String {
@@ -325,46 +414,82 @@ struct TranscriptTurn: Identifiable, Equatable {
         return remainingMinutes == 0 ? "\(hours)h" : "\(hours)h \(remainingMinutes)m"
     }
 
-    private static func toolCallCount(in items: [ConversationItem]) -> Int {
-        items.reduce(into: 0) { count, item in
-            switch item.content {
-            case .commandExecution,
-                 .fileChange,
-                 .turnDiff,
-                 .mcpToolCall,
-                 .dynamicToolCall,
-                 .multiAgentAction,
-                 .webSearch:
-                count += 1
-            default:
-                break
-            }
-        }
-    }
-
-    private static func eventCount(in items: [ConversationItem]) -> Int {
-        items.reduce(into: 0) { count, item in
-            switch item.content {
-            case .divider, .error, .note, .userInputResponse:
-                count += 1
-            default:
-                break
-            }
-        }
-    }
-
     private static func collapsedExcerpt(from text: String) -> String {
-        let normalized = text
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && $0 != "```" }
-            .joined(separator: " ")
+        var normalized = ""
+        normalized.reserveCapacity(min(text.count, collapsedExcerptLimit))
+        var hitLimit = false
 
-        if normalized.count <= 180 {
-            return normalized
+        text.enumerateLines { line, stop in
+            let trimmed = trimWhitespace(in: line[...])
+            guard !trimmed.isEmpty, trimmed != "```" else { return }
+
+            if !normalized.isEmpty {
+                appendExcerptChunk(" ", to: &normalized, hitLimit: &hitLimit)
+                if hitLimit {
+                    stop = true
+                    return
+                }
+            }
+
+            appendExcerptChunk(String(trimmed), to: &normalized, hitLimit: &hitLimit)
+            if hitLimit {
+                stop = true
+            }
         }
 
-        let endIndex = normalized.index(normalized.startIndex, offsetBy: 180)
-        return String(normalized[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+        if normalized.isEmpty {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.count <= collapsedExcerptLimit {
+                return trimmed
+            }
+            let endIndex = trimmed.index(trimmed.startIndex, offsetBy: collapsedExcerptLimit)
+            return String(trimmed[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+        }
+
+        return hitLimit ? normalized.trimmingCharacters(in: .whitespacesAndNewlines) + "..." : normalized
+    }
+
+    private static func trimWhitespace(in substring: Substring) -> Substring {
+        var start = substring.startIndex
+        var end = substring.endIndex
+
+        while start < end, substring[start].isWhitespace {
+            start = substring.index(after: start)
+        }
+        while start < end {
+            let previous = substring.index(before: end)
+            guard substring[previous].isWhitespace else { break }
+            end = previous
+        }
+
+        return substring[start..<end]
+    }
+
+    private static func appendExcerptChunk(
+        _ chunk: String,
+        to result: inout String,
+        hitLimit: inout Bool
+    ) {
+        let remaining = collapsedExcerptLimit - result.count
+        guard remaining > 0 else {
+            hitLimit = true
+            return
+        }
+
+        if chunk.count <= remaining {
+            result.append(contentsOf: chunk)
+            return
+        }
+
+        let endIndex = chunk.index(chunk.startIndex, offsetBy: remaining)
+        result.append(contentsOf: chunk[..<endIndex])
+        hitLimit = true
+    }
+}
+
+private extension ConversationItem {
+    var isFinalAnswerAssistantItem: Bool {
+        guard case .assistant(let data) = content else { return false }
+        return data.phase == .finalAnswer
     }
 }

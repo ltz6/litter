@@ -3,7 +3,7 @@
 use crate::MobileClient;
 use crate::ffi::ClientError;
 use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};
-use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppUpdate};
+use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppUpdate};
 use crate::types::generated;
 use crate::types::models::ThreadKey;
 use std::sync::Arc;
@@ -101,6 +101,15 @@ impl AppStore {
 
     pub async fn snapshot(&self) -> Result<AppSnapshotRecord, ClientError> {
         AppSnapshotRecord::try_from(self.inner.app_snapshot()).map_err(ClientError::Serialization)
+    }
+
+    pub async fn thread_snapshot(&self, key: ThreadKey) -> Result<Option<AppThreadSnapshot>, ClientError> {
+        self.inner
+            .snapshot_thread(&key)
+            .ok()
+            .map(AppThreadSnapshot::try_from)
+            .transpose()
+            .map_err(ClientError::Serialization)
     }
 
     pub fn subscribe_updates(&self) -> AppStoreSubscription {

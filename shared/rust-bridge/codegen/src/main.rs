@@ -125,17 +125,18 @@ fn main() {
                 .join("../third_party/codex/codex-rs/app-server-protocol/src/protocol/common.rs")
         });
 
-    let protocol_config_types_path = workspace_dir
-        .join("../third_party/codex/codex-rs/protocol/src/config_types.rs");
-    let protocol_openai_models_path = workspace_dir
-        .join("../third_party/codex/codex-rs/protocol/src/openai_models.rs");
+    let protocol_config_types_path =
+        workspace_dir.join("../third_party/codex/codex-rs/protocol/src/config_types.rs");
+    let protocol_openai_models_path =
+        workspace_dir.join("../third_party/codex/codex-rs/protocol/src/openai_models.rs");
     let protocol_account_path =
         workspace_dir.join("../third_party/codex/codex-rs/protocol/src/account.rs");
     let protocol_models_path =
         workspace_dir.join("../third_party/codex/codex-rs/protocol/src/models.rs");
-    let protocol_parse_command_path = workspace_dir
-        .join("../third_party/codex/codex-rs/protocol/src/parse_command.rs");
-    let protocol_path = workspace_dir.join("../third_party/codex/codex-rs/protocol/src/protocol.rs");
+    let protocol_parse_command_path =
+        workspace_dir.join("../third_party/codex/codex-rs/protocol/src/parse_command.rs");
+    let protocol_path =
+        workspace_dir.join("../third_party/codex/codex-rs/protocol/src/protocol.rs");
 
     let v1_path = args
         .iter()
@@ -548,13 +549,8 @@ where\n\
             &enums,
             &all_known,
         );
-        let rpc_output = generate_rpc_methods(
-            &rpc_methods,
-            &all_known,
-            &rpc_param_types,
-            &structs,
-            &enums,
-        );
+        let rpc_output =
+            generate_rpc_methods(&rpc_methods, &all_known, &rpc_param_types, &structs, &enums);
         std::fs::write(&rpc_out, &rpc_output).expect("failed to write RPC output");
         eprintln!("Written RPC methods to: {}", rpc_out.display());
 
@@ -1033,7 +1029,11 @@ fn map_field_def(
     let (_kind, key_ty, value_ty) = parse_map_types(&inner)?;
     let owner_base = owner.replace("::", "");
     let field_base = to_pascal_case(field_name);
-    let helper_base = format!("{}_{}", to_snake_case(&owner_base), to_snake_case(&field_base));
+    let helper_base = format!(
+        "{}_{}",
+        to_snake_case(&owner_base),
+        to_snake_case(&field_base)
+    );
     Some(MapFieldDef {
         entry_name: format!("{owner_base}{field_base}Entry"),
         deserialize_fn: format!("deserialize_{helper_base}_map"),
@@ -1349,9 +1349,7 @@ fn generate_rpc_methods(
     out.push_str("use codex_app_server_protocol as upstream;\n");
     out.push_str("use crate::{MobileClient, types::generated};\n");
     out.push_str("use super::{RpcClientError, next_request_id};\n\n");
-    out.push_str(
-        "pub fn convert_generated_field<T, U>(value: T) -> Result<U, RpcClientError>\n",
-    );
+    out.push_str("pub fn convert_generated_field<T, U>(value: T) -> Result<U, RpcClientError>\n");
     out.push_str("where\n");
     out.push_str("    T: serde::Serialize,\n");
     out.push_str("    U: serde::de::DeserializeOwned,\n");
@@ -1369,7 +1367,9 @@ fn generate_rpc_methods(
     out.push_str("        {\n");
     out.push_str("            let src = std::any::type_name::<T>();\n");
     out.push_str("            let dst = std::any::type_name::<U>();\n");
-    out.push_str("            let json = serde_json::to_string_pretty(&value).unwrap_or_default();\n");
+    out.push_str(
+        "            let json = serde_json::to_string_pretty(&value).unwrap_or_default();\n",
+    );
     out.push_str("            eprintln!(\n");
     out.push_str("                \"[codex-rpc] FAILED {src} -> {dst}: {e}\\n--- intermediate JSON ---\\n{json}\\n---\"\n");
     out.push_str("            );\n");
@@ -1475,7 +1475,9 @@ fn generate_rpc_methods(
                 "        let req = upstream::ClientRequest::{} {{\n",
                 method.variant
             ));
-            out.push_str("            request_id: upstream::RequestId::Integer(next_request_id()),\n");
+            out.push_str(
+                "            request_id: upstream::RequestId::Integer(next_request_id()),\n",
+            );
             out.push_str("            params,\n");
             out.push_str("        };\n");
         } else {
@@ -1483,7 +1485,9 @@ fn generate_rpc_methods(
                 "        let req = upstream::ClientRequest::{} {{\n",
                 method.variant
             ));
-            out.push_str("            request_id: upstream::RequestId::Integer(next_request_id()),\n");
+            out.push_str(
+                "            request_id: upstream::RequestId::Integer(next_request_id()),\n",
+            );
             out.push_str("            params: None,\n");
             out.push_str("        };\n");
         }
@@ -1512,7 +1516,9 @@ fn generate_public_rpc_methods(
     );
     out.push_str("use crate::MobileClient;\n");
     out.push_str("use crate::ffi::ClientError;\n");
-    out.push_str("use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};\n");
+    out.push_str(
+        "use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};\n",
+    );
     out.push_str("use crate::types::generated;\n");
     out.push_str("use std::sync::Arc;\n\n");
     out.push_str("#[derive(uniffi::Object)]\n");

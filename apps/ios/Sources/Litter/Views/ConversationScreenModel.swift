@@ -19,6 +19,7 @@ struct ConversationComposerSnapshot {
     var threadKey: ThreadKey
     var pendingUserInputRequest: PendingUserInputRequest?
     var composerPrefillRequest: AppModel.ComposerPrefillRequest?
+    var activeTurnId: String?
     var isTurnActive: Bool
     var threadPreview: String
     var threadModel: String
@@ -33,6 +34,7 @@ struct ConversationComposerSnapshot {
         threadKey: ThreadKey(serverId: "", threadId: ""),
         pendingUserInputRequest: nil,
         composerPrefillRequest: nil,
+        activeTurnId: nil,
         isTurnActive: false,
         threadPreview: "",
         threadModel: "",
@@ -92,7 +94,14 @@ final class ConversationScreenModel {
         let items = thread.hydratedConversationItems.map(\.conversationItem)
         let threadStatus = conversationStatus(from: thread)
         let updatedAt = Date(timeIntervalSince1970: TimeInterval(thread.info.updatedAt ?? 0))
-        let isTurnActive = thread.activeTurnId != nil || thread.info.status == .active
+        let activeTurnId: String?
+        if let value = thread.activeTurnId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            activeTurnId = value
+        } else {
+            activeTurnId = nil
+        }
+        let hasTurnInFlight = activeTurnId != nil || thread.info.status == .active
         let pendingUserInputRequest = appModel.snapshot?.pendingUserInputs.first {
             $0.serverId == thread.key.serverId && $0.threadId == thread.key.threadId
         }
@@ -103,7 +112,8 @@ final class ConversationScreenModel {
             threadKey: thread.key,
             pendingUserInputRequest: pendingUserInputRequest,
             composerPrefillRequest: composerPrefillRequest,
-            isTurnActive: isTurnActive,
+            activeTurnId: activeTurnId,
+            isTurnActive: activeTurnId != nil,
             threadPreview: thread.resolvedPreview,
             threadModel: thread.resolvedModel,
             threadReasoningEffort: thread.reasoningEffort,
@@ -116,7 +126,7 @@ final class ConversationScreenModel {
 
         if let lastObservedUpdatedAt,
            updatedAt != lastObservedUpdatedAt,
-           isTurnActive {
+           hasTurnInFlight {
             followScrollToken &+= 1
         }
         lastObservedUpdatedAt = updatedAt

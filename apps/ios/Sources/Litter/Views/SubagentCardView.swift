@@ -453,7 +453,7 @@ private struct SubagentDetailSheet: View {
                     approvalPolicy: nil,
                     sandbox: nil,
                     developerInstructions: nil,
-                    persistExtendedHistory: false
+                    persistExtendedHistory: true
                 ).threadResumeParams(threadId: threadKey.threadId, cwdOverride: nil)
             )
             await appModel.refreshSnapshot()

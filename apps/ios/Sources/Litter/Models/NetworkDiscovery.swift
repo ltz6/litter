@@ -126,8 +126,9 @@ final class NetworkDiscovery {
         tailscaleDiscoveryNotice = nil
 
         let cachedNetworkServers = loadCachedNetworkServers()
+        let savedNetworkServers = loadSavedNetworkServers()
         let retainedNetworkServers = servers.filter { $0.source != .local }
-        servers = reconcileNetworkServers(cachedNetworkServers + retainedNetworkServers)
+        servers = reconcileNetworkServers(cachedNetworkServers + savedNetworkServers + retainedNetworkServers)
         isScanning = true
         isInitialLoad = true
         servers.append(DiscoveredServer(
@@ -194,29 +195,47 @@ final class NetworkDiscovery {
         let localIPv4 = Self.localIPv4Address()?.0
         guard !Task.isCancelled else { return }
 
-        let rustServers = (try? await store.scanServersWithMdnsContext(
+        let subscription = store.scanServersWithMdnsContextProgressive(
             seeds: seeds.map {
                 FfiMdnsSeed(name: $0.name, host: $0.host, port: $0.port, serviceType: $0.serviceType)
             },
             localIpv4: localIPv4
-        )) ?? []
+        )
 
-        guard !Task.isCancelled else { return }
+        do {
+            while !Task.isCancelled {
+                let update = try await subscription.nextEvent()
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.activeScanID == scanID else { return }
+                    self.isInitialLoad = false
+                    self.applyRustDiscoveryResults(update.servers)
+                }
+                if update.kind == .scanComplete {
+                    break
+                }
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+        }
+
         _ = await tailscaleNoticeProbe
         let tailscaleNotice = await tailscaleDiagnostics.notice
         await MainActor.run { [weak self] in
             guard let self, self.activeScanID == scanID else { return }
             self.tailscaleDiscoveryNotice = tailscaleNotice
-            self.isInitialLoad = false
-            self.applyRustDiscoveryResults(rustServers)
         }
     }
 
     private func applyRustDiscoveryResults(_ discovered: [FfiDiscoveredServer]) {
         let now = Date()
-        let existingById = Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) })
+        let metadataSources = loadSavedNetworkServers() + servers.filter { $0.source != .local }
+        var existingByKey: [String: DiscoveredServer] = [:]
+        for server in metadataSources {
+            existingByKey[server.deduplicationKey] = server
+        }
         let resolved = discovered.compactMap { rust -> DiscoveredServer? in
-            let existing = existingById[rust.id]
+            let existing = existingByKey[Self.normalizedServerKey(for: rust.host)]
             guard let server = Self.discoveredServer(from: rust, existing: existing) else {
                 return nil
             }
@@ -225,8 +244,7 @@ final class NetworkDiscovery {
         }
 
         let local = servers.filter { $0.source == .local }
-        let retained = servers.filter { $0.source != .local }
-        servers = local + reconcileNetworkServers(resolved + retained)
+        servers = local + reconcileNetworkServers(resolved + metadataSources)
         saveCachedNetworkServers()
     }
 
@@ -254,7 +272,10 @@ final class NetworkDiscovery {
     }
 
     private func reconcileNetworkServers(_ candidates: [DiscoveredServer]) -> [DiscoveredServer] {
-        let existingById = Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) })
+        var existingByKey: [String: DiscoveredServer] = [:]
+        for server in candidates where server.source != .local {
+            existingByKey[server.deduplicationKey] = server
+        }
         return discoveryStore
             .reconcileServers(
                 candidates: candidates
@@ -262,8 +283,30 @@ final class NetworkDiscovery {
                     .map(Self.ffiDiscoveredServer(from:))
             )
             .compactMap { rust in
-                Self.discoveredServer(from: rust, existing: existingById[rust.id])
+                Self.discoveredServer(
+                    from: rust,
+                    existing: existingByKey[Self.normalizedServerKey(for: rust.host)]
+                )
             }
+    }
+
+    private func loadSavedNetworkServers() -> [DiscoveredServer] {
+        SavedServerStore.load()
+            .map { $0.toDiscoveredServer() }
+            .filter { $0.source != .local }
+    }
+
+    private static func normalizedServerKey(for host: String) -> String {
+        var normalized = host
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .replacingOccurrences(of: "%25", with: "%")
+
+        if !normalized.contains(":"), let scopeIndex = normalized.firstIndex(of: "%") {
+            normalized = String(normalized[..<scopeIndex])
+        }
+
+        return normalized.lowercased()
     }
 
     private static func ffiDiscoveredServer(from server: DiscoveredServer) -> FfiDiscoveredServer {

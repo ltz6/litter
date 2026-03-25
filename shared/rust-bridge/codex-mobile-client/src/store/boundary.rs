@@ -47,6 +47,29 @@ pub struct AppThreadSnapshot {
     pub realtime_session_id: Option<String>,
 }
 
+impl TryFrom<super::snapshot::ThreadSnapshot> for AppThreadSnapshot {
+    type Error = String;
+
+    fn try_from(thread: super::snapshot::ThreadSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            key: thread.key,
+            info: thread.info,
+            model: thread.model,
+            reasoning_effort: thread.reasoning_effort,
+            hydrated_conversation_items: thread.items.into_iter().map(Into::into).collect(),
+            active_turn_id: thread.active_turn_id,
+            context_tokens_used: thread.context_tokens_used,
+            model_context_window: thread.model_context_window,
+            rate_limits_json: thread
+                .rate_limits
+                .map(|limits| serde_json::to_string(&limits))
+                .transpose()
+                .map_err(|error| format!("serialize rate limits: {error}"))?,
+            realtime_session_id: thread.realtime_session_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AppSessionSummary {
     pub key: ThreadKey,
@@ -198,24 +221,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
         let mut threads = snapshot
             .threads
             .into_values()
-            .map(|thread| {
-                Ok(AppThreadSnapshot {
-                    key: thread.key,
-                    info: thread.info,
-                    model: thread.model,
-                    reasoning_effort: thread.reasoning_effort,
-                    hydrated_conversation_items: thread.items.into_iter().map(Into::into).collect(),
-                    active_turn_id: thread.active_turn_id,
-                    context_tokens_used: thread.context_tokens_used,
-                    model_context_window: thread.model_context_window,
-                    rate_limits_json: thread
-                        .rate_limits
-                        .map(|limits| serde_json::to_string(&limits))
-                        .transpose()
-                        .map_err(|error| format!("serialize rate limits: {error}"))?,
-                    realtime_session_id: thread.realtime_session_id,
-                })
-            })
+            .map(AppThreadSnapshot::try_from)
             .collect::<Result<Vec<_>, String>>()?;
         threads.sort_by(|lhs, rhs| lhs.key.thread_id.cmp(&rhs.key.thread_id));
 
@@ -292,11 +298,21 @@ fn sanitized_label_field(raw: Option<&str>) -> Option<&str> {
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum AppStoreUpdateRecord {
     FullResync,
-    ServerChanged { server_id: String },
-    ServerRemoved { server_id: String },
-    ThreadChanged { key: ThreadKey },
-    ThreadRemoved { key: ThreadKey },
-    ActiveThreadChanged { key: Option<ThreadKey> },
+    ServerChanged {
+        server_id: String,
+    },
+    ServerRemoved {
+        server_id: String,
+    },
+    ThreadChanged {
+        key: ThreadKey,
+    },
+    ThreadRemoved {
+        key: ThreadKey,
+    },
+    ActiveThreadChanged {
+        key: Option<ThreadKey>,
+    },
     PendingApprovalsChanged,
     PendingUserInputsChanged,
     VoiceSessionChanged,

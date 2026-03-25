@@ -23,7 +23,6 @@ PATCH_FILES=(
 )
 
 SYNC_MODE="--preserve-current"
-BUILD_INTEL_SIM=0
 DEVICE_ONLY=0
 FAST_DEVICE=0
 FORCE_BINDINGS=0
@@ -36,9 +35,6 @@ for arg in "$@"; do
   case "$arg" in
     --preserve-current|--recorded-gitlink)
       SYNC_MODE="$arg"
-      ;;
-    --with-intel-sim)
-      BUILD_INTEL_SIM=1
       ;;
     --device-only)
       DEVICE_ONLY=1
@@ -59,7 +55,7 @@ for arg in "$@"; do
       CARGO_FEATURES="--features rpc-trace"
       ;;
     *)
-      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--with-intel-sim] [--device-only] [--fast-device] [--force-bindings] [--skip-bindings] [--rpc-trace]" >&2
+      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--device-only] [--fast-device] [--force-bindings] [--skip-bindings] [--rpc-trace]" >&2
       exit 1
       ;;
   esac
@@ -94,7 +90,6 @@ mkdir -p "$FRAMEWORKS_DIR" "$GENERATED_HEADERS_DIR" "$GENERATED_DEVICE_DIR" "$GE
 
 export CXX_aarch64_apple_ios="$IOS_CLANGXX_WRAPPER"
 export CXX_aarch64_apple_ios_sim="$IOS_CLANGXX_WRAPPER"
-export CXX_x86_64_apple_ios="$IOS_CLANGXX_WRAPPER"
 export IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET"
 
 bindings_inputs() {
@@ -183,34 +178,44 @@ maybe_generate_swift_bindings
 echo "==> Installing iOS targets..."
 if [ "$DEVICE_ONLY" -eq 1 ]; then
   rustup target add aarch64-apple-ios
-elif [ "$BUILD_INTEL_SIM" -eq 1 ]; then
-  rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 else
   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 fi
 
-echo "==> Building codex-mobile-client for aarch64-apple-ios ($PROFILE)..."
-cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
-copy_device_artifact
+if [ "$DEVICE_ONLY" -eq 1 ]; then
+  echo "==> Building codex-mobile-client for aarch64-apple-ios ($PROFILE)..."
+  cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
+  copy_device_artifact
+else
+  # Build device and simulator targets in parallel
+  echo "==> Building codex-mobile-client for aarch64-apple-ios + aarch64-apple-ios-sim ($PROFILE) in parallel..."
 
-if [ "$DEVICE_ONLY" -eq 0 ]; then
-  echo "==> Building codex-mobile-client for aarch64-apple-ios-sim ($PROFILE)..."
-  cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios-sim --crate-type staticlib $CARGO_FEATURES
+  build_device() {
+    cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
+  }
 
-  SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a"
-  if [ "$BUILD_INTEL_SIM" -eq 1 ]; then
-    echo "==> Building codex-mobile-client for x86_64-apple-ios ($PROFILE)..."
-    cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target x86_64-apple-ios --crate-type staticlib $CARGO_FEATURES
+  build_sim() {
+    cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios-sim --crate-type staticlib $CARGO_FEATURES
+  }
 
-    echo "==> Creating fat simulator lib..."
-    mkdir -p "$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE"
-    lipo -create \
-      "$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a" \
-      "$RUST_BRIDGE_DIR/target/x86_64-apple-ios/$PROFILE/libcodex_mobile_client.a" \
-      -output "$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE/libcodex_mobile_client.a"
-    SIMULATOR_LIB="$RUST_BRIDGE_DIR/target/ios-sim-fat/$PROFILE/libcodex_mobile_client.a"
+  build_device &
+  DEVICE_PID=$!
+  build_sim &
+  SIM_PID=$!
+
+  FAILED=0
+  if ! wait "$DEVICE_PID"; then
+    echo "ERROR: device build (aarch64-apple-ios) failed" >&2
+    FAILED=1
   fi
-  copy_sim_artifact "$SIMULATOR_LIB"
+  if ! wait "$SIM_PID"; then
+    echo "ERROR: simulator build (aarch64-apple-ios-sim) failed" >&2
+    FAILED=1
+  fi
+  [ "$FAILED" -eq 0 ] || exit 1
+
+  copy_device_artifact
+  copy_sim_artifact "$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a"
 fi
 
 if [ "$FAST_DEVICE" -eq 1 ]; then

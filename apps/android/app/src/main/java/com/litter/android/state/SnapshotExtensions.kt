@@ -34,6 +34,18 @@ val AppServerHealth.accentColor: Color
 val AppServerSnapshot.isConnected: Boolean
     get() = health == AppServerHealth.CONNECTED
 
+val AppServerSnapshot.statusLabel: String
+    get() = when {
+        health == AppServerHealth.CONNECTED && !isLocal && account == null -> "Sign in required"
+        else -> health.displayLabel
+    }
+
+val AppServerSnapshot.statusColor: Color
+    get() = when {
+        health == AppServerHealth.CONNECTED && !isLocal && account == null -> WarningOrange
+        else -> health.accentColor
+    }
+
 // --- AppThreadSnapshot extensions --------------------------------------------
 
 val AppThreadSnapshot.hasActiveTurn: Boolean

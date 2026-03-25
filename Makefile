@@ -63,7 +63,7 @@ $(shell mkdir -p $(STAMPS))
 	rust-ios rust-ios-package rust-ios-device-fast rust-android rust-check rust-test rust-host-dev \
 	bindings bindings-swift bindings-kotlin \
 	sync patch unpatch xcgen ios-frameworks \
-	ios-build ios-build-sim ios-build-device \
+	ios-build ios-build-sim ios-build-device ios-build-device-fast \
 	test test-rust test-ios test-android \
 	testflight play-upload \
 	clean clean-rust clean-ios clean-android \
@@ -71,10 +71,18 @@ $(shell mkdir -p $(STAMPS))
 
 all: ios android
 
-ios: rust-ios-package ios-frameworks xcgen ios-build-sim
-ios-sim: rust-ios-package ios-frameworks xcgen ios-build-sim
-ios-device: rust-ios-package ios-frameworks xcgen ios-build-device
-ios-device-fast: rust-ios-device-fast ios-frameworks xcgen ios-build-device
+# ios-build-* targets declare their real prerequisites so that `make -j`
+# can run rust-ios-package, ios-frameworks, and xcgen in parallel.
+ios-build-sim: rust-ios-package ios-frameworks xcgen
+ios-build-device: rust-ios-package ios-frameworks xcgen
+
+# Fast device lane uses the lightweight rust target instead of full package.
+ios-build-device-fast: rust-ios-device-fast ios-frameworks xcgen
+
+ios: ios-build-sim
+ios-sim: ios-build-sim
+ios-device: ios-build-device
+ios-device-fast: ios-build-device-fast
 ios-run: ios
 	@open $(IOS_DIR)/Litter.xcodeproj
 
@@ -184,6 +192,14 @@ ios-build-sim:
 
 ios-build-device:
 	@echo "==> Building iOS ($(XCODE_CONFIG), device)..."
+	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
+		-scheme $(IOS_SCHEME) \
+		-configuration $(XCODE_CONFIG) \
+		-destination 'generic/platform=iOS' \
+		build | tail -20
+
+ios-build-device-fast:
+	@echo "==> Building iOS ($(XCODE_CONFIG), fast device)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \

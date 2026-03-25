@@ -74,6 +74,7 @@ final class VoiceSessionCoordinator {
     private let session = AVAudioSession.sharedInstance()
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
+    private var playbackFormat: AVAudioFormat?
     private var uploadPump: AudioUploadPump?
     private var notificationObservers: [NSObjectProtocol] = []
     private var aecBridge: AecBridge?
@@ -92,9 +93,10 @@ final class VoiceSessionCoordinator {
 
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
+        let mixerFormat = engine.mainMixerNode.outputFormat(forBus: 0)
         let playerFormat = AVAudioFormat(
-            standardFormatWithSampleRate: VoiceSessionAudioCodec.targetSampleRate,
-            channels: 1
+            standardFormatWithSampleRate: mixerFormat.sampleRate,
+            channels: max(mixerFormat.channelCount, 1)
         )
         guard let playerFormat else {
             throw NSError(
@@ -164,6 +166,7 @@ final class VoiceSessionCoordinator {
 
         audioEngine = engine
         playerNode = player
+        playbackFormat = playerFormat
         installAudioNotifications()
         emitRoute()
     }
@@ -180,6 +183,7 @@ final class VoiceSessionCoordinator {
         audioEngine?.stop()
         playerNode = nil
         audioEngine = nil
+        playbackFormat = nil
         speakerModeEnabled = true
         captureWarmupState.reset()
 
@@ -189,6 +193,7 @@ final class VoiceSessionCoordinator {
     func enqueueOutputAudio(_ chunk: ThreadRealtimeAudioChunk) {
         guard let playerNode,
               let engine = audioEngine,
+              let playbackFormat,
               let samples = VoiceSessionAudioCodec.decodePCM16Base64(
                 chunk.data,
                 numChannels: Int(chunk.numChannels)
@@ -201,9 +206,15 @@ final class VoiceSessionCoordinator {
             sampleRate: Double(chunk.sampleRate)
         )
         aecBridge?.analyzeRender(aecSamples)
-        guard let buffer = VoiceSessionAudioCodec.makePlaybackBuffer(
+        let playbackSamples = VoiceSessionAudioCodec.resampleToTarget(
             samples: samples,
-            sampleRate: Double(chunk.sampleRate)
+            sampleRate: Double(chunk.sampleRate),
+            targetSampleRate: playbackFormat.sampleRate
+        )
+        guard let buffer = VoiceSessionAudioCodec.makePlaybackBuffer(
+            samples: playbackSamples,
+            sampleRate: playbackFormat.sampleRate,
+            channels: playbackFormat.channelCount
         ) else {
             return
         }

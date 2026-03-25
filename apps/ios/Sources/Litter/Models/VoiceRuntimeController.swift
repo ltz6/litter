@@ -169,7 +169,7 @@ final class VoiceRuntimeController: VoiceActions {
                         approvalPolicy: AskForApproval(wireValue: approvalPolicy),
                         sandbox: SandboxMode(wireValue: sandboxMode),
                         developerInstructions: nil,
-                        persistExtendedHistory: false
+                        persistExtendedHistory: true
                     ).threadResumeParams(
                         threadId: key.threadId,
                         cwdOverride: preferredVoiceThreadCwd(for: key, fallback: cwd)
@@ -190,7 +190,7 @@ final class VoiceRuntimeController: VoiceActions {
                 approvalPolicy: AskForApproval(wireValue: approvalPolicy),
                 sandbox: SandboxMode(wireValue: sandboxMode),
                 developerInstructions: nil,
-                persistExtendedHistory: false
+                persistExtendedHistory: true
             ).threadStartParams(cwd: preferredVoiceThreadCwd(for: nil, fallback: cwd))
         )
         let key = ThreadKey(serverId: serverId, threadId: response.thread.id)
@@ -232,7 +232,7 @@ final class VoiceRuntimeController: VoiceActions {
                     approvalPolicy: nil,
                     sandbox: nil,
                     developerInstructions: nil,
-                    persistExtendedHistory: false
+                    persistExtendedHistory: true
                 ).threadResumeParams(threadId: key.threadId, cwdOverride: nil)
             )
             appModel.store.setActiveThread(key: key)
@@ -459,7 +459,7 @@ final class VoiceRuntimeController: VoiceActions {
                     approvalPolicy: nil,
                     sandbox: nil,
                     developerInstructions: nil,
-                    persistExtendedHistory: false
+                    persistExtendedHistory: true
                 ).threadStartParams(cwd: cwd)
             )
             let key = ThreadKey(serverId: serverId, threadId: response.thread.id)

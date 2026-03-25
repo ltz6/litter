@@ -1,8 +1,8 @@
-use crate::discovery_uniffi::{FfiDiscoveredServer, FfiMdnsSeed};
+use crate::MobileClient;
+use crate::discovery_uniffi::{FfiDiscoveredServer, FfiMdnsSeed, FfiProgressiveDiscoveryUpdate};
 use crate::ffi::ClientError;
 use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};
 use crate::session::connection::{InProcessConfig, ServerConfig};
-use crate::MobileClient;
 use std::sync::Arc;
 
 #[derive(uniffi::Object)]
@@ -15,6 +15,13 @@ pub struct DiscoveryBridge {
 pub struct ServerBridge {
     pub(crate) inner: Arc<MobileClient>,
     pub(crate) rt: Arc<tokio::runtime::Runtime>,
+}
+
+#[derive(uniffi::Object)]
+pub struct DiscoveryScanSubscription {
+    pub(crate) rx: std::sync::Mutex<
+        Option<tokio::sync::broadcast::Receiver<crate::discovery::ProgressiveDiscoveryUpdate>>,
+    >,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -42,7 +49,24 @@ impl DiscoveryBridge {
         })
     }
 
-    pub fn reconcile_servers(&self, candidates: Vec<FfiDiscoveredServer>) -> Vec<FfiDiscoveredServer> {
+    pub fn scan_servers_with_mdns_context_progressive(
+        &self,
+        seeds: Vec<FfiMdnsSeed>,
+        local_ipv4: Option<String>,
+    ) -> DiscoveryScanSubscription {
+        let seeds: Vec<_> = seeds.into_iter().map(Into::into).collect();
+        DiscoveryScanSubscription {
+            rx: std::sync::Mutex::new(Some(
+                self.inner
+                    .subscribe_scan_servers_with_mdns_context(seeds, local_ipv4),
+            )),
+        }
+    }
+
+    pub fn reconcile_servers(
+        &self,
+        candidates: Vec<FfiDiscoveredServer>,
+    ) -> Vec<FfiDiscoveredServer> {
         crate::discovery::reconcile_discovered_servers(
             candidates.into_iter().map(Into::into).collect(),
         )
@@ -142,5 +166,31 @@ impl ServerBridge {
 
     pub fn disconnect_server(&self, server_id: String) {
         self.inner.disconnect_server(&server_id);
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl DiscoveryScanSubscription {
+    pub async fn next_event(&self) -> Result<FfiProgressiveDiscoveryUpdate, ClientError> {
+        let mut rx = {
+            self.rx
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(ClientError::EventClosed(
+                    "no discovery subscriber".to_string(),
+                ))?
+        };
+        let result = loop {
+            match rx.recv().await {
+                Ok(update) => break Ok(update.into()),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break Err(ClientError::EventClosed("closed".to_string()));
+                }
+            }
+        };
+        *self.rx.lock().unwrap() = Some(rx);
+        result
     }
 }

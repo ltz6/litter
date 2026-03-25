@@ -1,11 +1,11 @@
 use codex_mobile_client::store::AppSnapshot;
 use codex_mobile_client::types::{ThreadKey, ThreadSummaryStatus};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame,
 };
 use std::collections::BTreeMap;
 
@@ -79,11 +79,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SessionsState, snapshot
             }
         }
 
-        let cwd = thread
-            .info
-            .cwd
-            .clone()
-            .unwrap_or_else(|| "~/".into());
+        let cwd = thread.info.cwd.clone().unwrap_or_else(|| "~/".into());
         let model = thread.model.clone().unwrap_or_default();
         let is_active = thread.active_turn_id.is_some()
             || matches!(thread.info.status, ThreadSummaryStatus::Active);
@@ -104,9 +100,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SessionsState, snapshot
 
     for (cwd, sessions) in &groups {
         // Workspace header (not selectable, but we include a dummy key)
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!(" {cwd}"), theme::bold()),
-        ])));
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!(" {cwd}"),
+            theme::bold(),
+        )])));
         // Push a dummy key for workspace headers
         visible_keys.push(ThreadKey {
             server_id: String::new(),
@@ -128,7 +125,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SessionsState, snapshot
                 Span::raw("  "),
                 Span::styled(&session.model, theme::secondary()),
                 Span::styled(active, theme::accent()),
-                Span::styled(fork_badge, ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
+                Span::styled(
+                    fork_badge,
+                    ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
+                ),
             ]);
             items.push(ListItem::new(line));
             visible_keys.push(session.key.clone());

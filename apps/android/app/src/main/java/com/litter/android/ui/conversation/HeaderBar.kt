@@ -51,11 +51,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.litter.android.state.AppThreadLaunchConfig
 import com.litter.android.state.accentColor
+import com.litter.android.state.AppThreadLaunchConfig
 import com.litter.android.state.hasActiveTurn
 import com.litter.android.state.isConnected
 import com.litter.android.state.resolvedModel
+import com.litter.android.state.statusColor
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
@@ -104,6 +105,7 @@ fun HeaderBar(
 
             // Status dot
             val health = server?.health ?: AppServerHealth.UNKNOWN
+            val statusColor = server?.statusColor ?: health.accentColor
             val shouldPulse = health == AppServerHealth.CONNECTING || health == AppServerHealth.UNRESPONSIVE
             val dotAlpha = if (shouldPulse) {
                 val infiniteTransition = rememberInfiniteTransition(label = "statusDotPulse")
@@ -123,7 +125,7 @@ fun HeaderBar(
                 modifier = Modifier
                     .size(8.dp)
                     .clip(CircleShape)
-                    .background(health.accentColor.copy(alpha = dotAlpha)),
+                    .background(statusColor.copy(alpha = dotAlpha)),
             )
             Spacer(Modifier.width(8.dp))
 
@@ -172,7 +174,7 @@ fun HeaderBar(
                     scope.launch {
                         isReloading = true
                         try {
-                            if (server != null && !server.isLocal && (server.account == null || server.requiresOpenaiAuth)) {
+                            if (server != null && !server.isLocal && server.account == null) {
                                 val resp = appModel.rpc.loginAccount(
                                     thread.key.serverId,
                                     uniffi.codex_mobile_client.LoginAccountParams.Chatgpt,

@@ -2,11 +2,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::types::generated::{JsonObjectEntry, JsonValue, JsonValueKind};
 use crate::types::ThreadKey;
-use crate::uniffi_shared::{
-    AppVoiceHandoffRequest, AppVoiceSpeaker, AppVoiceTranscriptUpdate,
-};
+use crate::types::generated::{JsonObjectEntry, JsonValue, JsonValueKind};
+use crate::uniffi_shared::{AppVoiceHandoffRequest, AppVoiceSpeaker, AppVoiceTranscriptUpdate};
 
 #[derive(Debug, Clone)]
 pub enum VoiceDerivedUpdate {
@@ -65,8 +63,11 @@ impl VoiceRealtimeThreadState {
             "handoff_request" => vec![VoiceDerivedUpdate::HandoffRequest(AppVoiceHandoffRequest {
                 handoff_id: json_string_for_keys(item, &["handoff_id", "handoffId", "id"])
                     .unwrap_or_else(|| self.next_virtual_item_id("handoff")),
-                input_transcript: json_string_for_keys(item, &["input_transcript", "inputTranscript"])
-                    .unwrap_or_default(),
+                input_transcript: json_string_for_keys(
+                    item,
+                    &["input_transcript", "inputTranscript"],
+                )
+                .unwrap_or_default(),
                 active_transcript: parse_active_transcript(item),
                 server_hint: json_string_for_keys(item, &["server_hint", "serverHint", "server"]),
                 fallback_transcript: json_string_for_keys(
@@ -189,13 +190,17 @@ impl VoiceRealtimeThreadState {
         });
         let pending_item_id = self.pending_item_id(speaker);
 
-        (prefer_upstream_id.then_some(upstream_item_id.clone()).flatten())
-            .or(pending_item_id)
-            .or(upstream_item_id)
-            .unwrap_or_else(|| self.next_virtual_item_id(match speaker {
+        (prefer_upstream_id
+            .then_some(upstream_item_id.clone())
+            .flatten())
+        .or(pending_item_id)
+        .or(upstream_item_id)
+        .unwrap_or_else(|| {
+            self.next_virtual_item_id(match speaker {
                 AppVoiceSpeaker::User => "user",
                 AppVoiceSpeaker::Assistant => "assistant",
-            }))
+            })
+        })
     }
 
     fn flush_live_transcript(&mut self, speaker: AppVoiceSpeaker) -> Option<VoiceDerivedUpdate> {
@@ -503,7 +508,10 @@ mod tests {
             panic!("expected final assistant message update");
         };
         assert_eq!(first.item_id, second.item_id);
-        assert_eq!(second.speaker, crate::uniffi_shared::AppVoiceSpeaker::Assistant);
+        assert_eq!(
+            second.speaker,
+            crate::uniffi_shared::AppVoiceSpeaker::Assistant
+        );
         assert_eq!(second.text, "Hi there");
         assert!(second.is_final);
     }
@@ -541,7 +549,10 @@ mod tests {
         let VoiceDerivedUpdate::Transcript(assistant_final) = &updates[1] else {
             panic!("expected assistant final transcript");
         };
-        assert_eq!(flushed_user.speaker, crate::uniffi_shared::AppVoiceSpeaker::User);
+        assert_eq!(
+            flushed_user.speaker,
+            crate::uniffi_shared::AppVoiceSpeaker::User
+        );
         assert_eq!(flushed_user.text, "Search docs");
         assert!(flushed_user.is_final);
         assert_eq!(

@@ -1,11 +1,11 @@
 //! Renders a phone-shaped bezel around content.
 
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
 };
 
 use crate::theme;
@@ -63,7 +63,12 @@ pub fn render_frame(frame: &mut Frame) -> Rect {
     ]);
     frame.render_widget(
         Paragraph::new(notch_line),
-        Rect { x: status_area.x, y: status_area.y, width: status_area.width, height: 1 },
+        Rect {
+            x: status_area.x,
+            y: status_area.y,
+            width: status_area.width,
+            height: 1,
+        },
     );
 
     // Row 2: time on left, battery on right
@@ -84,9 +89,10 @@ pub fn render_frame(frame: &mut Frame) -> Rect {
     frame.render_widget(Paragraph::new(time_line), row2);
 
     // Right: battery (render right-aligned on same row)
-    let battery_line = Line::from(vec![
-        Span::styled("■ ▂▅▇  100% ", Style::default().fg(theme::FG)),
-    ]);
+    let battery_line = Line::from(vec![Span::styled(
+        "■ ▂▅▇  100% ",
+        Style::default().fg(theme::FG),
+    )]);
     frame.render_widget(
         Paragraph::new(battery_line).alignment(Alignment::Right),
         row2,

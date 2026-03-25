@@ -39,7 +39,7 @@ data class AppThreadLaunchConfig(
         dynamicTools = null,
         mockExperimentalField = null,
         experimentalRawEvents = true,
-        persistExtendedHistory = persistHistory,
+        persistExtendedHistory = true,
     )
 
     fun toThreadResumeParams(threadId: String, cwd: String? = null): ThreadResumeParams =
@@ -58,7 +58,7 @@ data class AppThreadLaunchConfig(
             baseInstructions = null,
             developerInstructions = developerInstructions,
             personality = null,
-            persistExtendedHistory = persistHistory,
+            persistExtendedHistory = true,
         )
 
     fun toThreadForkParams(sourceThreadId: String, cwd: String): ThreadForkParams =
@@ -76,7 +76,7 @@ data class AppThreadLaunchConfig(
             baseInstructions = null,
             developerInstructions = developerInstructions,
             ephemeral = false,
-            persistExtendedHistory = persistHistory,
+            persistExtendedHistory = true,
         )
 }
 

@@ -120,13 +120,22 @@ mod tests {
 
     #[test]
     fn operation_status_normalizes_aliases() {
-        assert_eq!(AppOperationStatus::from_raw("pending"), AppOperationStatus::Pending);
+        assert_eq!(
+            AppOperationStatus::from_raw("pending"),
+            AppOperationStatus::Pending
+        );
         assert_eq!(
             AppOperationStatus::from_raw("in_progress"),
             AppOperationStatus::InProgress
         );
-        assert_eq!(AppOperationStatus::from_raw("done"), AppOperationStatus::Completed);
-        assert_eq!(AppOperationStatus::from_raw("denied"), AppOperationStatus::Failed);
+        assert_eq!(
+            AppOperationStatus::from_raw("done"),
+            AppOperationStatus::Completed
+        );
+        assert_eq!(
+            AppOperationStatus::from_raw("denied"),
+            AppOperationStatus::Failed
+        );
         assert_eq!(
             AppOperationStatus::from_raw("rejected"),
             AppOperationStatus::Declined
@@ -135,10 +144,25 @@ mod tests {
 
     #[test]
     fn subagent_status_normalizes_aliases() {
-        assert_eq!(AppSubagentStatus::from_raw("PendingInit"), AppSubagentStatus::PendingInit);
-        assert_eq!(AppSubagentStatus::from_raw("in_progress"), AppSubagentStatus::Running);
-        assert_eq!(AppSubagentStatus::from_raw("done"), AppSubagentStatus::Completed);
-        assert_eq!(AppSubagentStatus::from_raw("failed"), AppSubagentStatus::Errored);
-        assert_eq!(AppSubagentStatus::from_raw("notFound"), AppSubagentStatus::Unknown);
+        assert_eq!(
+            AppSubagentStatus::from_raw("PendingInit"),
+            AppSubagentStatus::PendingInit
+        );
+        assert_eq!(
+            AppSubagentStatus::from_raw("in_progress"),
+            AppSubagentStatus::Running
+        );
+        assert_eq!(
+            AppSubagentStatus::from_raw("done"),
+            AppSubagentStatus::Completed
+        );
+        assert_eq!(
+            AppSubagentStatus::from_raw("failed"),
+            AppSubagentStatus::Errored
+        );
+        assert_eq!(
+            AppSubagentStatus::from_raw("notFound"),
+            AppSubagentStatus::Unknown
+        );
     }
 }

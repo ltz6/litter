@@ -1,8 +1,11 @@
 import SwiftUI
+import PhotosUI
 
 struct AppearanceSettingsView: View {
     @Environment(ThemeManager.self) private var themeManager
+    @Environment(WallpaperManager.self) private var wallpaperManager
     @State private var activeThemePicker: ThemePickerKind?
+    @State private var wallpaperPickerItem: PhotosPickerItem?
     @AppStorage("conversationTextSizeStep") private var textSizeStep = ConversationTextSize.large.rawValue
 
     var body: some View {
@@ -10,6 +13,7 @@ struct AppearanceSettingsView: View {
             LitterTheme.backgroundGradient.ignoresSafeArea()
             Form {
                 fontSizeSection
+                wallpaperSection
                 conversationPreviewSection
                 lightThemeSection
                 darkThemeSection
@@ -28,6 +32,80 @@ struct AppearanceSettingsView: View {
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+        }
+    }
+
+    // MARK: - Wallpaper
+
+    private var wallpaperSection: some View {
+        Section {
+            HStack(spacing: 12) {
+                // Preview thumbnail
+                Group {
+                    if let image = wallpaperManager.wallpaperImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        LitterTheme.backgroundGradient
+                    }
+                }
+                .frame(width: 48, height: 72)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(LitterTheme.border.opacity(0.5), lineWidth: 1)
+                )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    PhotosPicker(
+                        selection: $wallpaperPickerItem,
+                        matching: .images,
+                        photoLibrary: .shared()
+                    ) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "photo.on.rectangle")
+                                .litterFont(size: 13, weight: .medium)
+                            Text("Choose from Library")
+                                .litterFont(.subheadline)
+                        }
+                        .foregroundColor(LitterTheme.accent)
+                    }
+                    .buttonStyle(.plain)
+
+                    if wallpaperManager.isWallpaperSet {
+                        Button {
+                            wallpaperManager.clear()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "xmark.circle")
+                                    .litterFont(size: 13, weight: .medium)
+                                Text("Remove Wallpaper")
+                                    .litterFont(.subheadline)
+                            }
+                            .foregroundColor(LitterTheme.danger)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 4)
+            .listRowBackground(LitterTheme.surface.opacity(0.6))
+            .onChange(of: wallpaperPickerItem) { _, newItem in
+                guard let newItem else { return }
+                Task {
+                    if let data = try? await newItem.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data) {
+                        wallpaperManager.setCustom(image)
+                    }
+                    wallpaperPickerItem = nil
+                }
+            }
+        } header: {
+            Text("Chat Wallpaper")
+                .foregroundColor(LitterTheme.textSecondary)
         }
     }
 
@@ -111,7 +189,17 @@ struct AppearanceSettingsView: View {
             .padding(.vertical, 6)
             .environment(\.textScale, ConversationTextSize.clamped(rawValue: textSizeStep).scale)
             .id(themeManager.themeVersion)
-            .listRowBackground(LitterTheme.backgroundGradient)
+            .listRowBackground(
+                Group {
+                    if let image = wallpaperManager.wallpaperImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        LitterTheme.backgroundGradient
+                    }
+                }
+            )
             .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
         } header: {
             Text("Preview")

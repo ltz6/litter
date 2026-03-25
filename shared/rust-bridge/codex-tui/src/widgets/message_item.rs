@@ -50,9 +50,7 @@ fn render_assistant(data: &AssistantMessageData, width: u16) -> Vec<Line<'static
 
     let mut lines = vec![Line::from(Span::styled(
         label,
-        Style::default()
-            .fg(theme::FG)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
     ))];
 
     let md_lines = markdown::render(&data.text, width.saturating_sub(2));
@@ -92,10 +90,7 @@ fn render_command(data: &CommandExecutionData) -> Vec<Line<'static>> {
     if let Some(ref output) = data.output {
         let output_lines: Vec<&str> = output.lines().take(10).collect();
         for ol in &output_lines {
-            lines.push(Line::from(Span::styled(
-                format!(" │ {ol}"),
-                theme::dim(),
-            )));
+            lines.push(Line::from(Span::styled(format!(" │ {ol}"), theme::dim())));
         }
         let total_lines = output.lines().count();
         if total_lines > 10 {
@@ -126,10 +121,7 @@ fn render_file_change(data: &FileChangeData) -> Vec<Line<'static>> {
 
     lines.push(Line::from(vec![
         Span::styled(" ┌─ files ", Style::default().fg(theme::BORDER)),
-        Span::styled(
-            format!("({}) ", data.status),
-            theme::secondary(),
-        ),
+        Span::styled(format!("({}) ", data.status), theme::secondary()),
         Span::styled("─".repeat(25), Style::default().fg(theme::BORDER)),
     ]));
 
@@ -157,10 +149,7 @@ fn render_file_change(data: &FileChangeData) -> Vec<Line<'static>> {
             } else {
                 theme::dim()
             };
-            lines.push(Line::from(Span::styled(
-                format!(" │   {diff_line}"),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(format!(" │   {diff_line}"), style)));
         }
     }
 
@@ -181,10 +170,7 @@ fn render_mcp_tool_call(data: &McpToolCallData) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             Span::styled(" ┌─ mcp: ", Style::default().fg(theme::BORDER)),
-            Span::styled(
-                format!("{}:{}", data.server, data.tool),
-                theme::accent(),
-            ),
+            Span::styled(format!("{}:{}", data.server, data.tool), theme::accent()),
         ]),
         Line::from(vec![
             Span::styled(" │ status: ", theme::dim()),
@@ -214,10 +200,7 @@ fn render_multi_agent(data: &MultiAgentActionData) -> Vec<Line<'static>> {
     for state in &data.agent_states {
         lines.push(Line::from(vec![
             Span::styled(" │ ", theme::dim()),
-            Span::styled(
-                state.target_id.clone(),
-                Style::default().fg(Color::Magenta),
-            ),
+            Span::styled(state.target_id.clone(), Style::default().fg(Color::Magenta)),
             Span::raw(format!(" [{}]", state.status)),
         ]));
     }
@@ -285,10 +268,7 @@ fn render_divider(data: &DividerData) -> Vec<Line<'static>> {
         DividerData::ReviewEntered { .. } => "── review entered ──",
         DividerData::ReviewExited { .. } => "── review exited ──",
     };
-    vec![Line::from(Span::styled(
-        format!(" {label}"),
-        theme::dim(),
-    ))]
+    vec![Line::from(Span::styled(format!(" {label}"), theme::dim()))]
 }
 
 fn render_note(data: &NoteData) -> Vec<Line<'static>> {

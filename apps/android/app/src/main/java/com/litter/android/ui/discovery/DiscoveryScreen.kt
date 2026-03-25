@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +46,7 @@ import com.litter.android.state.SavedServerStore
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
+import uniffi.codex_mobile_client.AppServerSnapshot
 import uniffi.codex_mobile_client.FfiDiscoveredServer
 
 /**
@@ -59,6 +61,7 @@ fun DiscoveryScreen(
     onDismiss: () -> Unit,
 ) {
     val appModel = LocalAppModel.current
+    val snapshot by appModel.snapshot.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var showManualEntry by remember { mutableStateOf(false) }
@@ -108,6 +111,7 @@ fun DiscoveryScreen(
             items(merged, key = { it.id }) { entry ->
                 ServerRow(
                     entry = entry,
+                    connectedServer = connectedSnapshot(entry, snapshot?.servers ?: emptyList()),
                     onClick = {
                         scope.launch {
                             try {
@@ -202,7 +206,13 @@ fun DiscoveryScreen(
 }
 
 @Composable
-private fun ServerRow(entry: SavedServer, onClick: () -> Unit) {
+private fun ServerRow(
+    entry: SavedServer,
+    connectedServer: AppServerSnapshot?,
+    onClick: () -> Unit,
+) {
+    val displayHost = connectedServer?.host ?: entry.hostname
+    val displayPort = connectedServer?.port?.toInt() ?: entry.port
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -220,11 +230,13 @@ private fun ServerRow(entry: SavedServer, onClick: () -> Unit) {
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(entry.name.ifBlank { entry.hostname }, color = LitterTheme.textPrimary, fontSize = 14.sp)
-            Text("${entry.hostname}:${entry.port}", color = LitterTheme.textSecondary, fontSize = 11.sp)
+            Text("$displayHost:$displayPort", color = LitterTheme.textSecondary, fontSize = 11.sp)
         }
         val (sourceColor, sourceLabel) = when (entry.source) {
             "bonjour" -> LitterTheme.info to "Bonjour"
             "tailscale" -> Color(0xFFC797D8) to "Tailscale"
+            "lanProbe" -> LitterTheme.accent to "LAN"
+            "arpScan" -> LitterTheme.textSecondary to "ARP"
             "ssh" -> Color(0xFFFF9500) to "SSH"
             "local" -> LitterTheme.accent to "Local"
             else -> LitterTheme.textMuted to "Manual"
@@ -266,22 +278,63 @@ private fun ManualEntryDialog(onDismiss: () -> Unit, onConnect: (String) -> Unit
     )
 }
 
+private fun connectedSnapshot(
+    entry: SavedServer,
+    servers: List<AppServerSnapshot>,
+): AppServerSnapshot? = servers.firstOrNull { it.serverId == entry.id }
+    ?: servers.firstOrNull { it.host.lowercase().trim().trimStart('[').trimEnd(']') == entry.deduplicationKey }
+
 private fun mergeServers(
     discovered: List<FfiDiscoveredServer>,
     saved: List<SavedServer>,
 ): List<SavedServer> {
-    val result = mutableMapOf<String, SavedServer>()
+    val merged = linkedMapOf<String, SavedServer>()
 
-    // Add saved servers first
-    for (s in saved) {
-        result[s.deduplicationKey] = s
+    fun sourceRank(source: String): Int = when (source) {
+        "bonjour" -> 0
+        "tailscale" -> 1
+        "lanProbe" -> 2
+        "arpScan" -> 3
+        "ssh" -> 4
+        "manual" -> 5
+        "local" -> 6
+        else -> 7
     }
 
-    // Overlay discovered servers (prefer discovered — fresher data)
-    for (d in discovered) {
-        val ss = SavedServer.from(d)
-        result[ss.deduplicationKey] = ss
+    fun mergeCandidate(existing: SavedServer, candidate: SavedServer): SavedServer {
+        val betterSource = sourceRank(candidate.source) < sourceRank(existing.source)
+        val hasCodexUpgrade = candidate.hasCodexServer && !existing.hasCodexServer
+        val betterCodexPort = candidate.hasCodexServer && existing.hasCodexServer && candidate.port != existing.port
+        val betterName = existing.name == existing.hostname && candidate.name != candidate.hostname
+        val preferCandidate = betterSource || hasCodexUpgrade || betterCodexPort || betterName
+
+        return if (preferCandidate) {
+            candidate.copy(
+                id = existing.id,
+                wakeMAC = candidate.wakeMAC ?: existing.wakeMAC,
+                sshPortForwardingEnabled = candidate.sshPortForwardingEnabled || existing.sshPortForwardingEnabled,
+                websocketURL = candidate.websocketURL ?: existing.websocketURL,
+            )
+        } else {
+            existing.copy(
+                sshPort = existing.sshPort ?: candidate.sshPort,
+                wakeMAC = existing.wakeMAC ?: candidate.wakeMAC,
+                sshPortForwardingEnabled = existing.sshPortForwardingEnabled || candidate.sshPortForwardingEnabled,
+                websocketURL = existing.websocketURL ?: candidate.websocketURL,
+            )
+        }
     }
 
-    return result.values.sortedBy { it.name.lowercase() }
+    for (server in saved) {
+        merged[server.deduplicationKey] = server
+    }
+
+    for (server in discovered.map(SavedServer::from)) {
+        val key = server.deduplicationKey
+        merged[key] = merged[key]?.let { existing -> mergeCandidate(existing, server) } ?: server
+    }
+
+    return merged.values.sortedWith(
+        compareBy<SavedServer> { sourceRank(it.source) }.thenBy { it.name.lowercase() }
+    )
 }

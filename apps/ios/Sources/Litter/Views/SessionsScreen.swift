@@ -1027,7 +1027,7 @@ struct SessionsScreen: View {
         await conversationWarmup.prewarmIfNeeded()
         workDir = thread.cwd
         appState.currentCwd = thread.cwd
-        let opened: Bool
+        let openedKey: ThreadKey?
         do {
             let response = try await appModel.rpc.threadResume(
                 serverId: thread.key.serverId,
@@ -1036,21 +1036,20 @@ struct SessionsScreen: View {
                     cwdOverride: thread.cwd
                 )
             )
-            appModel.store.setActiveThread(
-                key: ThreadKey(serverId: thread.key.serverId, threadId: response.thread.id)
-            )
+            let nextKey = ThreadKey(serverId: thread.key.serverId, threadId: response.thread.id)
+            appModel.store.setActiveThread(key: nextKey)
             await appModel.refreshSnapshot()
-            opened = true
+            openedKey = nextKey
         } catch {
             sessionActionErrorMessage = error.localizedDescription
-            opened = false
+            openedKey = nil
         }
         resumingKey = nil
-        guard opened else {
+        guard let openedKey else {
             sessionActionErrorMessage = sessionActionErrorMessage ?? "Failed to open conversation."
             return
         }
-        onOpenConversation(thread.key)
+        onOpenConversation(openedKey)
     }
 
     private func startNewSession(serverId: String, cwd: String) async {
@@ -1069,7 +1068,13 @@ struct SessionsScreen: View {
             let startedKey = ThreadKey(serverId: serverId, threadId: response.thread.id)
             appModel.store.setActiveThread(key: startedKey)
             await appModel.refreshSnapshot()
-            onOpenConversation(startedKey)
+            guard let resolvedKey = await appModel.ensureThreadLoaded(key: startedKey)
+                ?? appModel.snapshot?.threadSnapshot(for: startedKey)?.key else {
+                sessionActionErrorMessage = appModel.lastError ?? "Failed to load the new session."
+                return
+            }
+
+            onOpenConversation(resolvedKey)
         } catch {
             sessionActionErrorMessage = error.localizedDescription
         }
@@ -1105,7 +1110,7 @@ struct SessionsScreen: View {
             approvalPolicy: AskForApproval(wireValue: appState.approvalPolicy),
             sandbox: SandboxMode(wireValue: appState.sandboxMode),
             developerInstructions: nil,
-            persistExtendedHistory: false
+            persistExtendedHistory: true
         )
     }
 

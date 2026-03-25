@@ -58,6 +58,7 @@ impl MobileClient {
             .upsert_server(session.config(), ServerHealthSnapshot::Connected);
 
         self.spawn_event_reader(server_id.clone(), Arc::clone(&session));
+        self.spawn_health_reader(server_id.clone(), session.health());
 
         self.sessions
             .write()
@@ -82,6 +83,7 @@ impl MobileClient {
             .upsert_server(session.config(), ServerHealthSnapshot::Connected);
 
         self.spawn_event_reader(server_id.clone(), Arc::clone(&session));
+        self.spawn_health_reader(server_id.clone(), session.health());
 
         self.sessions
             .write()
@@ -246,16 +248,14 @@ impl MobileClient {
                     base_instructions: None,
                     developer_instructions,
                     ephemeral: false,
-                    persist_extended_history,
+                    persist_extended_history: true,
                 },
             )
             .await
             .map_err(|e| RpcError::Deserialization(e.to_string()))?;
 
         let fork_model = Some(response.model);
-        let fork_reasoning = response
-            .reasoning_effort
-            .map(reasoning_effort_string);
+        let fork_reasoning = response.reasoning_effort.map(reasoning_effort_string);
         let mut snapshot = thread_snapshot_from_generated_thread(
             &key.server_id,
             response.thread,
@@ -322,21 +322,21 @@ impl MobileClient {
         let response = generated::ToolRequestUserInputResponse {
             answers: answers
                 .into_iter()
-                .map(|answer| generated::ToolRequestUserInputResponseAnswersEntry {
-                    key: answer.question_id,
-                    value: generated::ToolRequestUserInputAnswer {
-                        answers: answer.answers,
+                .map(
+                    |answer| generated::ToolRequestUserInputResponseAnswersEntry {
+                        key: answer.question_id,
+                        value: generated::ToolRequestUserInputAnswer {
+                            answers: answer.answers,
+                        },
                     },
-                })
+                )
                 .collect(),
         };
-        let response_json = serde_json::to_value(response)
-            .map_err(|e| RpcError::Deserialization(format!("serialize user input response: {e}")))?;
+        let response_json = serde_json::to_value(response).map_err(|e| {
+            RpcError::Deserialization(format!("serialize user input response: {e}"))
+        })?;
         session
-            .respond(
-                serde_json::Value::String(request.id.clone()),
-                response_json,
-            )
+            .respond(serde_json::Value::String(request.id.clone()), response_json)
             .await?;
         debug!(
             "MobileClient: user input response sent for server={} request_id={}",
@@ -357,12 +357,12 @@ impl MobileClient {
         }
 
         match params {
-            generated::LoginAccountParams::ApiKey { .. } => Err(
-                "API keys can only be saved on the local server.".to_string(),
-            ),
-            generated::LoginAccountParams::ChatgptAuthTokens { .. } => Err(
-                "Local ChatGPT tokens can only be sent to the local server.".to_string(),
-            ),
+            generated::LoginAccountParams::ApiKey { .. } => {
+                Err("API keys can only be saved on the local server.".to_string())
+            }
+            generated::LoginAccountParams::ChatgptAuthTokens { .. } => {
+                Err("Local ChatGPT tokens can only be sent to the local server.".to_string())
+            }
             generated::LoginAccountParams::Chatgpt => Ok(()),
         }
     }
@@ -396,10 +396,31 @@ impl MobileClient {
         mdns_results: Vec<MdnsSeed>,
         local_ipv4: Option<String>,
     ) -> Vec<DiscoveredServer> {
-        let mut discovery = self.discovery.write().expect("discovery lock poisoned");
+        let discovery = self.discovery.write().expect("discovery lock poisoned");
         discovery
             .scan_once_with_context(&mdns_results, local_ipv4.as_deref())
             .await
+    }
+
+    pub fn subscribe_scan_servers_with_mdns_context(
+        &self,
+        mdns_results: Vec<MdnsSeed>,
+        local_ipv4: Option<String>,
+    ) -> broadcast::Receiver<crate::discovery::ProgressiveDiscoveryUpdate> {
+        let (tx, rx) = broadcast::channel(32);
+        let discovery = self
+            .discovery
+            .read()
+            .expect("discovery lock poisoned")
+            .clone_for_one_shot();
+
+        Self::spawn_detached(async move {
+            let _ = discovery
+                .scan_once_progressive_with_context(&mdns_results, local_ipv4.as_deref(), &tx)
+                .await;
+        });
+
+        rx
     }
 
     fn spawn_event_reader(&self, server_id: String, session: Arc<ServerSession>) {
@@ -409,21 +430,68 @@ impl MobileClient {
             loop {
                 match events.recv().await {
                     Ok(ServerEvent::Notification(notification)) => {
+                        eprintln!(
+                            "[codex-mobile-client] event reader server_id={} notification={:?}",
+                            server_id, notification
+                        );
                         processor.process_notification(&server_id, &notification);
                     }
                     Ok(ServerEvent::LegacyNotification { method, params }) => {
+                        eprintln!(
+                            "[codex-mobile-client] event reader server_id={} legacy_method={} params={}",
+                            server_id, method, params
+                        );
                         processor.process_legacy_notification(&server_id, &method, &params);
                     }
                     Ok(ServerEvent::Request(request)) => {
+                        eprintln!(
+                            "[codex-mobile-client] event reader server_id={} request={:?}",
+                            server_id, request
+                        );
                         processor.process_server_request(&server_id, &request);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         debug!("MobileClient: event stream closed for {server_id}");
+                        eprintln!(
+                            "[codex-mobile-client] event reader closed server_id={}",
+                            server_id
+                        );
                         break;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!("MobileClient: lagged {skipped} events for {server_id}");
+                        eprintln!(
+                            "[codex-mobile-client] event reader lagged server_id={} skipped={}",
+                            server_id, skipped
+                        );
                     }
+                }
+            }
+        });
+    }
+
+    fn spawn_health_reader(
+        &self,
+        server_id: String,
+        mut health_rx: tokio::sync::watch::Receiver<crate::session::connection::ConnectionHealth>,
+    ) {
+        let processor = Arc::clone(&self.event_processor);
+        Self::spawn_detached(async move {
+            processor.emit_connection_state(&server_id, "connecting");
+            loop {
+                let health = health_rx.borrow().clone();
+                let health_wire = match health {
+                    crate::session::connection::ConnectionHealth::Disconnected => "disconnected",
+                    crate::session::connection::ConnectionHealth::Connecting { .. } => "connecting",
+                    crate::session::connection::ConnectionHealth::Connected => "connected",
+                    crate::session::connection::ConnectionHealth::Unresponsive { .. } => {
+                        "unresponsive"
+                    }
+                };
+                processor.emit_connection_state(&server_id, health_wire);
+
+                if health_rx.changed().await.is_err() {
+                    break;
                 }
             }
         });
@@ -484,8 +552,7 @@ impl MobileClient {
             .request_client(request)
             .await
             .map_err(|e| e.to_string())?;
-        serde_json::from_value(value)
-            .map_err(|e| format!("deserialize typed RPC response: {e}"))
+        serde_json::from_value(value).map_err(|e| format!("deserialize typed RPC response: {e}"))
     }
 
     fn pending_approval(&self, request_id: &str) -> Result<PendingApproval, RpcError> {
@@ -494,7 +561,9 @@ impl MobileClient {
             .pending_approvals
             .into_iter()
             .find(|approval| approval.id == request_id)
-            .ok_or_else(|| RpcError::Deserialization(format!("unknown approval request {request_id}")))
+            .ok_or_else(|| {
+                RpcError::Deserialization(format!("unknown approval request {request_id}"))
+            })
     }
 
     fn pending_user_input(&self, request_id: &str) -> Result<PendingUserInputRequest, RpcError> {
@@ -503,7 +572,9 @@ impl MobileClient {
             .pending_user_inputs
             .into_iter()
             .find(|request| request.id == request_id)
-            .ok_or_else(|| RpcError::Deserialization(format!("unknown user input request {request_id}")))
+            .ok_or_else(|| {
+                RpcError::Deserialization(format!("unknown user input request {request_id}"))
+            })
     }
 
     pub(crate) fn spawn_detached<F>(future: F)
@@ -530,10 +601,7 @@ impl Default for MobileClient {
     }
 }
 
-fn spawn_store_listener(
-    app_store: Arc<AppStoreReducer>,
-    mut rx: broadcast::Receiver<UiEvent>,
-) {
+fn spawn_store_listener(app_store: Arc<AppStoreReducer>, mut rx: broadcast::Receiver<UiEvent>) {
     MobileClient::spawn_detached(async move {
         loop {
             match rx.recv().await {
@@ -547,9 +615,7 @@ fn spawn_store_listener(
     });
 }
 
-pub fn thread_info_from_generated_thread(
-    thread: generated::Thread,
-) -> Option<ThreadInfo> {
+pub fn thread_info_from_generated_thread(thread: generated::Thread) -> Option<ThreadInfo> {
     thread_info_from_generated_thread_list_item(thread, None, None)
 }
 
@@ -588,12 +654,17 @@ pub fn copy_thread_runtime_fields(source: &ThreadSnapshot, target: &mut ThreadSn
 
 fn ensure_thread_is_editable(snapshot: &ThreadSnapshot) -> Result<(), RpcError> {
     if snapshot.items.is_empty() {
-        return Err(RpcError::Deserialization("thread has no conversation items".to_string()));
+        return Err(RpcError::Deserialization(
+            "thread has no conversation items".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn rollback_depth_for_turn(snapshot: &ThreadSnapshot, selected_turn_index: usize) -> Result<u32, RpcError> {
+fn rollback_depth_for_turn(
+    snapshot: &ThreadSnapshot,
+    selected_turn_index: usize,
+) -> Result<u32, RpcError> {
     let user_turn_indices = snapshot
         .items
         .iter()
@@ -614,13 +685,23 @@ fn rollback_depth_for_turn(snapshot: &ThreadSnapshot, selected_turn_index: usize
         .map_err(|_| RpcError::Deserialization("rollback depth overflow".to_string()))
 }
 
-fn user_boundary_text_for_turn(snapshot: &ThreadSnapshot, selected_turn_index: usize) -> Result<String, RpcError> {
+fn user_boundary_text_for_turn(
+    snapshot: &ThreadSnapshot,
+    selected_turn_index: usize,
+) -> Result<String, RpcError> {
     let item = snapshot
         .items
         .iter()
-        .filter(|item| matches!(item.content, crate::conversation::ConversationItemContent::User(_)))
+        .filter(|item| {
+            matches!(
+                item.content,
+                crate::conversation::ConversationItemContent::User(_)
+            )
+        })
         .nth(selected_turn_index)
-        .ok_or_else(|| RpcError::Deserialization(format!("unknown user turn index {}", selected_turn_index)))?;
+        .ok_or_else(|| {
+            RpcError::Deserialization(format!("unknown user turn index {}", selected_turn_index))
+        })?;
     match &item.content {
         crate::conversation::ConversationItemContent::User(data) => Ok(data.text.clone()),
         _ => Err(RpcError::Deserialization(
@@ -659,9 +740,7 @@ fn map_transport_error(error: TransportError) -> RpcError {
 fn map_rpc_client_error(error: crate::rpc::RpcClientError) -> RpcError {
     match error {
         crate::rpc::RpcClientError::Rpc(message)
-        | crate::rpc::RpcClientError::Serialization(message) => {
-            RpcError::Deserialization(message)
-        }
+        | crate::rpc::RpcClientError::Serialization(message) => RpcError::Deserialization(message),
     }
 }
 
@@ -670,8 +749,8 @@ fn approval_response_json(
     decision: ApprovalDecisionValue,
 ) -> Result<serde_json::Value, RpcError> {
     match approval.kind {
-        crate::types::ApprovalKind::Command => serde_json::to_value(
-            generated::CommandExecutionRequestApprovalResponse {
+        crate::types::ApprovalKind::Command => {
+            serde_json::to_value(generated::CommandExecutionRequestApprovalResponse {
                 decision: match decision {
                     ApprovalDecisionValue::Accept => {
                         generated::CommandExecutionApprovalDecision::Accept
@@ -686,10 +765,10 @@ fn approval_response_json(
                         generated::CommandExecutionApprovalDecision::Cancel
                     }
                 },
-            },
-        ),
-        crate::types::ApprovalKind::FileChange => serde_json::to_value(
-            generated::FileChangeRequestApprovalResponse {
+            })
+        }
+        crate::types::ApprovalKind::FileChange => {
+            serde_json::to_value(generated::FileChangeRequestApprovalResponse {
                 decision: match decision {
                     ApprovalDecisionValue::Accept => generated::FileChangeApprovalDecision::Accept,
                     ApprovalDecisionValue::AcceptForSession => {
@@ -700,17 +779,20 @@ fn approval_response_json(
                     }
                     ApprovalDecisionValue::Cancel => generated::FileChangeApprovalDecision::Cancel,
                 },
-            },
-        ),
+            })
+        }
         crate::types::ApprovalKind::Permissions | crate::types::ApprovalKind::McpElicitation => {
-            let requested_permissions = serde_json::from_str::<serde_json::Value>(&approval.raw_params_json)
-                .ok()
-                .and_then(|value| value.get("permissions").cloned())
-                .and_then(|value| serde_json::from_value::<generated::GrantedPermissionProfile>(value).ok())
-                .unwrap_or(generated::GrantedPermissionProfile {
-                    network: None,
-                    file_system: None,
-                });
+            let requested_permissions =
+                serde_json::from_str::<serde_json::Value>(&approval.raw_params_json)
+                    .ok()
+                    .and_then(|value| value.get("permissions").cloned())
+                    .and_then(|value| {
+                        serde_json::from_value::<generated::GrantedPermissionProfile>(value).ok()
+                    })
+                    .unwrap_or(generated::GrantedPermissionProfile {
+                        network: None,
+                        file_system: None,
+                    });
             serde_json::to_value(generated::PermissionsRequestApprovalResponse {
                 permissions: match decision {
                     ApprovalDecisionValue::Accept | ApprovalDecisionValue::AcceptForSession => {

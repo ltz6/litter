@@ -67,7 +67,7 @@ struct ConversationView: View {
             onForkFromUserItem: forkFromMessage,
             onOpenConversation: onOpenConversation
         )
-        .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+        .background { ChatWallpaperBackground() }
         .mask {
             VStack(spacing: 0) {
                 LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
@@ -118,6 +118,12 @@ struct ConversationView: View {
     private func sendMessage(_ text: String, attachmentImage: UIImage?, skillMentions: [SkillMentionSelection]) {
         Task {
             do {
+                NSLog(
+                    "[ConversationView] sendMessage start server=%@ thread=%@ textLength=%ld",
+                    activeThreadKey.serverId,
+                    activeThreadKey.threadId,
+                    text.count
+                )
                 let payload = try makeComposerPayload(
                     text: text,
                     attachmentImage: attachmentImage,
@@ -127,7 +133,18 @@ struct ConversationView: View {
                     serverId: activeThreadKey.serverId,
                     params: payload.turnStartParams(threadId: activeThreadKey.threadId)
                 )
+                NSLog(
+                    "[ConversationView] sendMessage turnStart returned server=%@ thread=%@",
+                    activeThreadKey.serverId,
+                    activeThreadKey.threadId
+                )
             } catch {
+                NSLog(
+                    "[ConversationView] sendMessage error server=%@ thread=%@ error=%@",
+                    activeThreadKey.serverId,
+                    activeThreadKey.threadId,
+                    error.localizedDescription
+                )
                 messageActionError = error.localizedDescription
             }
         }
@@ -249,7 +266,7 @@ struct ConversationView: View {
             approvalPolicy: AskForApproval(wireValue: appState.approvalPolicy),
             sandbox: SandboxMode(wireValue: appState.sandboxMode),
             developerInstructions: nil,
-            persistExtendedHistory: false
+            persistExtendedHistory: true
         )
     }
 }
@@ -350,6 +367,7 @@ private struct ConversationMessageList: View {
     @State private var pinchBaseStep: Int?
     @State private var pinchAppliedDelta = 0
     @State private var transcriptTurns: [TranscriptTurn] = []
+    @State private var transcriptBuildKey: Int?
     @State private var expandedTurnIDs: Set<String> = []
     @State private var richRenderedTurnIDs: Set<String> = []
     @State private var pendingAnimatedTurns: [TranscriptTurn]?
@@ -398,7 +416,7 @@ private struct ConversationMessageList: View {
     }
 
     private var displayedTurns: [TranscriptTurn] {
-        if transcriptTurns.isEmpty {
+        if isStreaming {
             return TranscriptTurn.build(
                 from: items,
                 threadStatus: threadStatus,
@@ -409,15 +427,16 @@ private struct ConversationMessageList: View {
     }
 
     var body: some View {
-
+        let turns = displayedTurns
+        let lastTurnID = turns.last?.id
         ScrollViewReader { proxy in
             GeometryReader { viewport in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(displayedTurns) { turn in
-                                let isLastTurn = turn.id == displayedTurns.last?.id
+                            ForEach(turns) { turn in
+                                let isLastTurn = turn.id == lastTurnID
                                 ConversationTurnRow(
                                     turn: turn,
                                     isExpanded: isTurnExpanded(turn),
@@ -517,6 +536,10 @@ private struct ConversationMessageList: View {
                     .onChange(of: items.count) {
                         scheduleScrollToBottom(proxy)
                     }
+                    .onChange(of: collapseTurns) {
+                        syncTranscriptTurns(resetExpansion: true)
+                        syncRichRenderedTurns(reset: true)
+                    }
                     .onChange(of: threadStatus) {
                         syncTranscriptTurns()
                         syncRichRenderedTurns()
@@ -599,11 +622,20 @@ private struct ConversationMessageList: View {
     }
 
     private func syncTranscriptTurns(resetExpansion: Bool = false) {
+        let nextBuildKey = makeTranscriptBuildKey()
+        if transcriptBuildKey == nextBuildKey, !transcriptTurns.isEmpty {
+            if resetExpansion {
+                expandedTurnIDs.removeAll()
+            }
+            return
+        }
+
         let nextTurns = TranscriptTurn.build(
             from: items,
             threadStatus: threadStatus,
             expandedRecentTurnCount: expandedRecentTurnCount
         )
+        transcriptBuildKey = nextBuildKey
         if shouldAnimateNewTurnInsertion(from: transcriptTurns, to: nextTurns, resetExpansion: resetExpansion) {
             pendingAnimatedTurns = nextTurns
             guard !turnInsertionAnimationInFlight else { return }
@@ -617,6 +649,18 @@ private struct ConversationMessageList: View {
         }
 
         applyTranscriptTurns(nextTurns, resetExpansion: resetExpansion)
+    }
+
+    private func makeTranscriptBuildKey() -> Int {
+        var hasher = Hasher()
+        hasher.combine(expandedRecentTurnCount)
+        hasher.combine(isStreaming)
+        hasher.combine(items.count)
+        for item in items {
+            hasher.combine(item.id)
+            hasher.combine(item.renderDigest)
+        }
+        return hasher.finalize()
     }
 
     private func layoutSignature(for turn: TranscriptTurn) -> Int {
@@ -1169,6 +1213,14 @@ private struct ConversationInputBar: View {
         snapshot.isTurnActive
     }
 
+    private var activeTurnId: String? {
+        guard let value = snapshot.activeTurnId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
     private var popupState: ConversationComposerPopupState {
         if showSlashPopup {
             return .slash(slashSuggestions)
@@ -1370,13 +1422,14 @@ private struct ConversationInputBar: View {
     }
 
     private func interruptActiveTurn() {
+        guard let activeTurnId else { return }
         Task {
             do {
                 _ = try await appModel.rpc.turnInterrupt(
                     serverId: snapshot.threadKey.serverId,
                     params: TurnInterruptParams(
                         threadId: snapshot.threadKey.threadId,
-                        turnId: ""
+                        turnId: activeTurnId
                     )
                 )
             } catch {
@@ -1701,7 +1754,7 @@ private struct ConversationInputBar: View {
                     approvalPolicy: AskForApproval(wireValue: appState.approvalPolicy),
                     sandbox: SandboxMode(wireValue: appState.sandboxMode),
                     developerInstructions: nil,
-                    persistExtendedHistory: false
+                    persistExtendedHistory: true
                 ).threadForkParams(threadId: snapshot.threadKey.threadId, cwdOverride: workDir)
             )
             let nextKey = ThreadKey(serverId: snapshot.threadKey.serverId, threadId: response.thread.id)

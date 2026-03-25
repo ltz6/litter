@@ -57,14 +57,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.litter.android.state.AppThreadLaunchConfig
-import com.litter.android.state.accentColor
-import com.litter.android.state.displayLabel
 import com.litter.android.state.isConnected
+import com.litter.android.state.statusColor
+import com.litter.android.state.statusLabel
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.sessions.DirectoryPickerSheet
 import kotlinx.coroutines.launch
-import uniffi.codex_mobile_client.Account
 import uniffi.codex_mobile_client.AppServerSnapshot
 import uniffi.codex_mobile_client.AppSessionSummary
 import uniffi.codex_mobile_client.ThreadKey
@@ -459,7 +458,7 @@ private fun ServerCard(
             modifier = Modifier
                 .size(8.dp)
                 .clip(CircleShape)
-                .background(server.health.accentColor),
+                .background(server.statusColor),
         )
         Spacer(Modifier.width(10.dp))
 
@@ -474,21 +473,16 @@ private fun ServerCard(
                 color = LitterTheme.textSecondary,
                 fontSize = 11.sp,
             )
-            val accountLabel = when (val acct = server.account) {
-                is Account.Chatgpt -> acct.email
-                is Account.ApiKey -> "API Key"
-                else -> "Not logged in"
-            }
             Text(
-                text = accountLabel,
+                text = HomeDashboardSupport.maskedAccountLabel(server),
                 color = LitterTheme.textMuted,
                 fontSize = 10.sp,
             )
         }
 
         Text(
-            text = server.health.displayLabel,
-            color = server.health.accentColor,
+            text = server.statusLabel,
+            color = server.statusColor,
             fontSize = 11.sp,
         )
     }

@@ -3,10 +3,12 @@ package com.litter.android.state
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
-import android.net.wifi.WifiManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +19,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import uniffi.codex_mobile_client.DiscoveryBridge
 import uniffi.codex_mobile_client.FfiDiscoveredServer
 import uniffi.codex_mobile_client.FfiMdnsSeed
+import uniffi.codex_mobile_client.FfiProgressiveDiscoveryUpdateKind
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import kotlin.coroutines.resume
@@ -47,9 +50,15 @@ class NetworkDiscovery(private val discovery: DiscoveryBridge) {
                 // 2. Get local IPv4
                 val localIp = localIpv4Address()
 
-                // 3. Pass to Rust — handles Tailscale, LAN, ARP, merge, dedup
-                val results = discovery.scanServersWithMdnsContext(seeds, localIp)
-                _servers.value = results
+                // 3. Consume progressive Rust discovery batches as each source completes.
+                val subscription = discovery.scanServersWithMdnsContextProgressive(seeds, localIp)
+                while (true) {
+                    val update = subscription.nextEvent()
+                    _servers.value = update.servers
+                    if (update.kind == FfiProgressiveDiscoveryUpdateKind.SCAN_COMPLETE) {
+                        break
+                    }
+                }
             } catch (_: Exception) {
                 // Best-effort discovery
             } finally {
@@ -72,33 +81,32 @@ class NetworkDiscovery(private val discovery: DiscoveryBridge) {
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
             ?: return emptyList()
 
-        val seeds = mutableListOf<FfiMdnsSeed>()
         val serviceTypes = listOf("_ssh._tcp.", "_codex._tcp.")
+        return coroutineScope {
+            serviceTypes.map { serviceType ->
+                async {
+                    val discovered = withTimeoutOrNull(4500L) {
+                        discoverServices(nsdManager, serviceType)
+                    } ?: emptyList()
 
-        for (serviceType in serviceTypes) {
-            val discovered = withTimeoutOrNull(5000L) {
-                discoverServices(nsdManager, serviceType)
-            } ?: emptyList()
-
-            for (service in discovered) {
-                val resolved = withTimeoutOrNull(3000L) {
-                    resolveService(nsdManager, service)
+                    discovered.map { service ->
+                        async {
+                            withTimeoutOrNull(2000L) {
+                                resolveService(nsdManager, service)
+                            }?.let { resolved ->
+                                val host = resolved.host?.hostAddress ?: return@let null
+                                FfiMdnsSeed(
+                                    name = resolved.serviceName,
+                                    host = host,
+                                    port = resolved.port.toUShort(),
+                                    serviceType = serviceType,
+                                )
+                            }
+                        }
+                    }.awaitAll().filterNotNull()
                 }
-                if (resolved != null) {
-                    val host = resolved.host?.hostAddress ?: continue
-                    seeds.add(
-                        FfiMdnsSeed(
-                            name = resolved.serviceName,
-                            host = host,
-                            port = resolved.port.toUShort(),
-                            serviceType = serviceType,
-                        )
-                    )
-                }
-            }
+            }.awaitAll().flatten()
         }
-
-        return seeds
     }
 
     private suspend fun discoverServices(

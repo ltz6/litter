@@ -1,11 +1,11 @@
 use codex_mobile_client::store::{AppSnapshot, ThreadSnapshot};
 use codex_mobile_client::types::ThreadKey;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
-    Frame,
 };
 
 use crate::theme;
@@ -105,7 +105,10 @@ pub fn render(
         // Composer
         render_composer(frame, chunks[3], state, insert_mode);
     } else {
-        frame.render_widget(Paragraph::new(" No thread loaded").style(theme::dim()), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(" No thread loaded").style(theme::dim()),
+            chunks[1],
+        );
         render_composer(frame, chunks[3], state, insert_mode);
     }
 }
@@ -115,7 +118,11 @@ fn render_header(frame: &mut Frame, area: Rect, thread: Option<&ThreadSnapshot>)
         let title = t.info.title.as_deref().unwrap_or("Untitled");
         let model = t.model.as_deref().unwrap_or("—");
         let effort = t.reasoning_effort.as_deref().unwrap_or("");
-        let active = if t.active_turn_id.is_some() { " ⟳" } else { "" };
+        let active = if t.active_turn_id.is_some() {
+            " ⟳"
+        } else {
+            ""
+        };
         let effort_str = if effort.is_empty() {
             String::new()
         } else {
@@ -233,12 +240,7 @@ fn format_window_duration(mins: Option<i64>) -> String {
     }
 }
 
-fn render_composer(
-    frame: &mut Frame,
-    area: Rect,
-    state: &ConversationState,
-    insert_mode: bool,
-) {
+fn render_composer(frame: &mut Frame, area: Rect, state: &ConversationState, insert_mode: bool) {
     let border_style = if insert_mode {
         theme::border_focused()
     } else {

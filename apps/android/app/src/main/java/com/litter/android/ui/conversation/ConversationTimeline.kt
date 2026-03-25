@@ -72,6 +72,7 @@ import uniffi.codex_mobile_client.HydratedPlanStepStatus
 @Composable
 fun ConversationTimelineItem(
     item: HydratedConversationItem,
+    isLiveTurn: Boolean = false,
     onEditMessage: ((UInt) -> Unit)? = null,
     onForkFromMessage: ((UInt) -> Unit)? = null,
 ) {
@@ -96,6 +97,10 @@ fun ConversationTimelineItem(
         )
 
         is HydratedConversationItemContent.FileChange -> FileChangeRow(
+            data = content.v1,
+        )
+
+        is HydratedConversationItemContent.TurnDiff -> TurnDiffRow(
             data = content.v1,
         )
 
@@ -124,6 +129,11 @@ fun ConversationTimelineItem(
         )
 
         is HydratedConversationItemContent.Divider -> DividerRow(
+            data = content.v1,
+            isLiveTurn = isLiveTurn,
+        )
+
+        is HydratedConversationItemContent.Error -> ErrorRow(
             data = content.v1,
         )
 
@@ -156,7 +166,9 @@ private fun UserMessageRow(
                             onClick = {},
                             onLongClick = { showMenu = true },
                         )
-                    } else Modifier
+                    } else {
+                        Modifier
+                    }
                 )
                 .padding(10.dp),
         ) {
@@ -302,7 +314,26 @@ private fun ReasoningRow(
 private fun CommandExecutionRow(
     data: uniffi.codex_mobile_client.HydratedCommandExecutionData,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(true) }
+    val outputText =
+        data.output
+            ?.trim('\n')
+            ?.takeIf { it.isNotBlank() }
+            ?: if (data.status == AppOperationStatus.PENDING || data.status == AppOperationStatus.IN_PROGRESS) {
+                "Waiting for output…"
+            } else {
+                null
+            }
+    val metadata = mutableListOf<Pair<String, String>>()
+    if (data.cwd.isNotBlank()) {
+        metadata.add("Directory" to data.cwd)
+    }
+    data.processId?.takeIf { it.isNotBlank() }?.let { processId ->
+        metadata.add("Process ID" to processId)
+    }
+    data.exitCode?.let { exitCode ->
+        metadata.add("Exit Code" to exitCode.toString())
+    }
 
     Column(
         modifier = Modifier
@@ -333,33 +364,69 @@ private fun CommandExecutionRow(
             }
         }
 
-        if (expanded && !data.output.isNullOrBlank()) {
-            Text(
-                text = data.output!!,
-                color = LitterTheme.textSecondary,
-                fontFamily = LitterTheme.monoFont,
-                fontSize = LitterTextStyle.caption2.scaled,
-                modifier = Modifier
-                    .padding(top = 6.dp)
-                    .fillMaxWidth()
-                    .heightIn(max = 200.dp)
-                    .verticalScroll(rememberScrollState())
-                    .background(LitterTheme.codeBackground, RoundedCornerShape(4.dp))
-                    .padding(6.dp),
-            )
-        }
+        if (expanded) {
+            if (metadata.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                SectionLabel("Metadata")
+                Column(
+                    modifier = Modifier
+                        .padding(top = 4.dp)
+                        .fillMaxWidth()
+                        .background(LitterTheme.surface.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    metadata.forEach { entry ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                text = "${entry.first}:",
+                                color = LitterTheme.textSecondary,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = entry.second,
+                                color = LitterTheme.textPrimary,
+                                fontSize = 10.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
 
-        data.exitCode?.let { code ->
-            if (code != 0) {
+            outputText?.let { output ->
+                Spacer(Modifier.height(8.dp))
+                SectionLabel("Output")
                 Text(
-                    text = "Exit code: $code",
-                    color = LitterTheme.danger,
-                    fontSize = 10.sp,
-                    modifier = Modifier.padding(top = 2.dp),
+                    text = output,
+                    color = LitterTheme.textSecondary,
+                    fontFamily = LitterTheme.monoFont,
+                    fontSize = LitterTextStyle.caption2.scaled,
+                    modifier = Modifier
+                        .padding(top = 4.dp)
+                        .fillMaxWidth()
+                        .heightIn(max = 200.dp)
+                        .verticalScroll(rememberScrollState())
+                        .background(LitterTheme.codeBackground, RoundedCornerShape(6.dp))
+                        .padding(8.dp),
                 )
             }
         }
     }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text = text.uppercase(),
+        color = LitterTheme.textSecondary,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Bold,
+    )
 }
 
 // ── File Change ──────────────────────────────────────────────────────────────
@@ -608,12 +675,51 @@ private fun WebSearchRow(
 // ── Divider ──────────────────────────────────────────────────────────────────
 
 @Composable
+private fun TurnDiffRow(
+    data: uniffi.codex_mobile_client.HydratedTurnDiffData,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(LitterTheme.surface, RoundedCornerShape(8.dp))
+            .padding(8.dp),
+    ) {
+        Text(
+            text = "Turn Diff",
+            color = LitterTheme.toolCallFileChange,
+            fontSize = LitterTextStyle.caption.scaled,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            text = data.diff,
+            color = LitterTheme.textSecondary,
+            fontFamily = LitterTheme.monoFont,
+            fontSize = LitterTextStyle.caption2.scaled,
+            modifier = Modifier
+                .padding(top = 4.dp)
+                .fillMaxWidth()
+                .heightIn(max = 220.dp)
+                .verticalScroll(rememberScrollState())
+                .background(LitterTheme.codeBackground, RoundedCornerShape(6.dp))
+                .padding(8.dp),
+        )
+    }
+}
+
+@Composable
 private fun DividerRow(
     data: uniffi.codex_mobile_client.HydratedDividerData,
+    isLiveTurn: Boolean,
 ) {
     val label = when (data) {
         is uniffi.codex_mobile_client.HydratedDividerData.ContextCompaction ->
-            if (data.isComplete) "Context compacted" else "Compacting context\u2026"
+            if (data.isComplete && !isLiveTurn) "Context compacted" else "Compacting context\u2026"
+        is uniffi.codex_mobile_client.HydratedDividerData.ModelRerouted -> {
+            val route = data.fromModel?.takeIf { it.isNotBlank() }?.let { "$it -> ${data.toModel}" }
+                ?: "Routed to ${data.toModel}"
+            val reason = data.reason?.takeIf { it.isNotBlank() }
+            if (reason != null) "$route | $reason" else route
+        }
         is uniffi.codex_mobile_client.HydratedDividerData.ReviewEntered -> "Review started"
         is uniffi.codex_mobile_client.HydratedDividerData.ReviewExited -> "Review ended"
     }
@@ -663,6 +769,39 @@ private fun NoteRow(
                 text = data.body,
                 color = LitterTheme.textSecondary,
                 fontSize = LitterTextStyle.caption.scaled,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ErrorRow(
+    data: uniffi.codex_mobile_client.HydratedErrorData,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(LitterTheme.surface, RoundedCornerShape(8.dp))
+            .padding(8.dp),
+    ) {
+        Text(
+            text = data.title.ifBlank { "Error" },
+            color = LitterTheme.danger,
+            fontSize = LitterTextStyle.footnote.scaled,
+            fontWeight = FontWeight.Medium,
+        )
+        Text(
+            text = data.message,
+            color = LitterTheme.textPrimary,
+            fontSize = LitterTextStyle.caption.scaled,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        data.details?.takeIf { it.isNotBlank() }?.let { details ->
+            Text(
+                text = details,
+                color = LitterTheme.textSecondary,
+                fontSize = LitterTextStyle.caption2.scaled,
                 modifier = Modifier.padding(top = 2.dp),
             )
         }

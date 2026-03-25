@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -65,9 +66,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.litter.android.state.SavedServerStore
-import com.litter.android.state.accentColor
-import com.litter.android.state.displayLabel
 import com.litter.android.state.isConnected
+import com.litter.android.state.statusColor
+import com.litter.android.state.statusLabel
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterColorThemeType
 import com.litter.android.ui.BerkeleyMono
@@ -134,7 +135,10 @@ private fun SettingsTopLevel(
     }
 
     LazyColumn(
-        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         // Title
@@ -206,7 +210,7 @@ private fun SettingsTopLevel(
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(server.displayName, color = LitterTheme.textPrimary, fontSize = 13.sp)
-                        Text(server.health.displayLabel, color = server.health.accentColor, fontSize = 11.sp)
+                        Text(server.statusLabel, color = server.statusColor, fontSize = 11.sp)
                     }
                     TextButton(onClick = {
                         scope.launch {
@@ -234,7 +238,12 @@ private fun AppearanceScreen(onBack: () -> Unit) {
     var textSizeStep by remember { mutableFloatStateOf(com.litter.android.ui.TextSizePrefs.currentStep.toFloat()) }
     var showThemePicker by remember { mutableStateOf<LitterColorThemeType?>(null) }
 
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .imePadding()
+            .padding(16.dp),
+    ) {
         // Nav bar
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) {
@@ -405,7 +414,12 @@ private fun ThemePickerContent(
         else themes.filter { it.name.contains(searchQuery, ignoreCase = true) || it.slug.contains(searchQuery, ignoreCase = true) }
     }
 
-    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .padding(16.dp),
+    ) {
         // Title + Done
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Spacer(Modifier.weight(1f))
@@ -542,7 +556,12 @@ private fun ExperimentalScreen(onBack: () -> Unit) {
         isLoading = false
     }
 
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .imePadding()
+            .padding(16.dp),
+    ) {
         // Nav bar
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) {

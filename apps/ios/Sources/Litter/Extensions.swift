@@ -61,6 +61,16 @@ enum LitterTheme {
     static var gradientColors: [Color] {
         let isDark = UITraitCollection.current.userInterfaceStyle == .dark
         let theme = isDark ? dark : light
+        return gradientColors(for: theme, isDark: isDark)
+    }
+
+    static func gradientColors(for colorScheme: ColorScheme) -> [Color] {
+        let isDark = colorScheme == .dark
+        let theme = isDark ? dark : light
+        return gradientColors(for: theme, isDark: isDark)
+    }
+
+    private static func gradientColors(for theme: ResolvedTheme, isDark: Bool) -> [Color] {
         let bg = theme.background
         return [
             Color(hex: bg),
@@ -72,6 +82,14 @@ enum LitterTheme {
     static var backgroundGradient: LinearGradient {
         LinearGradient(
             colors: gradientColors,
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    static func backgroundGradient(for colorScheme: ColorScheme) -> LinearGradient {
+        LinearGradient(
+            colors: gradientColors(for: colorScheme),
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )

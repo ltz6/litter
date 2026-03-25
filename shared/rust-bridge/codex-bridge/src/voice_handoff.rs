@@ -12,8 +12,8 @@ use std::sync::Arc;
 // Re-export all public types from the shared crate so existing in-crate
 // consumers (tests, etc.) continue to work via `crate::voice_handoff::*`.
 pub use codex_mobile_client::session::voice_handoff::{
-    ConnectedServer, HandoffAction, HandoffEntry, HandoffManager, HandoffPhase,
-    HandoffTurnConfig, StreamedItem, TranscriptBuffer,
+    ConnectedServer, HandoffAction, HandoffEntry, HandoffManager, HandoffPhase, HandoffTurnConfig,
+    StreamedItem, TranscriptBuffer,
 };
 
 // ---------------------------------------------------------------------------
@@ -250,17 +250,16 @@ pub extern "C" fn codex_handoff_drain_actions_json(
     let actions = manager.drain_actions();
     std::mem::forget(manager);
 
-    let json_actions: Vec<serde_json::Value> = actions
-        .into_iter()
-        .map(action_to_json)
-        .collect();
+    let json_actions: Vec<serde_json::Value> = actions.into_iter().map(action_to_json).collect();
     let json_str = serde_json::to_string(&json_actions).unwrap_or_else(|_| "[]".to_string());
 
     let bytes = json_str.into_bytes();
     let len = bytes.len();
     let ptr = bytes.as_ptr() as *mut c_char;
     std::mem::forget(bytes);
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }
 
@@ -356,7 +355,9 @@ pub extern "C" fn codex_handoff_list_servers_json(
     let len = bytes.len();
     let ptr = bytes.as_ptr() as *mut c_char;
     std::mem::forget(bytes);
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }
 
@@ -568,10 +569,7 @@ mod tests {
         );
 
         // Thread should be reusable.
-        assert_eq!(
-            mgr.reused_thread("remote-1"),
-            Some(remote_key)
-        );
+        assert_eq!(mgr.reused_thread("remote-1"), Some(remote_key));
     }
 
     #[test]
@@ -617,10 +615,7 @@ mod tests {
             .iter()
             .find(|a| matches!(a, HandoffAction::ResolveHandoff { text, .. } if text.contains("not available")));
         assert!(resolve.is_some());
-        assert_eq!(
-            mgr.handoff_phase("handoff-2"),
-            Some(HandoffPhase::Failed)
-        );
+        assert_eq!(mgr.handoff_phase("handoff-2"), Some(HandoffPhase::Failed));
     }
 
     #[test]

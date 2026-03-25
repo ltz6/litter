@@ -69,6 +69,15 @@ enum ToolCallKind: String, Equatable {
         if normalized.contains("dynamic tool call") { return .mcpToolCall }
         return nil
     }
+
+    var isCommandLike: Bool {
+        switch self {
+        case .commandExecution, .commandOutput:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 enum ToolCallStatus: Equatable {
@@ -124,6 +133,11 @@ struct ToolCallKeyValue: Equatable {
     let value: String
 }
 
+struct ToolCallCommandContext: Equatable {
+    let command: String
+    let directory: String?
+}
+
 enum ToolCallSection: Equatable {
     case kv(label: String, entries: [ToolCallKeyValue])
     case code(label: String, language: String, content: String)
@@ -141,8 +155,30 @@ struct ToolCallCardModel: Equatable {
     let status: ToolCallStatus
     let duration: String?
     let sections: [ToolCallSection]
+    let initiallyExpanded: Bool
+    let commandContext: ToolCallCommandContext?
 
-    var defaultExpanded: Bool { status == .failed }
+    init(
+        kind: ToolCallKind,
+        title: String,
+        summary: String,
+        status: ToolCallStatus,
+        duration: String?,
+        sections: [ToolCallSection],
+        initiallyExpanded: Bool = false,
+        commandContext: ToolCallCommandContext? = nil
+    ) {
+        self.kind = kind
+        self.title = title
+        self.summary = summary
+        self.status = status
+        self.duration = duration
+        self.sections = sections
+        self.initiallyExpanded = initiallyExpanded
+        self.commandContext = commandContext
+    }
+
+    var defaultExpanded: Bool { initiallyExpanded || status == .failed }
 }
 
 enum ToolCallParseResult: Equatable {

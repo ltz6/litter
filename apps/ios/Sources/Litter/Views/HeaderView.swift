@@ -133,12 +133,15 @@ struct HeaderView: View {
         case .connecting, .unresponsive:
             return .orange
         case .connected:
-            switch server.account {
-            case .chatgpt?, .apiKey?:
-                return LitterTheme.success
-            case nil:
-                return LitterTheme.danger
+            if server.isLocal {
+                switch server.account {
+                case .chatgpt?, .apiKey?:
+                    return LitterTheme.success
+                case nil:
+                    return LitterTheme.danger
+                }
             }
+            return server.account == nil ? .orange : LitterTheme.success
         case .disconnected:
             return LitterTheme.danger
         case .unknown:
@@ -270,7 +273,7 @@ struct HeaderView: View {
         guard let server, !server.isLocal else {
             return false
         }
-        guard server.account == nil || server.requiresOpenaiAuth else {
+        guard server.account == nil else {
             return false
         }
         do {
@@ -296,7 +299,7 @@ struct HeaderView: View {
             approvalPolicy: AskForApproval(wireValue: appState.approvalPolicy),
             sandbox: SandboxMode(wireValue: appState.sandboxMode),
             developerInstructions: nil,
-            persistExtendedHistory: false
+            persistExtendedHistory: true
         )
     }
 

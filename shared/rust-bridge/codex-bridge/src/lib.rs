@@ -108,8 +108,8 @@ pub(crate) fn init_tls_roots() {
 // Conversation hydration FFI (used by both platforms for standalone hydration)
 // ===========================================================================
 
-use codex_mobile_client::conversation::{hydrate_turns, HydrationOptions};
 use codex_app_server_protocol::Turn;
+use codex_mobile_client::conversation::{HydrationOptions, hydrate_turns};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn codex_hydrate_turns(
@@ -145,7 +145,9 @@ pub extern "C" fn codex_hydrate_turns(
         }
     };
 
-    unsafe { *out_len = result_json.len(); }
+    unsafe {
+        *out_len = result_json.len();
+    }
 
     let c_string = match std::ffi::CString::new(result_json) {
         Ok(cs) => cs,
@@ -157,6 +159,8 @@ pub extern "C" fn codex_hydrate_turns(
 #[unsafe(no_mangle)]
 pub extern "C" fn codex_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
-        unsafe { let _ = std::ffi::CString::from_raw(ptr); }
+        unsafe {
+            let _ = std::ffi::CString::from_raw(ptr);
+        }
     }
 }

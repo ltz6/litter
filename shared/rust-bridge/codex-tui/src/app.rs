@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use futures::StreamExt;
 use ratatui::{
-    layout::{Constraint, Layout},
     Frame,
+    layout::{Constraint, Layout},
 };
 use tokio::sync::{broadcast, mpsc};
 
+use codex_mobile_client::MobileClient;
 use codex_mobile_client::store::{AppSnapshot, AppUpdate};
 use codex_mobile_client::types::{ApprovalDecisionValue, ThreadKey};
-use codex_mobile_client::MobileClient;
 
 use crate::input::InputMode;
 use crate::router::{ConfirmAction, Overlay, Router, Screen};
@@ -110,8 +110,8 @@ impl App {
         let content_area = phone_frame::render_frame(frame);
 
         // Split content into screen area + status bar
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-            .split(content_area);
+        let chunks =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(content_area);
 
         // Current screen
         match self.router.current_mut() {
@@ -162,10 +162,7 @@ impl App {
                     .border_style(crate::theme::border_focused());
                 let inner = block.inner(popup_area);
                 frame.render_widget(block, popup_area);
-                frame.render_widget(
-                    Paragraph::new(format!("{message}\n\n[y]es / [n]o")),
-                    inner,
-                );
+                frame.render_widget(Paragraph::new(format!("{message}\n\n[y]es / [n]o")), inner);
             }
             None => {}
         }
@@ -254,7 +251,11 @@ impl App {
                     if state.focus == discovery::DiscoveryFocus::ServerList {
                         let len = state.servers.len();
                         if len > 0 {
-                            let i = state.list_state.selected().map(|i| (i + 1) % len).unwrap_or(0);
+                            let i = state
+                                .list_state
+                                .selected()
+                                .map(|i| (i + 1) % len)
+                                .unwrap_or(0);
                             state.list_state.select(Some(i));
                         }
                     }
@@ -268,7 +269,9 @@ impl App {
                     if state.focus == discovery::DiscoveryFocus::ServerList {
                         let len = state.servers.len();
                         if len > 0 {
-                            let i = state.list_state.selected()
+                            let i = state
+                                .list_state
+                                .selected()
                                 .map(|i| if i == 0 { len - 1 } else { i - 1 })
                                 .unwrap_or(0);
                             state.list_state.select(Some(i));
@@ -289,9 +292,15 @@ impl App {
             KeyCode::Tab => {
                 if let Some(Overlay::Discovery(state)) = &mut self.router.overlay {
                     state.focus = match state.focus {
-                        discovery::DiscoveryFocus::ServerList => discovery::DiscoveryFocus::ManualHost,
-                        discovery::DiscoveryFocus::ManualHost => discovery::DiscoveryFocus::ManualPort,
-                        discovery::DiscoveryFocus::ManualPort => discovery::DiscoveryFocus::ServerList,
+                        discovery::DiscoveryFocus::ServerList => {
+                            discovery::DiscoveryFocus::ManualHost
+                        }
+                        discovery::DiscoveryFocus::ManualHost => {
+                            discovery::DiscoveryFocus::ManualPort
+                        }
+                        discovery::DiscoveryFocus::ManualPort => {
+                            discovery::DiscoveryFocus::ServerList
+                        }
                     };
                 }
             }
@@ -318,8 +327,12 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(Overlay::Discovery(state)) = &mut self.router.overlay {
                     match state.focus {
-                        discovery::DiscoveryFocus::ManualHost => { state.manual_host.pop(); }
-                        discovery::DiscoveryFocus::ManualPort => { state.manual_port.pop(); }
+                        discovery::DiscoveryFocus::ManualHost => {
+                            state.manual_host.pop();
+                        }
+                        discovery::DiscoveryFocus::ManualPort => {
+                            state.manual_port.pop();
+                        }
                         _ => {}
                     }
                 }
@@ -340,14 +353,18 @@ impl App {
     }
 
     async fn handle_home_key(&mut self, key: KeyEvent) {
-        let Screen::Home(_) = self.router.current_mut() else { return };
+        let Screen::Home(_) = self.router.current_mut() else {
+            return;
+        };
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.home_move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.home_move_cursor(-1),
             KeyCode::Tab => {
-                let Screen::Home(state) = self.router.current_mut() else { return };
+                let Screen::Home(state) = self.router.current_mut() else {
+                    return;
+                };
                 state.focus = match state.focus {
                     home::HomeSection::Sessions => home::HomeSection::Servers,
                     home::HomeSection::Servers => home::HomeSection::Sessions,
@@ -355,7 +372,9 @@ impl App {
             }
             KeyCode::Enter => {
                 let sessions = home::derive_recent_sessions(&self.snapshot);
-                let Screen::Home(state) = self.router.current() else { return };
+                let Screen::Home(state) = self.router.current() else {
+                    return;
+                };
                 match state.focus {
                     home::HomeSection::Sessions => {
                         if let Some(idx) = state.sessions_state.selected() {
@@ -367,7 +386,8 @@ impl App {
                     }
                     home::HomeSection::Servers => {
                         // Enter on server → open sessions screen
-                        self.router.push(Screen::Sessions(sessions::SessionsState::default()));
+                        self.router
+                            .push(Screen::Sessions(sessions::SessionsState::default()));
                         // Load threads for all connected servers
                         self.load_thread_lists();
                     }
@@ -379,12 +399,15 @@ impl App {
                 self.router.open_overlay(Overlay::Discovery(disc_state));
             }
             KeyCode::Char('s') => {
-                self.router.open_overlay(Overlay::Settings(settings::SettingsState::default()));
+                self.router
+                    .open_overlay(Overlay::Settings(settings::SettingsState::default()));
             }
             KeyCode::Char('d') => {
                 // Disconnect selected server
                 let servers = home::derive_servers(&self.snapshot);
-                let Screen::Home(state) = self.router.current() else { return };
+                let Screen::Home(state) = self.router.current() else {
+                    return;
+                };
                 if state.focus == home::HomeSection::Servers {
                     if let Some(idx) = state.servers_state.selected() {
                         if let Some(server) = servers.get(idx) {
@@ -401,7 +424,9 @@ impl App {
             KeyCode::Char('x') => {
                 // Delete selected session
                 let sessions = home::derive_recent_sessions(&self.snapshot);
-                let Screen::Home(state) = self.router.current() else { return };
+                let Screen::Home(state) = self.router.current() else {
+                    return;
+                };
                 if state.focus == home::HomeSection::Sessions {
                     if let Some(idx) = state.sessions_state.selected() {
                         if let Some(session) = sessions.get(idx) {
@@ -421,7 +446,9 @@ impl App {
     }
 
     fn home_move_cursor(&mut self, delta: i32) {
-        let Screen::Home(state) = self.router.current_mut() else { return };
+        let Screen::Home(state) = self.router.current_mut() else {
+            return;
+        };
         match state.focus {
             home::HomeSection::Sessions => {
                 let len = home::derive_recent_sessions(&self.snapshot).len();
@@ -435,9 +462,13 @@ impl App {
     }
 
     async fn handle_sessions_key(&mut self, key: KeyEvent) {
-        let Screen::Sessions(state) = self.router.current_mut() else { return };
+        let Screen::Sessions(state) = self.router.current_mut() else {
+            return;
+        };
         match key.code {
-            KeyCode::Esc => { self.router.pop(); }
+            KeyCode::Esc => {
+                self.router.pop();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 let len = state.visible_keys.len();
                 move_list_cursor(&mut state.list_state, len, 1);
@@ -447,7 +478,9 @@ impl App {
                 move_list_cursor(&mut state.list_state, len, -1);
             }
             KeyCode::Enter => {
-                let Screen::Sessions(state) = self.router.current() else { return };
+                let Screen::Sessions(state) = self.router.current() else {
+                    return;
+                };
                 if let Some(idx) = state.list_state.selected() {
                     if let Some(key) = state.visible_keys.get(idx).cloned() {
                         if !key.thread_id.is_empty() {
@@ -457,7 +490,9 @@ impl App {
                 }
             }
             KeyCode::Char('/') => {
-                let Screen::Sessions(state) = self.router.current_mut() else { return };
+                let Screen::Sessions(state) = self.router.current_mut() else {
+                    return;
+                };
                 state.search_active = true;
                 self.mode = InputMode::Search;
             }
@@ -486,10 +521,19 @@ impl App {
                             dynamic_tools: None,
                             mock_experimental_field: None,
                             experimental_raw_events: false,
-                            persist_extended_history: false,
+                            persist_extended_history: true,
                         };
-                        if let Ok(response) = client.generated_thread_start(&sid, params.clone()).await {
-                            let _ = client.reconcile_public_rpc("thread/start", &sid, Some(&params), &response).await;
+                        if let Ok(response) =
+                            client.generated_thread_start(&sid, params.clone()).await
+                        {
+                            let _ = client
+                                .reconcile_public_rpc(
+                                    "thread/start",
+                                    &sid,
+                                    Some(&params),
+                                    &response,
+                                )
+                                .await;
                             let key = ThreadKey {
                                 server_id: sid,
                                 thread_id: response.thread.id.clone(),
@@ -503,7 +547,9 @@ impl App {
             }
             KeyCode::Char('d') => {
                 // Delete selected session
-                let Screen::Sessions(state) = self.router.current() else { return };
+                let Screen::Sessions(state) = self.router.current() else {
+                    return;
+                };
                 if let Some(idx) = state.list_state.selected() {
                     if let Some(key) = state.visible_keys.get(idx).cloned() {
                         if !key.thread_id.is_empty() {
@@ -520,19 +566,32 @@ impl App {
             }
             KeyCode::Char('r') => {
                 // Rename selected session
-                let Screen::Sessions(state) = self.router.current() else { return };
+                let Screen::Sessions(state) = self.router.current() else {
+                    return;
+                };
                 if let Some(idx) = state.list_state.selected() {
                     if let Some(key) = state.visible_keys.get(idx).cloned() {
                         if !key.thread_id.is_empty() {
                             // For now, set a placeholder name; a proper rename would need a text input popup
                             let client = Arc::clone(&self.client);
                             tokio::spawn(async move {
-                                let params = codex_mobile_client::types::generated::ThreadSetNameParams {
-                                    thread_id: key.thread_id.clone(),
-                                    name: "Renamed Session".into(),
-                                };
-                                if let Ok(response) = client.generated_thread_set_name(&key.server_id, params.clone()).await {
-                                    let _ = client.reconcile_public_rpc("thread/setName", &key.server_id, Some(&params), &response).await;
+                                let params =
+                                    codex_mobile_client::types::generated::ThreadSetNameParams {
+                                        thread_id: key.thread_id.clone(),
+                                        name: "Renamed Session".into(),
+                                    };
+                                if let Ok(response) = client
+                                    .generated_thread_set_name(&key.server_id, params.clone())
+                                    .await
+                                {
+                                    let _ = client
+                                        .reconcile_public_rpc(
+                                            "thread/setName",
+                                            &key.server_id,
+                                            Some(&params),
+                                            &response,
+                                        )
+                                        .await;
                                 }
                             });
                             self.set_status("Session renamed".into());
@@ -551,20 +610,26 @@ impl App {
                 KeyCode::Char('y') => {
                     let id = approval.id.clone();
                     let client = Arc::clone(&self.client);
-                    tokio::spawn(async move { let _ = client.approve(&id).await; });
+                    tokio::spawn(async move {
+                        let _ = client.approve(&id).await;
+                    });
                     return;
                 }
                 KeyCode::Char('n') => {
                     let id = approval.id.clone();
                     let client = Arc::clone(&self.client);
-                    tokio::spawn(async move { let _ = client.deny(&id).await; });
+                    tokio::spawn(async move {
+                        let _ = client.deny(&id).await;
+                    });
                     return;
                 }
                 KeyCode::Char('a') => {
                     let id = approval.id.clone();
                     let client = Arc::clone(&self.client);
                     tokio::spawn(async move {
-                        let _ = client.respond_to_approval(&id, ApprovalDecisionValue::AcceptForSession).await;
+                        let _ = client
+                            .respond_to_approval(&id, ApprovalDecisionValue::AcceptForSession)
+                            .await;
                     });
                     return;
                 }
@@ -572,7 +637,9 @@ impl App {
                     let id = approval.id.clone();
                     let client = Arc::clone(&self.client);
                     tokio::spawn(async move {
-                        let _ = client.respond_to_approval(&id, ApprovalDecisionValue::Cancel).await;
+                        let _ = client
+                            .respond_to_approval(&id, ApprovalDecisionValue::Cancel)
+                            .await;
                     });
                     return;
                 }
@@ -580,10 +647,16 @@ impl App {
             }
         }
 
-        let Screen::Conversation(state) = self.router.current_mut() else { return };
+        let Screen::Conversation(state) = self.router.current_mut() else {
+            return;
+        };
         match key.code {
-            KeyCode::Esc => { self.router.pop(); }
-            KeyCode::Char('i') | KeyCode::Enter => { self.mode = InputMode::Insert; }
+            KeyCode::Esc => {
+                self.router.pop();
+            }
+            KeyCode::Char('i') | KeyCode::Enter => {
+                self.mode = InputMode::Insert;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 state.auto_scroll = false;
                 state.scroll_offset = state.scroll_offset.saturating_add(1);
@@ -592,8 +665,13 @@ impl App {
                 state.auto_scroll = false;
                 state.scroll_offset = state.scroll_offset.saturating_sub(1);
             }
-            KeyCode::Char('g') => { state.auto_scroll = false; state.scroll_offset = 0; }
-            KeyCode::Char('G') => { state.auto_scroll = true; }
+            KeyCode::Char('g') => {
+                state.auto_scroll = false;
+                state.scroll_offset = 0;
+            }
+            KeyCode::Char('G') => {
+                state.auto_scroll = true;
+            }
             KeyCode::PageDown => {
                 state.auto_scroll = false;
                 state.scroll_offset = state.scroll_offset.saturating_add(20);
@@ -626,7 +704,10 @@ impl App {
     async fn handle_insert_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('s') => { self.send_message().await; return; }
+                KeyCode::Char('s') => {
+                    self.send_message().await;
+                    return;
+                }
                 KeyCode::Char('c') => {
                     self.interrupt_active_turn();
                     self.mode = InputMode::Normal;
@@ -649,7 +730,9 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
                     // Shift+Enter or Alt+Enter → newline
                     if let Screen::Conversation(state) = self.router.current_mut() {
                         state.composer_text.push('\n');
@@ -691,18 +774,26 @@ impl App {
 
     async fn handle_user_input_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => { self.user_input_text.clear(); }
-            KeyCode::Char(c) => { self.user_input_text.push(c); }
-            KeyCode::Backspace => { self.user_input_text.pop(); }
+            KeyCode::Esc => {
+                self.user_input_text.clear();
+            }
+            KeyCode::Char(c) => {
+                self.user_input_text.push(c);
+            }
+            KeyCode::Backspace => {
+                self.user_input_text.pop();
+            }
             KeyCode::Enter => {
                 if let Some(request) = self.active_thread_user_input() {
                     let request_id = request.id.clone();
-                    let answers = request.questions.iter().map(|q| {
-                        codex_mobile_client::types::PendingUserInputAnswer {
+                    let answers = request
+                        .questions
+                        .iter()
+                        .map(|q| codex_mobile_client::types::PendingUserInputAnswer {
                             question_id: q.id.clone(),
                             answers: vec![self.user_input_text.clone()],
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     let client = Arc::clone(&self.client);
                     tokio::spawn(async move {
                         let _ = client.respond_to_user_input(&request_id, answers).await;
@@ -717,9 +808,13 @@ impl App {
     // ── Actions ──────────────────────────────────────────────────────
 
     async fn send_message(&mut self) {
-        let Screen::Conversation(state) = self.router.current_mut() else { return };
+        let Screen::Conversation(state) = self.router.current_mut() else {
+            return;
+        };
         let text = state.composer_text.trim().to_string();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
 
         let thread_key = state.thread_key.clone();
         state.composer_text.clear();
@@ -746,14 +841,26 @@ impl App {
                 output_schema: None,
                 collaboration_mode: None,
             };
-            if let Ok(response) = client.generated_turn_start(&thread_key.server_id, params.clone()).await {
-                let _ = client.reconcile_public_rpc("turn/start", &thread_key.server_id, Some(&params), &response).await;
+            if let Ok(response) = client
+                .generated_turn_start(&thread_key.server_id, params.clone())
+                .await
+            {
+                let _ = client
+                    .reconcile_public_rpc(
+                        "turn/start",
+                        &thread_key.server_id,
+                        Some(&params),
+                        &response,
+                    )
+                    .await;
             }
         });
     }
 
     fn connect_from_discovery(&mut self) {
-        let Some(Overlay::Discovery(state)) = &self.router.overlay else { return };
+        let Some(Overlay::Discovery(state)) = &self.router.overlay else {
+            return;
+        };
 
         let config = if !state.manual_host.is_empty() {
             let host = state.manual_host.clone();
@@ -789,8 +896,13 @@ impl App {
             let tx = self.bg_tx.clone();
             tokio::spawn(async move {
                 match client.connect_remote(config).await {
-                    Ok(_) => { let _ = tx.send(BgMessage::ServerConnected); }
-                    Err(e) => { let _ = tx.send(BgMessage::StatusMessage(format!("Connection failed: {e}"))); }
+                    Ok(_) => {
+                        let _ = tx.send(BgMessage::ServerConnected);
+                    }
+                    Err(e) => {
+                        let _ =
+                            tx.send(BgMessage::StatusMessage(format!("Connection failed: {e}")));
+                    }
                 }
             });
         }
@@ -811,9 +923,7 @@ impl App {
                 .build()
                 .expect("discovery runtime");
             rt.block_on(async move {
-                let discovered = client
-                    .scan_servers_with_mdns_context(vec![], None)
-                    .await;
+                let discovered = client.scan_servers_with_mdns_context(vec![], None).await;
                 let entries = discovered
                     .into_iter()
                     .map(|s| discovery::DiscoveredServerEntry {
@@ -844,9 +954,10 @@ impl App {
             BgMessage::ThreadStarted(key) => {
                 self.snapshot = self.client.app_snapshot();
                 self.client.set_active_thread(Some(key.clone()));
-                self.router.push(Screen::Conversation(
-                    conversation::ConversationState::new(key),
-                ));
+                self.router
+                    .push(Screen::Conversation(conversation::ConversationState::new(
+                        key,
+                    )));
             }
             BgMessage::ServerConnected => {
                 self.router.close_overlay();
@@ -891,14 +1002,27 @@ impl App {
                 self.client.disconnect_server(&server_id);
                 self.snapshot = self.client.app_snapshot();
             }
-            ConfirmAction::DeleteSession { server_id, thread_id } => {
+            ConfirmAction::DeleteSession {
+                server_id,
+                thread_id,
+            } => {
                 let client = Arc::clone(&self.client);
                 tokio::spawn(async move {
                     let params = codex_mobile_client::types::generated::ThreadArchiveParams {
                         thread_id: thread_id.clone(),
                     };
-                    if let Ok(response) = client.generated_thread_archive(&server_id, params.clone()).await {
-                        let _ = client.reconcile_public_rpc("thread/archive", &server_id, Some(&params), &response).await;
+                    if let Ok(response) = client
+                        .generated_thread_archive(&server_id, params.clone())
+                        .await
+                    {
+                        let _ = client
+                            .reconcile_public_rpc(
+                                "thread/archive",
+                                &server_id,
+                                Some(&params),
+                                &response,
+                            )
+                            .await;
                     }
                 });
             }
@@ -916,8 +1040,18 @@ impl App {
                             thread_id: thread_key.thread_id.clone(),
                             turn_id,
                         };
-                        if let Ok(response) = client.generated_turn_interrupt(&thread_key.server_id, params.clone()).await {
-                            let _ = client.reconcile_public_rpc("turn/interrupt", &thread_key.server_id, Some(&params), &response).await;
+                        if let Ok(response) = client
+                            .generated_turn_interrupt(&thread_key.server_id, params.clone())
+                            .await
+                        {
+                            let _ = client
+                                .reconcile_public_rpc(
+                                    "turn/interrupt",
+                                    &thread_key.server_id,
+                                    Some(&params),
+                                    &response,
+                                )
+                                .await;
                         }
                     });
                 }
@@ -929,19 +1063,30 @@ impl App {
 
     fn active_thread_approval(&self) -> Option<codex_mobile_client::types::PendingApproval> {
         if let Screen::Conversation(state) = self.router.current() {
-            self.snapshot.pending_approvals.iter().find(|a| {
-                a.thread_id.as_ref().map(|tid| tid == &state.thread_key.thread_id).unwrap_or(false)
-            }).cloned()
+            self.snapshot
+                .pending_approvals
+                .iter()
+                .find(|a| {
+                    a.thread_id
+                        .as_ref()
+                        .map(|tid| tid == &state.thread_key.thread_id)
+                        .unwrap_or(false)
+                })
+                .cloned()
         } else {
             None
         }
     }
 
-    fn active_thread_user_input(&self) -> Option<codex_mobile_client::types::PendingUserInputRequest> {
+    fn active_thread_user_input(
+        &self,
+    ) -> Option<codex_mobile_client::types::PendingUserInputRequest> {
         if let Screen::Conversation(state) = self.router.current() {
-            self.snapshot.pending_user_inputs.iter().find(|r| {
-                r.thread_id == state.thread_key.thread_id
-            }).cloned()
+            self.snapshot
+                .pending_user_inputs
+                .iter()
+                .find(|r| r.thread_id == state.thread_key.thread_id)
+                .cloned()
         } else {
             None
         }
@@ -952,9 +1097,10 @@ impl App {
 
         // Navigate immediately — the conversation view will show whatever
         // items are already in the snapshot (may be empty until resume completes).
-        self.router.push(Screen::Conversation(
-            conversation::ConversationState::new(key.clone()),
-        ));
+        self.router
+            .push(Screen::Conversation(conversation::ConversationState::new(
+                key.clone(),
+            )));
 
         // Resume the thread in the background to load full conversation history.
         let client = Arc::clone(&self.client);
@@ -974,10 +1120,15 @@ impl App {
                 base_instructions: None,
                 developer_instructions: None,
                 personality: None,
-                persist_extended_history: false,
+                persist_extended_history: true,
             };
-            if let Ok(response) = client.generated_thread_resume(&key.server_id, params.clone()).await {
-                let _ = client.reconcile_public_rpc("thread/resume", &key.server_id, Some(&params), &response).await;
+            if let Ok(response) = client
+                .generated_thread_resume(&key.server_id, params.clone())
+                .await
+            {
+                let _ = client
+                    .reconcile_public_rpc("thread/resume", &key.server_id, Some(&params), &response)
+                    .await;
             }
         });
     }
@@ -988,7 +1139,9 @@ impl App {
 }
 
 fn move_list_cursor(list_state: &mut ratatui::widgets::ListState, len: usize, delta: i32) {
-    if len == 0 { return; }
+    if len == 0 {
+        return;
+    }
     let current = list_state.selected().unwrap_or(0) as i32;
     let next = (current + delta).rem_euclid(len as i32) as usize;
     list_state.select(Some(next));

@@ -3,14 +3,19 @@ use std::sync::RwLock;
 
 use tokio::sync::broadcast;
 
-use crate::conversation::ConversationItemContent;
+use crate::conversation::{
+    AssistantMessageData, ConversationItem, ConversationItemContent, make_error_item,
+    make_model_rerouted_item, make_turn_diff_item,
+};
 use crate::session::connection::ServerConfig;
 use crate::session::events::UiEvent;
 use crate::types::{
     PendingApproval, PendingUserInputOption, PendingUserInputQuestion, PendingUserInputRequest,
     ThreadInfo, ThreadKey, ThreadSummaryStatus, generated,
 };
-use crate::uniffi_shared::{AppVoiceSessionPhase, AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate};
+use crate::uniffi_shared::{
+    AppVoiceSessionPhase, AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate,
+};
 
 use super::actions::{
     conversation_item_from_upstream, thread_info_from_upstream,
@@ -144,8 +149,11 @@ impl AppStoreReducer {
         let mut active_thread_cleared = false;
         {
             let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
+            let active_thread_key = snapshot.active_thread.clone();
             snapshot.threads.retain(|key, _| {
-                let keep = key.server_id != server_id || incoming_ids.contains(&key.thread_id);
+                let keep = key.server_id != server_id
+                    || incoming_ids.contains(&key.thread_id)
+                    || active_thread_key.as_ref() == Some(key);
                 if !keep {
                     removed_thread_keys.push(key.clone());
                 }
@@ -163,13 +171,17 @@ impl AppStoreReducer {
                 entry.info = info.clone();
                 entry.model = info.model.clone().or(entry.model.clone());
             }
-            if snapshot
-                .active_thread
-                .as_ref()
-                .is_some_and(|key| key.server_id == server_id && !incoming_ids.contains(&key.thread_id))
-            {
-                snapshot.active_thread = None;
-                active_thread_cleared = true;
+            if snapshot.active_thread.as_ref().is_some_and(|key| {
+                key.server_id == server_id && !incoming_ids.contains(&key.thread_id)
+            }) {
+                let should_clear = snapshot
+                    .active_thread
+                    .as_ref()
+                    .is_some_and(|key| !snapshot.threads.contains_key(key));
+                if should_clear {
+                    snapshot.active_thread = None;
+                    active_thread_cleared = true;
+                }
             }
             snapshot.pending_approvals.retain(|approval| {
                 approval.thread_id.as_deref().is_none_or(|tid| {
@@ -188,7 +200,9 @@ impl AppStoreReducer {
                 .voice_session
                 .active_thread
                 .as_ref()
-                .is_some_and(|key| key.server_id == server_id && !incoming_ids.contains(&key.thread_id))
+                .is_some_and(|key| {
+                    key.server_id == server_id && !incoming_ids.contains(&key.thread_id)
+                })
             {
                 snapshot.voice_session = VoiceSessionSnapshot::default();
             }
@@ -366,6 +380,16 @@ impl AppStoreReducer {
                 self.mutate_thread(key, |thread| {
                     thread.model = Some(notification.to_model.clone());
                     thread.info.model = Some(notification.to_model.clone());
+                    upsert_item(
+                        thread,
+                        make_model_rerouted_item(
+                            &notification.turn_id,
+                            Some(notification.from_model.clone()),
+                            notification.to_model.clone(),
+                            Some(format_model_reroute_reason(&notification.reason)),
+                            Some(&notification.turn_id),
+                        ),
+                    );
                 });
             }
             UiEvent::TurnStarted { key, turn_id } => {
@@ -426,6 +450,23 @@ impl AppStoreReducer {
                     append_command_output_delta(thread, item_id, delta)
                 });
             }
+            UiEvent::TurnDiffUpdated { key, notification } => {
+                self.mutate_thread(key, |thread| {
+                    upsert_item(
+                        thread,
+                        make_turn_diff_item(
+                            &notification.turn_id,
+                            notification.diff.clone(),
+                            Some(&notification.turn_id),
+                        ),
+                    );
+                });
+            }
+            UiEvent::McpToolCallProgress { key, notification } => {
+                self.mutate_thread(key, |thread| {
+                    append_mcp_progress(thread, &notification.item_id, &notification.message);
+                });
+            }
             UiEvent::ApprovalRequested { approval, .. } => {
                 let approvals = {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
@@ -478,9 +519,7 @@ impl AppStoreReducer {
             UiEvent::RealtimeStarted { key, notification } => {
                 eprintln!(
                     "[codex-mobile-client] reducer RealtimeStarted server_id={} thread_id={} session_id={:?}",
-                    key.server_id,
-                    key.thread_id,
-                    notification.session_id
+                    key.server_id, key.thread_id, notification.session_id
                 );
                 self.voice_state.reset_thread(key);
                 {
@@ -523,7 +562,8 @@ impl AppStoreReducer {
                                 {
                                     let mut snapshot =
                                         self.snapshot.write().expect("app store lock poisoned");
-                                    snapshot.voice_session.phase = Some(AppVoiceSessionPhase::Handoff);
+                                    snapshot.voice_session.phase =
+                                        Some(AppVoiceSessionPhase::Handoff);
                                 }
                                 self.emit(AppUpdate::VoiceSessionChanged);
                                 self.emit(AppUpdate::RealtimeHandoffRequested {
@@ -553,15 +593,16 @@ impl AppStoreReducer {
                     }
                 }
                 self.emit(AppUpdate::VoiceSessionChanged);
-                let generated_notification = generated::ThreadRealtimeOutputAudioDeltaNotification {
-                    thread_id: notification.thread_id.clone(),
-                    audio: generated::ThreadRealtimeAudioChunk {
-                        data: notification.audio.data.clone(),
-                        sample_rate: notification.audio.sample_rate,
-                        num_channels: notification.audio.num_channels as u32,
-                        samples_per_channel: notification.audio.samples_per_channel,
-                    },
-                };
+                let generated_notification =
+                    generated::ThreadRealtimeOutputAudioDeltaNotification {
+                        thread_id: notification.thread_id.clone(),
+                        audio: generated::ThreadRealtimeAudioChunk {
+                            data: notification.audio.data.clone(),
+                            sample_rate: notification.audio.sample_rate,
+                            num_channels: notification.audio.num_channels as u32,
+                            samples_per_channel: notification.audio.samples_per_channel,
+                        },
+                    };
                 self.emit(AppUpdate::RealtimeOutputAudioDelta {
                     key: key.clone(),
                     notification: generated_notification,
@@ -570,9 +611,7 @@ impl AppStoreReducer {
             UiEvent::RealtimeError { key, notification } => {
                 eprintln!(
                     "[codex-mobile-client] reducer RealtimeError server_id={} thread_id={} message={}",
-                    key.server_id,
-                    key.thread_id,
-                    notification.message
+                    key.server_id, key.thread_id, notification.message
                 );
                 {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
@@ -592,9 +631,7 @@ impl AppStoreReducer {
             UiEvent::RealtimeClosed { key, notification } => {
                 eprintln!(
                     "[codex-mobile-client] reducer RealtimeClosed server_id={} thread_id={} reason={:?}",
-                    key.server_id,
-                    key.thread_id,
-                    notification.reason
+                    key.server_id, key.thread_id, notification.reason
                 );
                 self.voice_state.clear_thread(key);
                 {
@@ -623,6 +660,16 @@ impl AppStoreReducer {
                     notification: generated_notification,
                 });
                 self.emit(AppUpdate::ThreadChanged { key: key.clone() });
+            }
+            UiEvent::Error { key, message, code } => {
+                if let Some(key) = key {
+                    self.mutate_thread(key, |thread| {
+                        let id = format!("error-{}-{}", key.thread_id, thread.items.len());
+                        thread
+                            .items
+                            .push(make_error_item(id, message.clone(), *code));
+                    });
+                }
             }
             UiEvent::RawNotification {
                 server_id,
@@ -840,6 +887,22 @@ fn upsert_item(thread: &mut ThreadSnapshot, item: crate::conversation::Conversat
 }
 
 fn append_assistant_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) {
+    if !thread.items.iter().any(|item| item.id == item_id) {
+        thread.items.push(ConversationItem {
+            id: item_id.to_string(),
+            content: ConversationItemContent::Assistant(AssistantMessageData {
+                text: String::new(),
+                agent_nickname: None,
+                agent_role: None,
+                phase: None,
+            }),
+            source_turn_id: thread.active_turn_id.clone(),
+            source_turn_index: None,
+            timestamp: None,
+            is_from_user_turn_boundary: false,
+        });
+    }
+
     let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
         return;
     };
@@ -857,6 +920,180 @@ fn append_reasoning_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &st
             last.push_str(delta);
         } else {
             reasoning.content.push(delta.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::DividerData;
+    use codex_app_server_protocol::{
+        McpToolCallProgressNotification, ModelRerouteReason, ModelReroutedNotification,
+        TurnDiffUpdatedNotification,
+    };
+
+    fn make_thread_info(id: &str) -> ThreadInfo {
+        ThreadInfo {
+            id: id.to_string(),
+            title: Some(format!("Thread {id}")),
+            model: None,
+            status: ThreadSummaryStatus::Idle,
+            preview: None,
+            cwd: Some("/tmp".to_string()),
+            path: None,
+            model_provider: None,
+            agent_nickname: None,
+            agent_role: None,
+            parent_thread_id: None,
+            agent_status: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn sync_thread_list_preserves_active_missing_thread() {
+        let reducer = AppStoreReducer::new();
+        let active_key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "active".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("active")));
+        reducer.set_active_thread(Some(active_key.clone()));
+
+        reducer.sync_thread_list("srv", &[make_thread_info("other")]);
+
+        let snapshot = reducer.snapshot();
+        assert!(snapshot.threads.contains_key(&active_key));
+        assert_eq!(snapshot.active_thread, Some(active_key));
+    }
+
+    #[test]
+    fn turn_diff_updates_become_conversation_items() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+
+        reducer.apply_ui_event(&UiEvent::TurnDiffUpdated {
+            key: key.clone(),
+            notification: TurnDiffUpdatedNotification {
+                thread_id: key.thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+                diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
+            },
+        });
+
+        let snapshot = reducer.snapshot();
+        let thread = snapshot.threads.get(&key).expect("thread exists");
+        let diff_item = thread
+            .items
+            .iter()
+            .find(|item| item.id == "turn-diff-turn-1")
+            .expect("turn diff item exists");
+        match &diff_item.content {
+            ConversationItemContent::TurnDiff(data) => assert!(data.diff.contains("+new")),
+            other => panic!("expected turn diff item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_progress_updates_append_to_existing_item() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut thread = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        thread.items.push(crate::conversation::ConversationItem {
+            id: "mcp-1".to_string(),
+            content: ConversationItemContent::McpToolCall(crate::conversation::McpToolCallData {
+                server: "github".to_string(),
+                tool: "search".to_string(),
+                status: "inProgress".to_string(),
+                duration_ms: None,
+                arguments_json: None,
+                content_summary: None,
+                structured_content_json: None,
+                raw_output_json: None,
+                error_message: None,
+                progress_messages: Vec::new(),
+            }),
+            source_turn_id: Some("turn-1".to_string()),
+            source_turn_index: None,
+            timestamp: None,
+            is_from_user_turn_boundary: false,
+        });
+        reducer.upsert_thread_snapshot(thread);
+
+        reducer.apply_ui_event(&UiEvent::McpToolCallProgress {
+            key: key.clone(),
+            notification: McpToolCallProgressNotification {
+                thread_id: key.thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+                item_id: "mcp-1".to_string(),
+                message: "Fetched 3 results".to_string(),
+            },
+        });
+
+        let snapshot = reducer.snapshot();
+        let thread = snapshot.threads.get(&key).expect("thread exists");
+        let mcp_item = thread.items.iter().find(|item| item.id == "mcp-1").unwrap();
+        match &mcp_item.content {
+            ConversationItemContent::McpToolCall(data) => {
+                assert_eq!(
+                    data.progress_messages,
+                    vec!["Fetched 3 results".to_string()]
+                );
+            }
+            other => panic!("expected mcp tool item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_reroutes_become_divider_items() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+
+        reducer.apply_ui_event(&UiEvent::ModelRerouted {
+            key: key.clone(),
+            notification: ModelReroutedNotification {
+                thread_id: key.thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+                from_model: "gpt-5".to_string(),
+                to_model: "gpt-5-mini".to_string(),
+                reason: ModelRerouteReason::HighRiskCyberActivity,
+            },
+        });
+
+        let snapshot = reducer.snapshot();
+        let thread = snapshot.threads.get(&key).expect("thread exists");
+        let reroute_item = thread
+            .items
+            .iter()
+            .find(|item| item.id == "model-rerouted-turn-1")
+            .expect("model reroute item exists");
+        match &reroute_item.content {
+            ConversationItemContent::Divider(DividerData::ModelRerouted {
+                from_model,
+                to_model,
+                reason,
+            }) => {
+                assert_eq!(from_model.as_deref(), Some("gpt-5"));
+                assert_eq!(to_model, "gpt-5-mini");
+                assert_eq!(reason.as_deref(), Some("High Risk Cyber Activity"));
+            }
+            other => panic!("expected model reroute divider, got {other:?}"),
         }
     }
 }
@@ -880,4 +1117,27 @@ fn append_command_output_delta(thread: &mut ThreadSnapshot, item_id: &str, delta
             .get_or_insert_with(String::new)
             .push_str(delta);
     }
+}
+
+fn append_mcp_progress(thread: &mut ThreadSnapshot, item_id: &str, message: &str) {
+    let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
+        return;
+    };
+    if let ConversationItemContent::McpToolCall(call) = &mut item.content {
+        if !message.trim().is_empty() {
+            call.progress_messages.push(message.to_string());
+        }
+    }
+}
+
+fn format_model_reroute_reason(reason: &codex_app_server_protocol::ModelRerouteReason) -> String {
+    let raw = format!("{reason:?}");
+    let mut formatted = String::new();
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0 && ch.is_uppercase() {
+            formatted.push(' ');
+        }
+        formatted.push(ch);
+    }
+    formatted
 }

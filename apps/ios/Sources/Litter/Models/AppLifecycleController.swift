@@ -166,7 +166,7 @@ final class AppLifecycleController {
                 approvalPolicy: nil,
                 sandbox: nil,
                 developerInstructions: nil,
-                persistExtendedHistory: false
+                persistExtendedHistory: true
             )
             _ = try? await appModel.rpc.threadResume(
                 serverId: key.serverId,

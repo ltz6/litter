@@ -405,7 +405,8 @@ enum LitterPreviewData {
                     HydratedAssistantMessageData(
                         text: message.text,
                         agentNickname: message.agentNickname,
-                        agentRole: message.agentRole
+                        agentRole: message.agentRole,
+                        phase: nil
                     )
                 )
             case .system:
@@ -457,6 +458,7 @@ struct LitterPreviewScene<Content: View>: View {
         .environment(voiceRuntime)
         .environment(appState)
         .environment(ThemeManager.shared)
+        .environment(WallpaperManager.shared)
     }
 }
 #endif

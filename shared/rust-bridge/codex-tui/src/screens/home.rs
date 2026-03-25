@@ -1,11 +1,11 @@
 use codex_mobile_client::store::{AppSnapshot, ServerHealthSnapshot};
 use codex_mobile_client::types::ThreadKey;
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame,
 };
 
 use crate::theme;
@@ -103,7 +103,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut HomeState, snapshot: &A
         Span::styled(" codex-tui ", theme::bold()),
         Span::raw("─".repeat(chunks[0].width.saturating_sub(30) as usize)),
         Span::styled(
-            format!(" {} server{} ", server_count, if server_count == 1 { "" } else { "s" }),
+            format!(
+                " {} server{} ",
+                server_count,
+                if server_count == 1 { "" } else { "s" }
+            ),
             theme::secondary(),
         ),
     ]);
@@ -150,11 +154,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut HomeState, snapshot: &A
             let health_sym = theme::health_symbol(&s.health);
             let health_col = theme::health_color(&s.health);
             let line = Line::from(vec![
-                Span::styled(format!("{health_sym} "), ratatui::style::Style::default().fg(health_col)),
+                Span::styled(
+                    format!("{health_sym} "),
+                    ratatui::style::Style::default().fg(health_col),
+                ),
                 Span::styled(&s.display_name, theme::accent()),
                 Span::raw(format!(" ({}:{})", s.host, s.port)),
                 Span::raw("  "),
-                Span::styled(format!("{:?}", s.health).to_lowercase(), ratatui::style::Style::default().fg(health_col)),
+                Span::styled(
+                    format!("{:?}", s.health).to_lowercase(),
+                    ratatui::style::Style::default().fg(health_col),
+                ),
             ]);
             ListItem::new(line)
         })

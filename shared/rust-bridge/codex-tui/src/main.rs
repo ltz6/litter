@@ -15,7 +15,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 use codex_mobile_client::MobileClient;
 use codex_mobile_client::session::connection::ServerConfig;
@@ -26,11 +26,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -62,7 +58,9 @@ fn parse_args() -> Args {
                 eprintln!();
                 eprintln!("OPTIONS:");
                 eprintln!("  -c, --connect HOST:PORT   Connect to server on startup");
-                eprintln!("  -l, --log-file PATH       Write logs to file (default: codex-tui.log)");
+                eprintln!(
+                    "  -l, --log-file PATH       Write logs to file (default: codex-tui.log)"
+                );
                 eprintln!("  -h, --help                Show this help");
                 std::process::exit(0);
             }

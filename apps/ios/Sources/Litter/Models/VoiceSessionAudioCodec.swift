@@ -45,6 +45,14 @@ enum VoiceSessionAudioCodec {
         resample(samples: samples, from: sampleRate, to: targetSampleRate)
     }
 
+    static func resampleToTarget(
+        samples: [Float],
+        sampleRate: Double,
+        targetSampleRate: Double
+    ) -> [Float] {
+        resample(samples: samples, from: sampleRate, to: targetSampleRate)
+    }
+
     static func encodeChunk(samples: [Float], channels: Int = targetChannels) -> ThreadRealtimeAudioChunk {
         let data = encodePCM16(samples: samples)
         return ThreadRealtimeAudioChunk(
@@ -55,10 +63,14 @@ enum VoiceSessionAudioCodec {
         )
     }
 
-    static func makePlaybackBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCMBuffer? {
+    static func makePlaybackBuffer(
+        samples: [Float],
+        sampleRate: Double,
+        channels: AVAudioChannelCount = 1
+    ) -> AVAudioPCMBuffer? {
         let format = AVAudioFormat(
             standardFormatWithSampleRate: sampleRate,
-            channels: 1
+            channels: channels
         )
         guard let format,
               let buffer = AVAudioPCMBuffer(
@@ -68,9 +80,13 @@ enum VoiceSessionAudioCodec {
             return nil
         }
         buffer.frameLength = AVAudioFrameCount(samples.count)
-        guard let channelData = buffer.floatChannelData?[0] else { return nil }
-        for (index, sample) in samples.enumerated() {
-            channelData[index] = sample
+        guard let floatChannelData = buffer.floatChannelData else { return nil }
+        let channelCount = Int(format.channelCount)
+        for channelIndex in 0..<channelCount {
+            let channelData = floatChannelData[channelIndex]
+            for (index, sample) in samples.enumerated() {
+                channelData[index] = sample
+            }
         }
         return buffer
     }

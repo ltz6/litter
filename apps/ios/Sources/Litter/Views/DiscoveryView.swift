@@ -39,99 +39,7 @@ struct DiscoveryView: View {
     }
 
     private var networkServers: [DiscoveredServer] {
-        let discovered = discovery.servers.filter { $0.source != .local }
-        let saved = SavedServerStore.load()
-            .map { $0.toDiscoveredServer() }
-            .filter { $0.source != .local }
-        let discoveredByHost = discovered.reduce(into: [String: DiscoveredServer]()) { partialResult, server in
-            partialResult[normalizedServerKey(for: server)] = server
-        }
-        let reconciledSaved = saved.map { savedServer in
-            guard let liveServer = discoveredByHost[normalizedServerKey(for: savedServer)] else {
-                return savedServer
-            }
-            return DiscoveredServer(
-                id: savedServer.id,
-                name: savedServer.name,
-                hostname: savedServer.hostname,
-                port: liveServer.port,
-                sshPort: liveServer.sshPort ?? savedServer.sshPort,
-                source: liveServer.source,
-                hasCodexServer: liveServer.hasCodexServer,
-                wakeMAC: savedServer.wakeMAC ?? liveServer.wakeMAC,
-                sshPortForwardingEnabled: savedServer.sshPortForwardingEnabled || liveServer.sshPortForwardingEnabled,
-                websocketURL: savedServer.websocketURL
-            )
-        }
-        return mergeServers(discovered + reconciledSaved)
-    }
-
-    private func mergeServers(_ candidates: [DiscoveredServer]) -> [DiscoveredServer] {
-        var merged: [String: DiscoveredServer] = [:]
-
-        func sourceRank(_ source: ServerSource) -> Int {
-            switch source {
-            case .bonjour: return 0
-            case .tailscale: return 1
-            case .ssh: return 2
-            case .manual: return 3
-            case .local: return 4
-            }
-        }
-
-        for candidate in candidates {
-            let mergeKey = normalizedServerKey(for: candidate)
-            if let existing = merged[mergeKey] {
-                let candidateWithWakeMAC = DiscoveredServer(
-                    id: candidate.id,
-                    name: candidate.name,
-                    hostname: candidate.hostname,
-                    port: candidate.port,
-                    sshPort: candidate.sshPort ?? existing.sshPort,
-                    source: candidate.source,
-                    hasCodexServer: candidate.hasCodexServer,
-                    wakeMAC: candidate.wakeMAC ?? existing.wakeMAC,
-                    sshPortForwardingEnabled: candidate.sshPortForwardingEnabled || existing.sshPortForwardingEnabled,
-                    websocketURL: candidate.websocketURL ?? existing.websocketURL
-                )
-                let betterSource = sourceRank(candidate.source) < sourceRank(existing.source)
-                let hasCodexUpgrade = candidate.hasCodexServer && !existing.hasCodexServer
-                let betterCodexPort = candidate.hasCodexServer && existing.hasCodexServer && candidate.port != existing.port
-                let betterName = existing.name == existing.hostname && candidate.name != candidate.hostname
-                if betterSource || hasCodexUpgrade || betterCodexPort || betterName {
-                    merged[mergeKey] = candidateWithWakeMAC
-                } else if existing.wakeMAC == nil, candidateWithWakeMAC.wakeMAC != nil {
-                    merged[mergeKey] = DiscoveredServer(
-                        id: existing.id,
-                        name: existing.name,
-                        hostname: existing.hostname,
-                        port: existing.port,
-                        sshPort: existing.sshPort ?? candidateWithWakeMAC.sshPort,
-                        source: existing.source,
-                        hasCodexServer: existing.hasCodexServer,
-                        wakeMAC: candidateWithWakeMAC.wakeMAC,
-                        sshPortForwardingEnabled: existing.sshPortForwardingEnabled || candidateWithWakeMAC.sshPortForwardingEnabled,
-                        websocketURL: existing.websocketURL ?? candidateWithWakeMAC.websocketURL
-                    )
-                }
-            } else {
-                merged[mergeKey] = candidate
-            }
-        }
-
-        return Array(merged.values).sorted { lhs, rhs in
-            let lhsRank = sourceRank(lhs.source)
-            let rhsRank = sourceRank(rhs.source)
-            if lhsRank != rhsRank {
-                return lhsRank < rhsRank
-            }
-            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-        }
-    }
-
-    private func normalizedServerKey(for server: DiscoveredServer) -> String {
-        let key = server.hostname.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return key.isEmpty ? server.id : key
+        discovery.servers.filter { $0.source != .local }
     }
 
     private func applyInitialServersIfNeeded() {
@@ -355,11 +263,16 @@ struct DiscoveryView: View {
 
     private func serverSubtitle(_ server: DiscoveredServer) -> String {
         if server.source == .local { return "In-process server" }
-        var parts = [server.hostname]
-        if let port = server.hasCodexServer ? server.port : server.sshPort {
+        let snapshot = connectedSnapshot(for: server)
+        let displayHost = snapshot?.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? snapshot!.host
+            : server.hostname
+        let displayPort = snapshot?.port ?? (server.hasCodexServer ? server.port : server.sshPort)
+
+        var parts = [displayHost]
+        if let port = displayPort {
             parts.append(":\(port)")
         }
-        let snapshot = appModel.snapshot?.servers.first(where: { $0.serverId == server.id })
         let isConnected = snapshot?.health == .connected
         let isKnown = snapshot != nil
         if server.hasCodexServer {
@@ -376,6 +289,10 @@ struct DiscoveryView: View {
         return parts.joined()
     }
 
+    private func connectedSnapshot(for server: DiscoveredServer) -> AppServerSnapshot? {
+        appModel.snapshot?.servers.first(where: { $0.serverId == server.id && !$0.isLocal })
+    }
+
     // MARK: - Actions
 
     private func handleTap(_ server: DiscoveredServer) {
@@ -383,11 +300,15 @@ struct DiscoveryView: View {
     }
 
     private func navigateAfterConnect(_ server: DiscoveredServer) {
-        if appModel.snapshot?.servers.first(where: { $0.serverId == server.id })?.account == nil {
-            appState.showSettings = true
-        } else {
+        guard let snapshot = appModel.snapshot?.servers.first(where: { $0.serverId == server.id }) else {
             onServerSelected?(server)
+            return
         }
+        if snapshot.isLocal, snapshot.account == nil {
+            appState.showSettings = true
+            return
+        }
+        onServerSelected?(server)
     }
 
     @MainActor

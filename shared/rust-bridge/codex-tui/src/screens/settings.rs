@@ -1,10 +1,10 @@
 use codex_mobile_client::store::AppSnapshot;
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame,
 };
 
 use crate::theme;
@@ -38,9 +38,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SettingsState, snapshot
     let mut items = Vec::new();
 
     // Show connected servers
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled(" Connected Servers:", theme::bold()),
-    ])));
+    items.push(ListItem::new(Line::from(vec![Span::styled(
+        " Connected Servers:",
+        theme::bold(),
+    )])));
 
     for server in snapshot.servers.values() {
         let health_sym = theme::health_symbol(&server.health);
@@ -56,16 +57,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SettingsState, snapshot
     }
 
     if snapshot.servers.is_empty() {
-        items.push(ListItem::new(
-            Span::styled("   No servers connected", theme::dim()),
-        ));
+        items.push(ListItem::new(Span::styled(
+            "   No servers connected",
+            theme::dim(),
+        )));
     }
 
     // Account info
     items.push(ListItem::new(Line::default()));
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled(" Account:", theme::bold()),
-    ])));
+    items.push(ListItem::new(Line::from(vec![Span::styled(
+        " Account:",
+        theme::bold(),
+    )])));
 
     for server in snapshot.servers.values() {
         if let Some(account) = &server.account {
@@ -83,8 +86,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SettingsState, snapshot
         }
     }
 
-    let list = List::new(items)
-        .highlight_style(theme::accent().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(theme::accent().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
 
     // Hints

@@ -94,6 +94,9 @@ private extension FfiToolCallSectionContent {
 private extension FfiToolCallCard {
     func toToolCallCardModel() -> ToolCallCardModel? {
         guard let kind = kind.toToolCallKind() else { return nil }
+        let mappedSections = sections.map { $0.content.toToolCallSection(label: $0.label) }
+        let commandContext = synthesizedCommandContext(kind: kind, sections: mappedSections)
+        let normalizedSections = normalizedSections(kind: kind, sections: mappedSections)
 
         let duration: String? = durationMs.map { ms in
             let seconds = Double(ms) / 1000.0
@@ -114,7 +117,71 @@ private extension FfiToolCallCard {
             summary: summary,
             status: status.toToolCallStatus(),
             duration: duration,
-            sections: sections.map { $0.content.toToolCallSection(label: $0.label) }
+            sections: normalizedSections,
+            commandContext: commandContext
         )
+    }
+
+    private func normalizedSections(kind: ToolCallKind, sections: [ToolCallSection]) -> [ToolCallSection] {
+        guard kind.isCommandLike else { return sections }
+        return sections.filter { section in
+            let label = normalizedLabel(for: section)
+            return label != "command" && label != "directory" && label != "cwd" && label != "working directory"
+        }
+    }
+
+    private func synthesizedCommandContext(
+        kind: ToolCallKind,
+        sections: [ToolCallSection]
+    ) -> ToolCallCommandContext? {
+        guard kind.isCommandLike else { return nil }
+
+        let command = (
+            sectionText(named: ["command"], in: sections)
+            ?? summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        let directory = sectionText(named: ["directory", "cwd", "working directory"], in: sections)
+
+        guard !command.isEmpty else {
+            return nil
+        }
+        return ToolCallCommandContext(
+            command: command,
+            directory: directory?.isEmpty == true ? nil : directory
+        )
+    }
+
+    private func sectionText(named names: Set<String>, in sections: [ToolCallSection]) -> String? {
+        for section in sections {
+            guard names.contains(normalizedLabel(for: section)) else { continue }
+            switch section {
+            case .text(_, let content):
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            case .code(_, _, let content):
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
+    private func normalizedLabel(for section: ToolCallSection) -> String {
+        switch section {
+        case .kv(let label, _),
+             .code(let label, _, _),
+             .json(let label, _),
+             .diff(let label, _),
+             .text(let label, _),
+             .list(let label, _),
+             .progress(let label, _):
+            return label
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "[^a-z0-9]+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 }

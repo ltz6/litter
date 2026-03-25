@@ -137,6 +137,7 @@
 		8A04BCA096806B66BF373FF0 /* solarized-dark.json in Resources */ = {isa = PBXBuildFile; fileRef = 45F4850CDE17E426ECBF4EA5 /* solarized-dark.json */; };
 		8C23140CEA84BA8C4DE2BC69 /* ConversationAttachmentSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33000D9825376F952524F20C /* ConversationAttachmentSupport.swift */; };
 		8C573877188B1CF76579523A /* DiscoveredServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7779BD02F3B304F9C3AD32A1 /* DiscoveredServer.swift */; };
+		93C87EABAC0D427BD6089349 /* ChatWallpaperBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4754654D5240E850C98AB85D /* ChatWallpaperBackground.swift */; };
 		9661EB7632A00EB0B261D7B9 /* temple-dark.json in Resources */ = {isa = PBXBuildFile; fileRef = 885259DDCC6E448B237FAA61 /* temple-dark.json */; };
 		980F1458FEEA8970E9F29FCF /* ConversationComposerContextBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0D72714D0B3E9209EF907B3 /* ConversationComposerContextBarView.swift */; };
 		9887C4BF6EDA51F23E491EB2 /* HomeDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B6104B911C0E0B00FC5375F /* HomeDashboardView.swift */; };
@@ -243,6 +244,7 @@
 		F9CB7C7D1E911E4B1B7B06D9 /* solarized-light.json in Resources */ = {isa = PBXBuildFile; fileRef = 887F9EF05D2351DEB6B9602D /* solarized-light.json */; };
 		FA145BA6C8F374ABE9C7B924 /* linear-light.json in Resources */ = {isa = PBXBuildFile; fileRef = 9355F09B357618AB71A7C114 /* linear-light.json */; };
 		FA98FED0824E234BDFF458AC /* snazzy-light.json in Resources */ = {isa = PBXBuildFile; fileRef = FE2B786FCD5DBBFC5BBEB20E /* snazzy-light.json */; };
+		FCAE1D50167F5F4DB4287DEF /* WallpaperManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CB4A268C8D43CA2144617DE /* WallpaperManager.swift */; };
 		FE7F588352FF00362744FAD4 /* github-dark.json in Resources */ = {isa = PBXBuildFile; fileRef = 87E1D2E7E6CB4DA678C6605E /* github-dark.json */; };
 		FF309C81AC29180713E1AF4F /* lobster-dark-dxSKfHK-.json in Resources */ = {isa = PBXBuildFile; fileRef = 64A9C3848F4142EF67DD23D3 /* lobster-dark-dxSKfHK-.json */; };
 		FF4D813592AD383AD342CFFB /* NetworkDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C54AE62D2865D1C7750F7A /* NetworkDiscovery.swift */; };
@@ -316,6 +318,7 @@
 		075CAE1122242626CE33A93F /* ConversationComposerEntryRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationComposerEntryRowView.swift; sourceTree = "<group>"; };
 		0A9C36495A1AD0AC9AC6DBA4 /* ios_system.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ios_system.xcframework; path = Frameworks/ios_system/ios_system.xcframework; sourceTree = "<group>"; };
 		0AB0858848FDF680B63C2432 /* ToolCallModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCallModels.swift; sourceTree = "<group>"; };
+		0CB4A268C8D43CA2144617DE /* WallpaperManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperManager.swift; sourceTree = "<group>"; };
 		0F4C10A9AB37FCCDDA975381 /* SavedServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedServer.swift; sourceTree = "<group>"; };
 		101538FB7758F2441ED27F40 /* Extensions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Extensions.swift; sourceTree = "<group>"; };
 		1251509F0DDD4F5D494C9956 /* AppRpcParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRpcParams.swift; sourceTree = "<group>"; };
@@ -363,6 +366,7 @@
 		43A18135FA93A4608A16C98F /* vitesse-dark.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "vitesse-dark.json"; sourceTree = "<group>"; };
 		45F4850CDE17E426ECBF4EA5 /* solarized-dark.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "solarized-dark.json"; sourceTree = "<group>"; };
 		46D841AF0FFB0241834F88D0 /* LitterUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LitterUITests.swift; sourceTree = "<group>"; };
+		4754654D5240E850C98AB85D /* ChatWallpaperBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatWallpaperBackground.swift; sourceTree = "<group>"; };
 		47D3FB91329C177A51F198B3 /* MessageRenderCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageRenderCache.swift; sourceTree = "<group>"; };
 		4925417F70C546B80DBD9EFF /* ConnectionTarget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionTarget.swift; sourceTree = "<group>"; };
 		4A55B713A264CC0C8FE3D813 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -866,6 +870,7 @@
 				5DD97D143F733E99AE81276D /* VoiceSessionCoordinator.swift */,
 				6AE2C5F6A9589EF98EF22485 /* VoiceSessionModels.swift */,
 				A57573910BEE96B3224934D2 /* VoiceTranscriptionManager.swift */,
+				0CB4A268C8D43CA2144617DE /* WallpaperManager.swift */,
 				E5F62BD166C32FDA09B0BAC4 /* WidgetGuidelines.swift */,
 			);
 			path = Models;
@@ -880,6 +885,7 @@
 				9D216CEBFB1B4B71CFC2C0F8 /* AppearanceSettingsView.swift */,
 				63D9ACF04F4018F2949FB7E0 /* AudioWaveformView.swift */,
 				C361CBF40ED3D35C44D46880 /* BrandLogo.swift */,
+				4754654D5240E850C98AB85D /* ChatWallpaperBackground.swift */,
 				EEDF2E1FEDF741D69062FDDD /* CodeBlockView.swift */,
 				D1E96C6677B2AA22A101A29C /* ContextBadgeView.swift */,
 				56EFBFE7DF8014B177A1F7B9 /* ConversationComposerAttachSheet.swift */,
@@ -1227,6 +1233,7 @@
 				483C48A38E7D5B48F9735CB6 /* CarPlayVoiceManager.swift in Sources */,
 				BDC09E8F6B156DB1FD6A0059 /* ChatGPTOAuth.swift in Sources */,
 				5342E9DEE1FB318F01E27F7E /* ChatTypes.swift in Sources */,
+				93C87EABAC0D427BD6089349 /* ChatWallpaperBackground.swift in Sources */,
 				8445E0A9CDF58E2E9A509018 /* CodeBlockView.swift in Sources */,
 				79979BB2F64E9429CB78709D /* CodexTurnAttributes.swift in Sources */,
 				3BEE4213B5E4E91944903E8C /* CodexTurnLiveActivity.swift in Sources */,
@@ -1306,6 +1313,7 @@
 				B4B7FDC4511BCAE9296770D3 /* VoiceSessionCoordinator.swift in Sources */,
 				5DCD93AFDFF3C4BF1388D5A9 /* VoiceSessionModels.swift in Sources */,
 				CCEC8DC921FB6DB93D821519 /* VoiceTranscriptionManager.swift in Sources */,
+				FCAE1D50167F5F4DB4287DEF /* WallpaperManager.swift in Sources */,
 				5FC21B742C1E838A7BDACCDA /* WidgetGuidelines.swift in Sources */,
 				18505C3526851FD8F141B78E /* WidgetWebView.swift in Sources */,
 			);

@@ -1,4 +1,7 @@
-use crate::discovery::{DiscoveredServer, DiscoverySource, MdnsSeed};
+use crate::discovery::{
+    DiscoveredServer, DiscoverySource, MdnsSeed, ProgressiveDiscoveryUpdate,
+    ProgressiveDiscoveryUpdateKind,
+};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -98,6 +101,38 @@ impl From<FfiDiscoveredServer> for DiscoveredServer {
             metadata: HashMap::new(),
             last_seen: Instant::now(),
             reachable: value.reachable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum FfiProgressiveDiscoveryUpdateKind {
+    PartialResults,
+    ScanComplete,
+}
+
+impl From<ProgressiveDiscoveryUpdateKind> for FfiProgressiveDiscoveryUpdateKind {
+    fn from(value: ProgressiveDiscoveryUpdateKind) -> Self {
+        match value {
+            ProgressiveDiscoveryUpdateKind::PartialResults => Self::PartialResults,
+            ProgressiveDiscoveryUpdateKind::ScanComplete => Self::ScanComplete,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiProgressiveDiscoveryUpdate {
+    pub kind: FfiProgressiveDiscoveryUpdateKind,
+    pub source: Option<FfiDiscoverySource>,
+    pub servers: Vec<FfiDiscoveredServer>,
+}
+
+impl From<ProgressiveDiscoveryUpdate> for FfiProgressiveDiscoveryUpdate {
+    fn from(value: ProgressiveDiscoveryUpdate) -> Self {
+        Self {
+            kind: value.kind.into(),
+            source: value.source.map(Into::into),
+            servers: value.servers.into_iter().map(Into::into).collect(),
         }
     }
 }

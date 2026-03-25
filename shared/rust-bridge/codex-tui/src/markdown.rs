@@ -48,14 +48,8 @@ pub fn render(text: &str, _width: u16) -> Vec<Line<'static>> {
                         lang.clone()
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!(" ┌─ {label} "),
-                            Style::default().fg(theme::BORDER),
-                        ),
-                        Span::styled(
-                            "─".repeat(30),
-                            Style::default().fg(theme::BORDER),
-                        ),
+                        Span::styled(format!(" ┌─ {label} "), Style::default().fg(theme::BORDER)),
+                        Span::styled("─".repeat(30), Style::default().fg(theme::BORDER)),
                     ]));
                     state = State::CodeBlock(lang);
                     continue;
@@ -76,9 +70,7 @@ pub fn render(text: &str, _width: u16) -> Vec<Line<'static>> {
                     let heading = trimmed.trim_start_matches('#').trim();
                     lines.push(Line::from(Span::styled(
                         format!(" {heading}"),
-                        Style::default()
-                            .fg(theme::FG)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
                     )));
                     continue;
                 }
@@ -210,10 +202,7 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
                         text_part.to_string(),
                         Style::default().add_modifier(Modifier::UNDERLINED),
                     ));
-                    spans.push(Span::styled(
-                        format!(" ({url})"),
-                        theme::dim(),
-                    ));
+                    spans.push(Span::styled(format!(" ({url})"), theme::dim()));
                     remaining = &after_bracket[paren_end + 1..];
                     continue;
                 }

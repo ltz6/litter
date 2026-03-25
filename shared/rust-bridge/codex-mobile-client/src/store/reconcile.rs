@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crate::MobileClient;
 use crate::transport::RpcError;
-use crate::types::{generated, ThreadInfo, ThreadKey};
+use crate::types::{ThreadInfo, ThreadKey, generated};
 
 impl MobileClient {
     /// Reconcile direct public RPC calls into the canonical app store.
@@ -21,10 +21,22 @@ impl MobileClient {
         params: Option<&P>,
         response: &R,
     ) -> Result<(), RpcError> {
+        if wire_method == "turn/start" {
+            tracing::info!(
+                "reconcile_public_rpc wire_method={} server_id={}",
+                wire_method,
+                server_id
+            );
+            eprintln!(
+                "[codex-mobile-client] reconcile_public_rpc wire_method={} server_id={}",
+                wire_method, server_id
+            );
+        }
         match wire_method {
             "thread/start" => {
                 let response = downcast_public_rpc_response::<generated::ThreadStartResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_thread_start_response(server_id, response)
                     .map(|_| ())
@@ -32,7 +44,8 @@ impl MobileClient {
             }
             "thread/list" => {
                 let response = downcast_public_rpc_response::<generated::ThreadListResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.sync_generated_thread_list(server_id, response.data.clone())
                     .map(|_| ())
@@ -40,7 +53,8 @@ impl MobileClient {
             }
             "thread/read" => {
                 let response = downcast_public_rpc_response::<generated::ThreadReadResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_thread_read_response(server_id, response)
                     .map(|_| ())
@@ -48,7 +62,8 @@ impl MobileClient {
             }
             "thread/resume" => {
                 let response = downcast_public_rpc_response::<generated::ThreadResumeResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_thread_resume_response(server_id, response)
                     .map(|_| ())
@@ -56,7 +71,8 @@ impl MobileClient {
             }
             "thread/fork" => {
                 let response = downcast_public_rpc_response::<generated::ThreadForkResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_thread_fork_response(server_id, response)
                     .map(|_| ())
@@ -64,7 +80,8 @@ impl MobileClient {
             }
             "thread/rollback" => {
                 let response = downcast_public_rpc_response::<generated::ThreadRollbackResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 let params = downcast_public_rpc_params::<generated::ThreadRollbackParams>(
                     wire_method,
@@ -76,21 +93,23 @@ impl MobileClient {
             }
             "account/read" => {
                 let response = downcast_public_rpc_response::<generated::GetAccountResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_account_response(server_id, response);
                 Ok(())
             }
             "account/rateLimits/read" => {
-                let response = downcast_public_rpc_response::<generated::GetAccountRateLimitsResponse>(
-                    wire_method, response,
-                )?;
+                let response = downcast_public_rpc_response::<
+                    generated::GetAccountRateLimitsResponse,
+                >(wire_method, response)?;
                 self.apply_account_rate_limits_response(server_id, response);
                 Ok(())
             }
             "model/list" => {
                 let response = downcast_public_rpc_response::<generated::ModelListResponse>(
-                    wire_method, response,
+                    wire_method,
+                    response,
                 )?;
                 self.apply_model_list_response(server_id, response);
                 Ok(())
@@ -170,7 +189,10 @@ impl MobileClient {
             server_id,
             response.thread.clone(),
             Some(response.model.clone()),
-            response.reasoning_effort.clone().map(crate::reasoning_effort_string),
+            response
+                .reasoning_effort
+                .clone()
+                .map(crate::reasoning_effort_string),
         )
         .map_err(|e| e.to_string())?;
         let key = snapshot.key.clone();
@@ -183,9 +205,13 @@ impl MobileClient {
         server_id: &str,
         response: &generated::ThreadReadResponse,
     ) -> Result<ThreadKey, String> {
-        let snapshot =
-            crate::thread_snapshot_from_generated_thread(server_id, response.thread.clone(), None, None)
-                .map_err(|e| e.to_string())?;
+        let snapshot = crate::thread_snapshot_from_generated_thread(
+            server_id,
+            response.thread.clone(),
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
         let key = snapshot.key.clone();
         self.app_store.upsert_thread_snapshot(snapshot);
         Ok(key)
@@ -200,7 +226,10 @@ impl MobileClient {
             server_id,
             response.thread.clone(),
             Some(response.model.clone()),
-            response.reasoning_effort.clone().map(crate::reasoning_effort_string),
+            response
+                .reasoning_effort
+                .clone()
+                .map(crate::reasoning_effort_string),
         )
         .map_err(|e| e.to_string())?;
         let key = snapshot.key.clone();
@@ -217,7 +246,10 @@ impl MobileClient {
             server_id,
             response.thread.clone(),
             Some(response.model.clone()),
-            response.reasoning_effort.clone().map(crate::reasoning_effort_string),
+            response
+                .reasoning_effort
+                .clone()
+                .map(crate::reasoning_effort_string),
         )
         .map_err(|e| e.to_string())?;
         let key = snapshot.key.clone();

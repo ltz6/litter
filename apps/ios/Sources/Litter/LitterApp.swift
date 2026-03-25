@@ -21,6 +21,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         codex_ios_system_init()
+        // Pre-initialize Rust bridges (tokio runtime) on a background thread
+        // before SwiftUI accesses AppModel.shared, avoiding a priority inversion
+        // where the main thread blocks on lower-QoS tokio worker init.
+        DispatchQueue.global(qos: .userInitiated).async {
+            AppModel.prewarmRustBridges()
+        }
         application.registerForRemoteNotifications()
         showSplashWindow()
         scheduleKeyboardWarmup()
@@ -143,6 +149,7 @@ struct LitterApp: App {
     @State private var voiceRuntime = VoiceRuntimeController.shared
     @State private var appRuntime = AppRuntimeController.shared
     @State private var themeManager = ThemeManager.shared
+    @State private var wallpaperManager = WallpaperManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -152,6 +159,7 @@ struct LitterApp: App {
                 .environment(appRuntime)
                 .environment(voiceRuntime)
                 .environment(themeManager)
+                .environment(wallpaperManager)
                 .task {
                     appModel.start()
                     voiceRuntime.bind(appModel: appModel)
@@ -565,7 +573,7 @@ private struct HomeNavigationView: View {
         await conversationWarmup.prewarmIfNeeded()
         workDir = thread.cwd
         appState.currentCwd = thread.cwd
-        let opened: Bool
+        let openedKey: ThreadKey?
         do {
             let response = try await appModel.rpc.threadResume(
                 serverId: thread.key.serverId,
@@ -574,20 +582,19 @@ private struct HomeNavigationView: View {
                     cwdOverride: thread.cwd
                 )
             )
-            appModel.store.setActiveThread(
-                key: ThreadKey(serverId: thread.key.serverId, threadId: response.thread.id)
-            )
+            let nextKey = ThreadKey(serverId: thread.key.serverId, threadId: response.thread.id)
+            appModel.store.setActiveThread(key: nextKey)
             await appModel.refreshSnapshot()
-            opened = true
+            openedKey = nextKey
         } catch {
             actionErrorMessage = error.localizedDescription
-            opened = false
+            openedKey = nil
         }
-        guard opened else {
+        guard let openedKey else {
             actionErrorMessage = actionErrorMessage ?? "Failed to open conversation."
             return
         }
-        openConversation(thread.key)
+        openConversation(openedKey)
     }
 
     private func startNewSession(serverId: String, cwd: String) async {
@@ -625,7 +632,13 @@ private struct HomeNavigationView: View {
             return
         }
 
-        openConversation(startedKey)
+        guard let resolvedKey = await appModel.ensureThreadLoaded(key: startedKey)
+            ?? appModel.snapshot?.threadSnapshot(for: startedKey)?.key else {
+            actionErrorMessage = appModel.lastError ?? "Failed to load the new session."
+            return
+        }
+
+        openConversation(resolvedKey)
     }
 
     private func seedInitialConversationIfNeeded(activeKey: ThreadKey?) {
@@ -654,7 +667,7 @@ private struct HomeNavigationView: View {
             approvalPolicy: AskForApproval(wireValue: appState.approvalPolicy),
             sandbox: SandboxMode(wireValue: appState.sandboxMode),
             developerInstructions: nil,
-            persistExtendedHistory: false
+            persistExtendedHistory: true
         )
     }
 
@@ -740,7 +753,26 @@ private struct ConversationDestinationScreen: View {
     let onOpenConversation: (ThreadKey) -> Void
 
     private var conversationThread: AppThreadSnapshot? {
-        appModel.snapshot?.threadSnapshot(for: threadKey)
+        if let exact = appModel.snapshot?.threadSnapshot(for: threadKey) {
+            return exact
+        }
+        guard let activeKey = appModel.snapshot?.activeThread,
+              activeKey.serverId == threadKey.serverId else {
+            return nil
+        }
+        return appModel.snapshot?.threadSnapshot(for: activeKey)
+    }
+
+    private var resolvedThreadKey: ThreadKey {
+        conversationThread?.key ?? threadKey
+    }
+
+    private func bindScreenModel(for thread: AppThreadSnapshot) {
+        screenModel.bind(
+            thread: thread,
+            appModel: appModel,
+            agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0
+        )
     }
 
     var body: some View {
@@ -749,7 +781,7 @@ private struct ConversationDestinationScreen: View {
                 ZStack(alignment: .top) {
                     ConversationView(
                         thread: conversationThread,
-                        activeThreadKey: threadKey,
+                        activeThreadKey: resolvedThreadKey,
                         transcript: screenModel.transcript,
                         pinnedContextItems: screenModel.pinnedContextItems,
                         composer: screenModel.composer,
@@ -775,12 +807,17 @@ private struct ConversationDestinationScreen: View {
                     )
                     .zIndex(2)
                 }
-                .task(id: conversationThread) {
-                    screenModel.bind(
-                        thread: conversationThread,
-                        appModel: appModel,
-                        agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0
-                    )
+                .onAppear {
+                    bindScreenModel(for: conversationThread)
+                }
+                .onChange(of: conversationThread) { _, updatedThread in
+                    bindScreenModel(for: updatedThread)
+                }
+                .onChange(of: appModel.snapshot?.agentDirectoryVersion) { _, _ in
+                    bindScreenModel(for: conversationThread)
+                }
+                .onChange(of: appModel.snapshot) { _, _ in
+                    bindScreenModel(for: conversationThread)
                 }
             } else {
                 VStack(spacing: 16) {
@@ -823,8 +860,11 @@ private struct ConversationDestinationScreen: View {
                 threadKey.threadId
             )
             appModel.store.setActiveThread(key: threadKey)
+            if appModel.snapshot?.threadSnapshot(for: threadKey) == nil {
+                _ = await appModel.ensureThreadLoaded(key: threadKey)
+            }
             await appModel.loadConversationMetadataIfNeeded(serverId: threadKey.serverId)
-            if let thread = appModel.snapshot?.threads.first(where: { $0.key == threadKey }),
+            if let thread = conversationThread,
                let cwd = thread.info.cwd?.trimmingCharacters(in: .whitespacesAndNewlines),
                !cwd.isEmpty {
                 workDir = cwd

@@ -1,7 +1,135 @@
 import SwiftUI
 import Textual
+import UIKit
 
 // MARK: - Reusable bubble components
+
+enum LitterMarkdownStyleVariant {
+    case content
+    case system
+}
+
+private extension VerticalAlignment {
+    private enum LitterFirstTextCenterAlignment: AlignmentID {
+        static func defaultValue(in context: ViewDimensions) -> CGFloat {
+            let firstLineHeight =
+                context.height - (context[.lastTextBaseline] - context[.firstTextBaseline])
+            return firstLineHeight / 2
+        }
+    }
+
+    static let litterFirstTextCenter = Self(LitterFirstTextCenterAlignment.self)
+}
+
+struct LitterMarkdownView: View {
+    let markdown: String
+    var style: LitterMarkdownStyleVariant = .content
+    var bodySize: CGFloat = 14
+    var codeSize: CGFloat = 13
+    var selectionEnabled = true
+
+    var body: some View {
+        renderedMarkdown(selectionEnabled: selectionEnabled)
+    }
+
+    @ViewBuilder
+    private func renderedMarkdown(selectionEnabled: Bool) -> some View {
+        switch style {
+        case .content:
+            StructuredText(markdown: markdown)
+                .litterContentMarkdown(
+                    bodySize: bodySize,
+                    codeSize: codeSize,
+                    selectionEnabled: selectionEnabled
+                )
+        case .system:
+            StructuredText(markdown: markdown)
+                .litterSystemMarkdown(
+                    bodySize: bodySize,
+                    codeSize: codeSize,
+                    selectionEnabled: selectionEnabled
+                )
+        }
+    }
+}
+
+struct InlineSelectableMarkdownMessage<Content: View>: View {
+    let markdown: String
+    var style: LitterMarkdownStyleVariant = .content
+    var bodySize: CGFloat = 14
+    var codeSize: CGFloat = 13
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
+    }
+}
+
+struct SelectableMarkdownTextView: UIViewRepresentable {
+    let markdown: String
+    let style: LitterMarkdownStyleVariant
+    let fontSize: CGFloat
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.backgroundColor = .clear
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isScrollEnabled = false
+        textView.showsVerticalScrollIndicator = false
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.adjustsFontForContentSizeCategory = true
+        textView.dataDetectorTypes = []
+        textView.textDragInteraction?.isEnabled = true
+        return textView
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        uiView.attributedText = attributedText()
+        uiView.tintColor = UIColor(LitterTheme.accent)
+        uiView.textColor = UIColor(foregroundColor)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        let width = proposal.width ?? uiView.bounds.width
+        guard width > 0 else { return nil }
+        let fittingSize = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: ceil(fittingSize.height))
+    }
+
+    private var foregroundColor: Color {
+        switch style {
+        case .content:
+            return LitterTheme.textBody
+        case .system:
+            return LitterTheme.textSystem
+        }
+    }
+
+    private func attributedText() -> NSAttributedString {
+        let baseFont = UIFont(name: LitterFont.markdownFontName, size: fontSize)
+            ?? UIFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: baseFont,
+            .foregroundColor: UIColor(foregroundColor)
+        ]
+
+        if let attributed = try? AttributedString(
+            markdown: markdown,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .full,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        ) {
+            let mutable = NSMutableAttributedString(attributed)
+            mutable.addAttributes(attributes, range: NSRange(location: 0, length: mutable.length))
+            return mutable
+        }
+
+        return NSAttributedString(string: markdown, attributes: attributes)
+    }
+}
 
 struct UserBubble: View {
     let text: String
@@ -51,6 +179,7 @@ struct AssistantBubble: View, Equatable {
     var label: String? = nil
     var compact: Bool = false
     var themeVersion: Int = 0
+    var allowsInlineSelection: Bool = true
     @ScaledMetric(relativeTo: .body) private var mdBodySize: CGFloat = 14
     @ScaledMetric(relativeTo: .footnote) private var mdCodeSize: CGFloat = 13
 
@@ -58,13 +187,15 @@ struct AssistantBubble: View, Equatable {
         text: String,
         label: String? = nil,
         compact: Bool = false,
-        themeVersion: Int = 0
+        themeVersion: Int = 0,
+        allowsInlineSelection: Bool = true
     ) {
         self.markdownString = text
         self.markdownIdentity = text.hashValue
         self.label = label
         self.compact = compact
         self.themeVersion = themeVersion
+        self.allowsInlineSelection = allowsInlineSelection
     }
 
     init(
@@ -72,36 +203,59 @@ struct AssistantBubble: View, Equatable {
         markdownIdentity: Int,
         label: String? = nil,
         compact: Bool = false,
-        themeVersion: Int = 0
+        themeVersion: Int = 0,
+        allowsInlineSelection: Bool = true
     ) {
         self.markdownString = markdownString
         self.markdownIdentity = markdownIdentity
         self.label = label
         self.compact = compact
         self.themeVersion = themeVersion
+        self.allowsInlineSelection = allowsInlineSelection
     }
 
     static func == (lhs: AssistantBubble, rhs: AssistantBubble) -> Bool {
         lhs.markdownIdentity == rhs.markdownIdentity &&
         lhs.label == rhs.label &&
         lhs.compact == rhs.compact &&
-        lhs.themeVersion == rhs.themeVersion
+        lhs.themeVersion == rhs.themeVersion &&
+        lhs.allowsInlineSelection == rhs.allowsInlineSelection
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: compact ? 4 : 8) {
-                if let label {
-                    Text(label)
-                        .litterFont(.caption2, weight: .semibold)
-                        .foregroundColor(LitterTheme.textSecondary)
+            if allowsInlineSelection {
+                InlineSelectableMarkdownMessage(
+                    markdown: markdownString,
+                    style: .content,
+                    bodySize: compact ? 12 : mdBodySize,
+                    codeSize: compact ? 11 : mdCodeSize
+                ) {
+                    bubbleContent
                 }
-                StructuredText(markdown: markdownString)
-                    .litterContentMarkdown(bodySize: compact ? 12 : mdBodySize, codeSize: compact ? 11 : mdCodeSize)
-                    .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                bubbleContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: compact ? 8 : 20)
+        }
+    }
+
+    private var bubbleContent: some View {
+        VStack(alignment: .leading, spacing: compact ? 4 : 8) {
+            if let label {
+                Text(label)
+                    .litterFont(.caption2, weight: .semibold)
+                    .foregroundColor(LitterTheme.textSecondary)
+            }
+            LitterMarkdownView(
+                markdown: markdownString,
+                style: .content,
+                bodySize: compact ? 12 : mdBodySize,
+                codeSize: compact ? 11 : mdCodeSize
+            )
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -123,7 +277,8 @@ struct StreamingAssistantBubble: View {
             markdownString: renderedText,
             markdownIdentity: renderedText.hashValue,
             label: label,
-            themeVersion: themeVersion
+            themeVersion: themeVersion,
+            allowsInlineSelection: false
         )
             .equatable()
             .opacity(snapshotOpacity)
@@ -304,29 +459,40 @@ struct MessageBubbleView: View {
                 }
             } else {
                 // Inline images — need segment-based rendering
-                HStack(alignment: .top, spacing: 0) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let assistantLabel = assistantAgentLabel {
-                            Text(assistantLabel)
-                                .litterFont(.caption2, weight: .semibold)
-                                .foregroundColor(LitterTheme.textSecondary)
-                        }
-                        ForEach(parsed) { segment in
-                            switch segment.kind {
-                            case .markdown(let content, _):
-                                StructuredText(markdown: content)
-                                    .litterContentMarkdown(bodySize: mdBodySize, codeSize: mdCodeSize)
-                            case .image(let uiImage):
-                                Image(uiImage: uiImage)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(maxHeight: 300)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                InlineSelectableMarkdownMessage(
+                    markdown: message.text,
+                    style: .content,
+                    bodySize: mdBodySize,
+                    codeSize: mdCodeSize
+                ) {
+                    HStack(alignment: .top, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let assistantLabel = assistantAgentLabel {
+                                Text(assistantLabel)
+                                    .litterFont(.caption2, weight: .semibold)
+                                    .foregroundColor(LitterTheme.textSecondary)
+                            }
+                            ForEach(parsed) { segment in
+                                switch segment.kind {
+                                case .markdown(let content, _):
+                                    LitterMarkdownView(
+                                        markdown: content,
+                                        style: .content,
+                                        bodySize: mdBodySize,
+                                        codeSize: mdCodeSize
+                                    )
+                                case .image(let uiImage):
+                                    Image(uiImage: uiImage)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(maxHeight: 300)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 20)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    Spacer(minLength: 20)
                 }
             }
         }
@@ -401,8 +567,12 @@ struct MessageBubbleView: View {
             }
 
             if !markdown.isEmpty {
-                StructuredText(markdown: markdown)
-                    .litterSystemMarkdown(bodySize: mdSystemBodySize, codeSize: mdSystemCodeSize)
+                LitterMarkdownView(
+                    markdown: markdown,
+                    style: .system,
+                    bodySize: mdSystemBodySize,
+                    codeSize: mdSystemCodeSize
+                )
                     .padding(.top, 8)
             }
         }
@@ -539,10 +709,12 @@ struct LitterThematicBreakStyle: StructuredText.ThematicBreakStyle {
 
 struct LitterListItemStyle: StructuredText.ListItemStyle {
     let topBottom: CGFloat
+    @ScaledMetric(relativeTo: .body) private var markerColumnWidth: CGFloat = 16
 
     func makeBody(configuration: Configuration) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .litterFirstTextCenter, spacing: 8) {
             configuration.marker
+                .frame(width: markerColumnWidth, alignment: .center)
             configuration.block
         }
         .textual.blockSpacing(.init(top: topBottom, bottom: topBottom))
@@ -653,15 +825,21 @@ private struct ScaledContentMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     let baseBodySize: CGFloat
     let baseCodeSize: CGFloat
+    let selectionEnabled: Bool
 
     func body(content: Content) -> some View {
         let scaledBody = baseBodySize * textScale
         let scaledCode = baseCodeSize * textScale
-        content
+        let styledContent = content
             .font(.custom(LitterFont.markdownFontName, size: scaledBody))
             .foregroundStyle(LitterTheme.textBody)
             .textual.structuredTextStyle(LitterStructuredStyle(bodySize: scaledBody, codeSize: scaledCode))
-            .textual.textSelection(.enabled)
+
+        if selectionEnabled {
+            styledContent.textual.textSelection(.enabled)
+        } else {
+            styledContent
+        }
     }
 }
 
@@ -669,25 +847,51 @@ private struct ScaledSystemMarkdownModifier: ViewModifier {
     @Environment(\.textScale) private var textScale
     let baseBodySize: CGFloat
     let baseCodeSize: CGFloat
+    let selectionEnabled: Bool
 
     func body(content: Content) -> some View {
         let scaledBody = baseBodySize * textScale
         let scaledCode = baseCodeSize * textScale
-        content
+        let styledContent = content
             .font(.custom(LitterFont.markdownFontName, size: scaledBody))
             .foregroundStyle(LitterTheme.textSystem)
             .textual.structuredTextStyle(LitterSystemStructuredStyle(bodySize: scaledBody, codeSize: scaledCode))
-            .textual.textSelection(.enabled)
+
+        if selectionEnabled {
+            styledContent.textual.textSelection(.enabled)
+        } else {
+            styledContent
+        }
     }
 }
 
 extension View {
-    func litterContentMarkdown(bodySize: CGFloat = 14, codeSize: CGFloat = 13) -> some View {
-        modifier(ScaledContentMarkdownModifier(baseBodySize: bodySize, baseCodeSize: codeSize))
+    func litterContentMarkdown(
+        bodySize: CGFloat = 14,
+        codeSize: CGFloat = 13,
+        selectionEnabled: Bool = true
+    ) -> some View {
+        modifier(
+            ScaledContentMarkdownModifier(
+                baseBodySize: bodySize,
+                baseCodeSize: codeSize,
+                selectionEnabled: selectionEnabled
+            )
+        )
     }
 
-    func litterSystemMarkdown(bodySize: CGFloat = 13, codeSize: CGFloat = 12) -> some View {
-        modifier(ScaledSystemMarkdownModifier(baseBodySize: bodySize, baseCodeSize: codeSize))
+    func litterSystemMarkdown(
+        bodySize: CGFloat = 13,
+        codeSize: CGFloat = 12,
+        selectionEnabled: Bool = true
+    ) -> some View {
+        modifier(
+            ScaledSystemMarkdownModifier(
+                baseBodySize: bodySize,
+                baseCodeSize: codeSize,
+                selectionEnabled: selectionEnabled
+            )
+        )
     }
 }
 

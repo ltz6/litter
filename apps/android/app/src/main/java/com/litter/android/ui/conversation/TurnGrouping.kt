@@ -1,5 +1,11 @@
 package com.litter.android.ui.conversation
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
@@ -21,13 +27,24 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.litter.android.ui.LitterTextStyle
 import com.litter.android.ui.LitterTheme
+import com.litter.android.ui.LocalTextScale
+import com.litter.android.ui.scaled
+import uniffi.codex_mobile_client.AppOperationStatus
+import uniffi.codex_mobile_client.HydratedCommandActionKind
 import uniffi.codex_mobile_client.HydratedConversationItem
 import uniffi.codex_mobile_client.HydratedConversationItemContent
+import uniffi.codex_mobile_client.MessagePhase
 
 /**
  * A group of conversation items belonging to the same turn.
@@ -42,7 +59,13 @@ data class TranscriptTurn(
             ?.let { (it.content as HydratedConversationItemContent.User).v1.text }
 
     val assistantSnippet: String?
-        get() = items.lastOrNull { it.content is HydratedConversationItemContent.Assistant }
+        get() = (
+            items.firstOrNull {
+                val assistant = (it.content as? HydratedConversationItemContent.Assistant)?.v1
+                assistant?.phase == MessagePhase.FINAL_ANSWER
+            }
+                ?: items.lastOrNull { it.content is HydratedConversationItemContent.Assistant }
+            )
             ?.let { (it.content as HydratedConversationItemContent.Assistant).v1.text }
             ?.take(120)
 
@@ -174,6 +197,7 @@ private fun MetadataBadge(text: String, color: androidx.compose.ui.graphics.Colo
  * into a collapsed "Explored N locations" row.
  */
 data class ExplorationGroup(
+    val id: String,
     val items: List<HydratedConversationItem>,
 )
 
@@ -186,13 +210,18 @@ sealed class TimelineEntry {
     data class Exploration(val group: ExplorationGroup) : TimelineEntry()
 }
 
-fun buildTimelineEntries(items: List<HydratedConversationItem>): List<TimelineEntry> {
+fun buildTimelineEntries(
+    items: List<HydratedConversationItem>,
+    isLive: Boolean,
+): List<TimelineEntry> {
     val result = mutableListOf<TimelineEntry>()
     var explorationRun = mutableListOf<HydratedConversationItem>()
 
     fun flushExploration() {
-        if (explorationRun.size >= 3) {
-            result.add(TimelineEntry.Exploration(ExplorationGroup(explorationRun.toList())))
+        if (explorationRun.isEmpty()) return
+        if (isLive || explorationRun.size > 1) {
+            val id = explorationRun.firstOrNull()?.id ?: "exploration"
+            result.add(TimelineEntry.Exploration(ExplorationGroup(id = "exploration-$id", items = explorationRun.toList())))
         } else {
             explorationRun.forEach { result.add(TimelineEntry.Single(it)) }
         }
@@ -202,7 +231,7 @@ fun buildTimelineEntries(items: List<HydratedConversationItem>): List<TimelineEn
     for (item in items) {
         val content = item.content
         if (content is HydratedConversationItemContent.CommandExecution &&
-            content.v1.output.isNullOrBlank()
+            content.v1.isPureExploration()
         ) {
             explorationRun.add(item)
         } else {
@@ -219,7 +248,20 @@ fun buildTimelineEntries(items: List<HydratedConversationItem>): List<TimelineEn
  */
 @Composable
 fun ExplorationGroupRow(group: ExplorationGroup) {
+    val textScale = LocalTextScale.current
     var expanded by remember { mutableStateOf(false) }
+    val isActive = remember(group.items) { group.items.any { it.isInProgressExplorationItem() } }
+    val shimmerProgress by rememberInfiniteTransition(label = "exploration-header-shimmer").animateFloat(
+        initialValue = -1f,
+        targetValue = 2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "exploration-header-shimmer-progress",
+    )
+    val bulletSize = (6f * textScale).dp
+    val bulletTopPadding = (5f * textScale).dp
 
     Column(
         modifier = Modifier
@@ -237,29 +279,127 @@ fun ExplorationGroupRow(group: ExplorationGroup) {
             Text(
                 text = if (expanded) "▼" else "▶",
                 color = LitterTheme.textMuted,
-                fontSize = 12.sp,
+                fontSize = LitterTextStyle.caption.scaled,
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = "Explored ${group.items.size} locations",
-                color = LitterTheme.textSecondary,
-                fontSize = 12.sp,
+                text = if (isActive) "Exploring ${group.items.size} locations" else "Explored ${group.items.size} locations",
+                color = if (isActive) LitterTheme.textPrimary else LitterTheme.textSecondary,
+                fontSize = LitterTextStyle.caption.scaled,
+                modifier = Modifier
+                    .weight(1f)
+                    .explorationHeaderShimmer(active = isActive, progress = shimmerProgress),
             )
         }
 
         if (expanded) {
             for (item in group.items) {
                 val cmd = (item.content as HydratedConversationItemContent.CommandExecution).v1
-                Text(
-                    text = "$ ${cmd.command}",
-                    color = LitterTheme.toolCallCommand,
-                    fontSize = 11.sp,
-                    fontFamily = com.litter.android.ui.LitterTheme.monoFont,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(start = 24.dp, top = 2.dp),
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 24.dp, top = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Spacer(
+                        modifier = Modifier
+                            .padding(top = bulletTopPadding)
+                            .width(bulletSize)
+                            .height(bulletSize)
+                            .background(
+                                color = if (cmd.status == AppOperationStatus.PENDING || cmd.status == AppOperationStatus.IN_PROGRESS) {
+                                    LitterTheme.warning
+                                } else {
+                                    LitterTheme.textMuted
+                                },
+                                shape = RoundedCornerShape(percent = 50),
+                            ),
+                    )
+                    Text(
+                        text = explorationLabel(cmd),
+                        color = LitterTheme.textSecondary,
+                        fontSize = LitterTextStyle.caption.scaled,
+                        maxLines = Int.MAX_VALUE,
+                        overflow = TextOverflow.Clip,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
         }
+    }
+}
+
+private fun uniffi.codex_mobile_client.HydratedCommandExecutionData.isPureExploration(): Boolean {
+    if (actions.isEmpty()) return false
+    return actions.all { action ->
+        when (action.kind) {
+            HydratedCommandActionKind.READ,
+            HydratedCommandActionKind.SEARCH,
+            HydratedCommandActionKind.LIST_FILES,
+            -> true
+
+            HydratedCommandActionKind.UNKNOWN -> false
+        }
+    }
+}
+
+private fun HydratedConversationItem.isInProgressExplorationItem(): Boolean {
+    val content = content as? HydratedConversationItemContent.CommandExecution ?: return false
+    return content.v1.status == AppOperationStatus.PENDING || content.v1.status == AppOperationStatus.IN_PROGRESS
+}
+
+private fun explorationLabel(data: uniffi.codex_mobile_client.HydratedCommandExecutionData): String {
+    val action = data.actions.firstOrNull() ?: return data.command
+    return when (action.kind) {
+        HydratedCommandActionKind.READ -> {
+            action.path?.let { "Read ${workspaceTitle(it)}" } ?: action.command
+        }
+
+        HydratedCommandActionKind.SEARCH -> {
+            when {
+                !action.query.isNullOrBlank() && !action.path.isNullOrBlank() ->
+                    "Searched for ${action.query} in ${workspaceTitle(action.path!!)}"
+                !action.query.isNullOrBlank() ->
+                    "Searched for ${action.query}"
+                else -> action.command
+            }
+        }
+
+        HydratedCommandActionKind.LIST_FILES -> {
+            action.path?.let { "Listed files in ${workspaceTitle(it)}" } ?: action.command
+        }
+
+        HydratedCommandActionKind.UNKNOWN -> data.command
+    }
+}
+
+private fun workspaceTitle(path: String): String {
+    val normalized = path.replace('\\', '/').trimEnd('/')
+    val lastSegment = normalized.substringAfterLast('/', normalized)
+    return if (lastSegment.isBlank()) path else lastSegment
+}
+
+private fun Modifier.explorationHeaderShimmer(active: Boolean, progress: Float): Modifier {
+    if (!active) return this
+    return drawWithContent {
+        drawContent()
+        val width = size.width
+        val shimmerWidth = width * 0.35f
+        val startX = (width + shimmerWidth) * progress - shimmerWidth
+        drawRect(
+            brush = Brush.horizontalGradient(
+                colors = listOf(
+                    Color.Transparent,
+                    Color.White.copy(alpha = 0.3f),
+                    Color.Transparent,
+                ),
+                startX = startX,
+                endX = startX + shimmerWidth,
+            ),
+            topLeft = Offset.Zero,
+            size = size,
+            blendMode = BlendMode.SrcAtop,
+        )
     }
 }

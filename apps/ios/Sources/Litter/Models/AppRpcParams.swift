@@ -5,7 +5,7 @@ struct AppThreadLaunchConfig: Equatable, Sendable {
     var approvalPolicy: AskForApproval?
     var sandbox: SandboxMode?
     var developerInstructions: String?
-    var persistExtendedHistory: Bool
+    var persistExtendedHistory: Bool = true
 
     func threadStartParams(cwd: String) -> ThreadStartParams {
         ThreadStartParams(
@@ -25,7 +25,7 @@ struct AppThreadLaunchConfig: Equatable, Sendable {
             dynamicTools: nil,
             mockExperimentalField: nil,
             experimentalRawEvents: false,
-            persistExtendedHistory: persistExtendedHistory
+            persistExtendedHistory: true
         )
     }
 
@@ -45,7 +45,7 @@ struct AppThreadLaunchConfig: Equatable, Sendable {
             baseInstructions: nil,
             developerInstructions: developerInstructions,
             personality: nil,
-            persistExtendedHistory: persistExtendedHistory
+            persistExtendedHistory: true
         )
     }
 
@@ -64,7 +64,7 @@ struct AppThreadLaunchConfig: Equatable, Sendable {
             baseInstructions: nil,
             developerInstructions: developerInstructions,
             ephemeral: false,
-            persistExtendedHistory: persistExtendedHistory
+            persistExtendedHistory: true
         )
     }
 }

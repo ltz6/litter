@@ -23,6 +23,7 @@ struct ConversationAssistantMessageData: Equatable {
     var text: String
     var agentNickname: String?
     var agentRole: String?
+    var phase: MessagePhase?
 }
 
 struct ConversationReasoningData: Equatable {
@@ -347,6 +348,7 @@ struct ConversationItem: Identifiable, Equatable {
             hasher.combine(data.text)
             hasher.combine(data.agentNickname)
             hasher.combine(data.agentRole)
+            hasher.combine(data.phase)
         case .reasoning(let data):
             hasher.combine("reasoning")
             hasher.combine(data.summary)
@@ -509,7 +511,8 @@ private extension HydratedConversationItemContent {
                 ConversationAssistantMessageData(
                     text: data.text,
                     agentNickname: data.agentNickname,
-                    agentRole: data.agentRole
+                    agentRole: data.agentRole,
+                    phase: data.phase
                 )
             )
         case .reasoning(let data):
@@ -555,6 +558,12 @@ private extension HydratedConversationItemContent {
                     outputDelta: nil
                 )
             )
+        case .turnDiff(let data):
+            return .turnDiff(
+                ConversationTurnDiffData(
+                    diff: data.diff
+                )
+            )
         case .mcpToolCall(let data):
             return .mcpToolCall(
                 ConversationMcpToolCallData(
@@ -567,7 +576,7 @@ private extension HydratedConversationItemContent {
                     structuredContentJSON: data.structuredContentJson,
                     rawOutputJSON: data.rawOutputJson,
                     errorMessage: data.errorMessage,
-                    progressMessages: []
+                    progressMessages: data.progressMessages
                 )
             )
         case .dynamicToolCall(let data):
@@ -610,11 +619,27 @@ private extension HydratedConversationItemContent {
             switch data {
             case .contextCompaction(let isComplete):
                 return .divider(.contextCompaction(isComplete: isComplete))
+            case .modelRerouted(let fromModel, let toModel, let reason):
+                return .divider(
+                    .modelRerouted(
+                        fromModel: fromModel,
+                        toModel: toModel,
+                        reason: reason
+                    )
+                )
             case .reviewEntered(let review):
                 return .divider(.reviewEntered(review))
             case .reviewExited(let review):
                 return .divider(.reviewExited(review))
             }
+        case .error(let data):
+            return .error(
+                ConversationSystemErrorData(
+                    title: data.title,
+                    message: data.message,
+                    details: data.details
+                )
+            )
         case .note(let data):
             return .note(ConversationNoteData(title: data.title, body: data.body))
         }

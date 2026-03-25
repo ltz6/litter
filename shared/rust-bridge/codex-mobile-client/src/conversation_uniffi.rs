@@ -1,4 +1,5 @@
 use crate::conversation;
+use crate::types::generated::MessagePhase;
 use crate::uniffi_shared::{AppOperationStatus, AppSubagentStatus};
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -20,11 +21,13 @@ pub enum HydratedConversationItemContent {
     ProposedPlan(HydratedProposedPlanData),
     CommandExecution(HydratedCommandExecutionData),
     FileChange(HydratedFileChangeData),
+    TurnDiff(HydratedTurnDiffData),
     McpToolCall(HydratedMcpToolCallData),
     DynamicToolCall(HydratedDynamicToolCallData),
     MultiAgentAction(HydratedMultiAgentActionData),
     WebSearch(HydratedWebSearchData),
     Divider(HydratedDividerData),
+    Error(HydratedErrorData),
     Note(HydratedNoteData),
 }
 
@@ -39,6 +42,7 @@ pub struct HydratedAssistantMessageData {
     pub text: String,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub phase: Option<MessagePhase>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -113,6 +117,11 @@ pub struct HydratedFileChangeEntryData {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct HydratedTurnDiffData {
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct HydratedMcpToolCallData {
     pub server: String,
     pub tool: String,
@@ -123,6 +132,7 @@ pub struct HydratedMcpToolCallData {
     pub structured_content_json: Option<String>,
     pub raw_output_json: Option<String>,
     pub error_message: Option<String>,
+    pub progress_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -161,15 +171,33 @@ pub struct HydratedWebSearchData {
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum HydratedDividerData {
-    ContextCompaction { is_complete: bool },
-    ReviewEntered { review: String },
-    ReviewExited { review: String },
+    ContextCompaction {
+        is_complete: bool,
+    },
+    ModelRerouted {
+        from_model: Option<String>,
+        to_model: String,
+        reason: Option<String>,
+    },
+    ReviewEntered {
+        review: String,
+    },
+    ReviewExited {
+        review: String,
+    },
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct HydratedNoteData {
     pub title: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HydratedErrorData {
+    pub title: String,
+    pub message: String,
+    pub details: Option<String>,
 }
 
 impl From<conversation::ConversationItem> for HydratedConversationItem {
@@ -198,6 +226,7 @@ impl From<conversation::ConversationItemContent> for HydratedConversationItemCon
                 text: data.text,
                 agent_nickname: data.agent_nickname,
                 agent_role: data.agent_role,
+                phase: data.phase,
             }),
             ItemContent::Reasoning(data) => Self::Reasoning(HydratedReasoningData {
                 summary: data.summary,
@@ -225,19 +254,19 @@ impl From<conversation::ConversationItemContent> for HydratedConversationItemCon
                 status: AppOperationStatus::from_raw(&data.status),
                 changes: data.changes.into_iter().map(Into::into).collect(),
             }),
-            ItemContent::McpToolCall(data) => {
-                Self::McpToolCall(HydratedMcpToolCallData {
-                    server: data.server,
-                    tool: data.tool,
-                    status: AppOperationStatus::from_raw(&data.status),
-                    duration_ms: data.duration_ms,
-                    arguments_json: data.arguments_json,
-                    content_summary: data.content_summary,
-                    structured_content_json: data.structured_content_json,
-                    raw_output_json: data.raw_output_json,
-                    error_message: data.error_message,
-                })
-            }
+            ItemContent::TurnDiff(data) => Self::TurnDiff(HydratedTurnDiffData { diff: data.diff }),
+            ItemContent::McpToolCall(data) => Self::McpToolCall(HydratedMcpToolCallData {
+                server: data.server,
+                tool: data.tool,
+                status: AppOperationStatus::from_raw(&data.status),
+                duration_ms: data.duration_ms,
+                arguments_json: data.arguments_json,
+                content_summary: data.content_summary,
+                structured_content_json: data.structured_content_json,
+                raw_output_json: data.raw_output_json,
+                error_message: data.error_message,
+                progress_messages: data.progress_messages,
+            }),
             ItemContent::DynamicToolCall(data) => {
                 Self::DynamicToolCall(HydratedDynamicToolCallData {
                     tool: data.tool,
@@ -264,6 +293,11 @@ impl From<conversation::ConversationItemContent> for HydratedConversationItemCon
                 is_in_progress: data.is_in_progress,
             }),
             ItemContent::Divider(data) => Self::Divider(data.into()),
+            ItemContent::Error(data) => Self::Error(HydratedErrorData {
+                title: data.title,
+                message: data.message,
+                details: data.details,
+            }),
             ItemContent::Note(data) => Self::Note(HydratedNoteData {
                 title: data.title,
                 body: data.body,
@@ -328,6 +362,15 @@ impl From<conversation::DividerData> for HydratedDividerData {
             conversation::DividerData::ContextCompaction { is_complete } => {
                 Self::ContextCompaction { is_complete }
             }
+            conversation::DividerData::ModelRerouted {
+                from_model,
+                to_model,
+                reason,
+            } => Self::ModelRerouted {
+                from_model,
+                to_model,
+                reason,
+            },
             conversation::DividerData::ReviewEntered { review } => Self::ReviewEntered { review },
             conversation::DividerData::ReviewExited { review } => Self::ReviewExited { review },
         }

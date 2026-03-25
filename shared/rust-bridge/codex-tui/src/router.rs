@@ -1,9 +1,6 @@
 use crate::screens::{
-    conversation::ConversationState,
-    discovery::DiscoveryState,
-    home::HomeState,
-    sessions::SessionsState,
-    settings::SettingsState,
+    conversation::ConversationState, discovery::DiscoveryState, home::HomeState,
+    sessions::SessionsState, settings::SettingsState,
 };
 
 #[derive(Debug)]
@@ -25,8 +22,13 @@ pub enum Overlay {
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    DeleteSession { server_id: String, thread_id: String },
-    DisconnectServer { server_id: String },
+    DeleteSession {
+        server_id: String,
+        thread_id: String,
+    },
+    DisconnectServer {
+        server_id: String,
+    },
 }
 
 pub struct Router {

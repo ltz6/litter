@@ -30,10 +30,6 @@ pub extern "C" fn aec_process_render(handle: *mut c_void, samples: *mut f32, cou
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn aec_process_capture(
-    handle: *mut c_void,
-    samples: *mut f32,
-    count: usize,
-) -> i32 {
+pub extern "C" fn aec_process_capture(handle: *mut c_void, samples: *mut f32, count: usize) -> i32 {
     codex_ios_audio::aec_process_capture(handle, samples, count)
 }
