@@ -18,10 +18,10 @@ final class NetworkMonitor {
                 let wasAvailable = self.isNetworkAvailable
                 self.isNetworkAvailable = satisfied
                 if satisfied && !wasAvailable {
-                    NSLog("[network] path restored")
+                    LLog.info("network", "path restored")
                     self.onNetworkRestored?()
                 } else if !satisfied && wasAvailable {
-                    NSLog("[network] path lost")
+                    LLog.warn("network", "path lost")
                     self.onNetworkLost?()
                 }
             }

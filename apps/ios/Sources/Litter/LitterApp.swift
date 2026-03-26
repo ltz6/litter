@@ -21,6 +21,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         codex_ios_system_init()
+        LLog.bootstrap()
         // Pre-initialize Rust bridges (tokio runtime) on a background thread
         // before SwiftUI accesses AppModel.shared, avoiding a priority inversion
         // where the main thread blocks on lower-QoS tokio worker init.
@@ -117,7 +118,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        NSLog("[push] device token received (%d bytes): %@", deviceToken.count, hex)
+        LLog.info("push", "device token received", fields: ["bytes": deviceToken.count, "hex": hex])
         if let appRuntime {
             appRuntime.setDevicePushToken(deviceToken)
         } else {
@@ -126,11 +127,11 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        NSLog("[push] registration failed: %@", error.localizedDescription)
+        LLog.error("push", "registration failed", error: error)
     }
 
     func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any], fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
-        NSLog("[push] background push received")
+        LLog.info("push", "background push received")
         guard let appRuntime else {
             completionHandler(.noData)
             return
@@ -318,6 +319,9 @@ private struct HomeNavigationView: View {
         case sessions(serverId: String, title: String)
         case conversation(ThreadKey)
         case realtimeVoice(ThreadKey)
+        case conversationInfo(ThreadKey)
+        case wallpaperSelection(ThreadKey)
+        case wallpaperAdjust(ThreadKey)
     }
 
     private var connectedServerOptions: [DirectoryPickerServerOption] {
@@ -393,7 +397,8 @@ private struct HomeNavigationView: View {
                         bottomInset: bottomInset,
                         onBack: popCurrentRoute,
                         onResumeSessions: { showSessions(for: $0) },
-                        onOpenConversation: { replaceTopConversation(with: $0) }
+                        onOpenConversation: { replaceTopConversation(with: $0) },
+                        onInfo: { navigationPath.append(.conversationInfo(threadKey)) }
                     )
                 case let .realtimeVoice(threadKey):
                     RealtimeVoiceScreen(
@@ -408,6 +413,25 @@ private struct HomeNavigationView: View {
                     )
                     .toolbar(.hidden, for: .navigationBar)
                     .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                case let .conversationInfo(threadKey):
+                    ConversationInfoView(
+                        threadKey: threadKey,
+                        onOpenWallpaper: { navigationPath.append(.wallpaperSelection(threadKey)) },
+                        onOpenConversation: { replaceTopConversation(with: $0) }
+                    )
+                    .toolbar(.hidden, for: .navigationBar)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                case let .wallpaperSelection(threadKey):
+                    WallpaperSelectionView(
+                        threadKey: threadKey,
+                        onSelectWallpaper: { navigationPath.append(.wallpaperAdjust(threadKey)) }
+                    )
+                    .toolbar(.hidden, for: .navigationBar)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                case let .wallpaperAdjust(threadKey):
+                    WallpaperAdjustView(threadKey: threadKey)
+                        .toolbar(.hidden, for: .navigationBar)
+                        .background(LitterTheme.backgroundGradient.ignoresSafeArea())
                 }
             }
         }
@@ -751,6 +775,7 @@ private struct ConversationDestinationScreen: View {
     let onBack: () -> Void
     let onResumeSessions: (String) -> Void
     let onOpenConversation: (ThreadKey) -> Void
+    var onInfo: (() -> Void)?
 
     private var conversationThread: AppThreadSnapshot? {
         if let exact = appModel.snapshot?.threadSnapshot(for: threadKey) {
@@ -803,6 +828,7 @@ private struct ConversationDestinationScreen: View {
                     HeaderView(
                         thread: conversationThread,
                         onBack: onBack,
+                        onInfo: onInfo,
                         topInset: topInset
                     )
                     .zIndex(2)

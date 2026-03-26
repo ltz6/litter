@@ -25,6 +25,8 @@ PATCH_FILES=(
 SYNC_MODE="--preserve-current"
 DEVICE_ONLY=0
 FAST_DEVICE=0
+SIM_ONLY=0
+FAST_SIM=0
 FORCE_BINDINGS=0
 SKIP_BINDINGS=0
 CARGO_FEATURES=""
@@ -45,6 +47,12 @@ for arg in "$@"; do
       PROFILE="debug"
       CARGO_PROFILE_FLAG=""
       ;;
+    --fast-sim)
+      FAST_SIM=1
+      SIM_ONLY=1
+      PROFILE="debug"
+      CARGO_PROFILE_FLAG=""
+      ;;
     --force-bindings)
       FORCE_BINDINGS=1
       ;;
@@ -55,7 +63,7 @@ for arg in "$@"; do
       CARGO_FEATURES="--features rpc-trace"
       ;;
     *)
-      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--device-only] [--fast-device] [--force-bindings] [--skip-bindings] [--rpc-trace]" >&2
+      echo "usage: $(basename "$0") [--preserve-current|--recorded-gitlink] [--device-only] [--fast-device] [--fast-sim] [--force-bindings] [--skip-bindings] [--rpc-trace]" >&2
       exit 1
       ;;
   esac
@@ -178,6 +186,8 @@ maybe_generate_swift_bindings
 echo "==> Installing iOS targets..."
 if [ "$DEVICE_ONLY" -eq 1 ]; then
   rustup target add aarch64-apple-ios
+elif [ "$SIM_ONLY" -eq 1 ]; then
+  rustup target add aarch64-apple-ios-sim
 else
   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 fi
@@ -186,6 +196,10 @@ if [ "$DEVICE_ONLY" -eq 1 ]; then
   echo "==> Building codex-mobile-client for aarch64-apple-ios ($PROFILE)..."
   cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios --crate-type staticlib $CARGO_FEATURES
   copy_device_artifact
+elif [ "$SIM_ONLY" -eq 1 ]; then
+  echo "==> Building codex-mobile-client for aarch64-apple-ios-sim ($PROFILE)..."
+  cargo rustc --manifest-path "$RUST_BRIDGE_DIR/Cargo.toml" -p codex-mobile-client $CARGO_PROFILE_FLAG --target aarch64-apple-ios-sim --crate-type staticlib $CARGO_FEATURES
+  copy_sim_artifact "$RUST_BRIDGE_DIR/target/aarch64-apple-ios-sim/$PROFILE/libcodex_mobile_client.a"
 else
   # Build device and simulator targets in parallel
   echo "==> Building codex-mobile-client for aarch64-apple-ios + aarch64-apple-ios-sim ($PROFILE) in parallel..."
@@ -221,6 +235,14 @@ fi
 if [ "$FAST_DEVICE" -eq 1 ]; then
   echo "==> Fast device build complete"
   echo "==> Device staticlib: $GENERATED_DEVICE_DIR/libcodex_mobile_client.a"
+  echo "==> Headers: $GENERATED_HEADERS_DIR"
+  echo "==> Swift bindings: $UNIFFI_OUT"
+  exit 0
+fi
+
+if [ "$FAST_SIM" -eq 1 ]; then
+  echo "==> Fast simulator build complete"
+  echo "==> Simulator staticlib: $GENERATED_SIM_DIR/libcodex_mobile_client.a"
   echo "==> Headers: $GENERATED_HEADERS_DIR"
   echo "==> Swift bindings: $UNIFFI_OUT"
   exit 0

@@ -91,15 +91,15 @@ final class ThemeManager {
 
     private func loadThemeIndex() {
         guard let url = Bundle.main.url(forResource: "theme-manifest", withExtension: "json") else {
-            NSLog("[ThemeManager] theme-manifest.json not found in bundle")
+            LLog.warn("theme", "theme-manifest.json not found in bundle")
             return
         }
         do {
             let data = try Data(contentsOf: url)
             themeIndex = try JSONDecoder().decode([ThemeIndexEntry].self, from: data)
-            NSLog("[ThemeManager] Loaded %d themes from manifest", themeIndex.count)
+            LLog.info("theme", "loaded theme manifest", fields: ["count": themeIndex.count])
         } catch {
-            NSLog("[ThemeManager] Failed to load theme manifest: %@", error.localizedDescription)
+            LLog.error("theme", "failed to load theme manifest", error: error)
         }
     }
 
@@ -111,7 +111,7 @@ final class ThemeManager {
     private func loadDefinition(_ slug: String) -> ThemeDefinition? {
         if let cached = definitionCache[slug] { return cached }
         guard let url = Bundle.main.url(forResource: slug, withExtension: "json") else {
-            NSLog("[ThemeManager] Theme file not found: %@", slug)
+            LLog.warn("theme", "theme file not found", fields: ["slug": slug])
             return nil
         }
         do {
@@ -120,7 +120,7 @@ final class ThemeManager {
             definitionCache[slug] = def
             return def
         } catch {
-            NSLog("[ThemeManager] Failed to parse theme %@: %@", slug, error.localizedDescription)
+            LLog.error("theme", "failed to parse theme", error: error, fields: ["slug": slug])
             return nil
         }
     }

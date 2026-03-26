@@ -115,7 +115,7 @@ final class VoiceSessionCoordinator {
             try inputNode.setVoiceProcessingEnabled(true)
             try outputNode.setVoiceProcessingEnabled(true)
         } catch {
-            NSLog("[voice] voice processing unavailable: %@", error.localizedDescription)
+            LLog.error("voice", "voice processing unavailable", error: error)
         }
         let aecBridge = AecBridge(sampleRate: UInt32(VoiceSessionAudioCodec.aecProcessingSampleRate))
         self.aecBridge = aecBridge
@@ -221,13 +221,13 @@ final class VoiceSessionCoordinator {
         let outputLevel = VoiceSessionAudioCodec.rmsLevel(samples: samples)
 
         if !engine.isRunning {
-            NSLog("[voice] engine not running during enqueue, restarting")
+            LLog.warn("voice", "engine not running during enqueue, restarting")
             do {
                 try applyAudioSessionCategory()
                 try session.setActive(true)
                 try engine.start()
             } catch {
-                NSLog("[voice] failed to restart engine: %@", error.localizedDescription)
+                LLog.error("voice", "failed to restart engine", error: error)
                 onEvent?(.failure("Failed to restart audio output"))
                 return
             }

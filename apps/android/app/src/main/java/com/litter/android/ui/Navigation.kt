@@ -10,4 +10,7 @@ sealed class Route {
     data class Sessions(val serverId: String, val title: String) : Route()
     data class Conversation(val key: ThreadKey) : Route()
     data class RealtimeVoice(val key: ThreadKey) : Route()
+    data class ConversationInfo(val key: ThreadKey) : Route()
+    data class WallpaperSelection(val key: ThreadKey) : Route()
+    data class WallpaperAdjust(val key: ThreadKey) : Route()
 }

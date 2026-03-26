@@ -67,7 +67,7 @@ struct ConversationView: View {
             onForkFromUserItem: forkFromMessage,
             onOpenConversation: onOpenConversation
         )
-        .background { ChatWallpaperBackground() }
+        .background { ChatWallpaperBackground(threadKey: activeThreadKey) }
         .mask {
             VStack(spacing: 0) {
                 LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)

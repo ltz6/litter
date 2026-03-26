@@ -1,6 +1,7 @@
 package com.litter.android.state
 
 import com.litter.android.core.bridge.UniffiInit
+import com.litter.android.util.LLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -56,6 +57,7 @@ class AppModel private constructor(context: android.content.Context) {
 
     init {
         UniffiInit.ensure(context)
+        LLog.bootstrap(context)
         store = AppStore()
         rpc = AppServerRpc()
         discovery = DiscoveryBridge()
@@ -100,15 +102,15 @@ class AppModel private constructor(context: android.content.Context) {
                 while (true) {
                     try {
                         val update: AppStoreUpdateRecord = subscription.nextUpdate()
-                        android.util.Log.d("AppModel", "AppStore update: ${update::class.simpleName}")
+                        LLog.d("AppModel", "AppStore update", fields = mapOf("update" to update::class.simpleName))
                         handleUpdate(update)
                     } catch (e: Exception) {
-                        android.util.Log.e("AppModel", "AppStore subscription loop failed", e)
+                        LLog.e("AppModel", "AppStore subscription loop failed", e)
                         throw e
                     }
                 }
             } catch (e: Exception) {
-                android.util.Log.e("AppModel", "AppModel.start() subscription failed", e)
+                LLog.e("AppModel", "AppModel.start() subscription failed", e)
                 _lastError.value = e.message
             }
         }
@@ -129,7 +131,11 @@ class AppModel private constructor(context: android.content.Context) {
             val serverSummary = snap.servers.joinToString(separator = " | ") { server ->
                 "${server.serverId}:${server.displayName}:${server.host}:${server.port}:${server.health}"
             }
-            android.util.Log.d("AppModel", "snapshot servers=${snap.servers.size} [$serverSummary]")
+            LLog.d(
+                "AppModel",
+                "snapshot refreshed",
+                fields = mapOf("servers" to snap.servers.size, "summary" to serverSummary),
+            )
         } catch (e: Exception) {
             _lastError.value = e.message
         }

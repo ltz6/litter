@@ -3,104 +3,405 @@ package com.litter.android.ui
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.ImageDecoder
+import android.graphics.Paint
 import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import uniffi.codex_mobile_client.ThreadKey
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.cos
+import kotlin.math.sin
 
-private const val WALLPAPER_PREFS_NAME = "litter_wallpaper_prefs"
-private const val CHAT_WALLPAPER_KEY = "chatWallpaper"
-private const val CHAT_WALLPAPER_NONE = "none"
-private const val CHAT_WALLPAPER_CUSTOM = "custom"
-private const val CUSTOM_WALLPAPER_FILE = "custom_wallpaper.jpg"
+private const val TAG = "WallpaperManager"
+private const val PREFS_FILENAME = "wallpaper_prefs.json"
 private const val MAX_WALLPAPER_DIMENSION = 2048
+private const val PATTERN_SIZE = 1080
+
+enum class WallpaperType {
+    NONE, THEME, CUSTOM_IMAGE, SOLID_COLOR
+}
+
+enum class PatternType {
+    DOT_GRID, DIAGONAL_LINES, CONCENTRIC_CIRCLES, HEXAGONAL_MESH, CROSS_HATCH, WAVE_LINES
+}
+
+data class WallpaperConfig(
+    val type: WallpaperType = WallpaperType.NONE,
+    val themeSlug: String? = null,
+    val colorHex: String? = null,
+    val blur: Float = 0f,
+    val brightness: Float = 1f,
+    val motionEnabled: Boolean = false,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("type", type.name.lowercase())
+        themeSlug?.let { put("themeSlug", it) }
+        colorHex?.let { put("colorHex", it) }
+        put("blur", blur.toDouble())
+        put("brightness", brightness.toDouble())
+        put("motionEnabled", motionEnabled)
+    }
+
+    companion object {
+        fun fromJson(json: JSONObject): WallpaperConfig = WallpaperConfig(
+            type = when (json.optString("type", "none")) {
+                "theme" -> WallpaperType.THEME
+                "custom_image" -> WallpaperType.CUSTOM_IMAGE
+                "solid_color" -> WallpaperType.SOLID_COLOR
+                else -> WallpaperType.NONE
+            },
+            themeSlug = json.optString("themeSlug", null),
+            colorHex = json.optString("colorHex", null),
+            blur = json.optDouble("blur", 0.0).toFloat(),
+            brightness = json.optDouble("brightness", 1.0).toFloat(),
+            motionEnabled = json.optBoolean("motionEnabled", false),
+        )
+    }
+}
+
+sealed class WallpaperScope {
+    data class Thread(val key: ThreadKey) : WallpaperScope()
+    data class Server(val serverId: String) : WallpaperScope()
+}
 
 object WallpaperManager {
-    private const val TAG = "WallpaperManager"
     private var appContext: Context? = null
     private var initialized = false
+    private var prefsData = JSONObject()
+    private val bitmapCache = LinkedHashMap<String, Bitmap>(8, 0.75f, true)
 
-    var wallpaperBitmap by mutableStateOf<Bitmap?>(null)
+    var activeThreadKey by mutableStateOf<ThreadKey?>(null)
+
+    var resolvedBitmap by mutableStateOf<Bitmap?>(null)
         private set
 
-    var isWallpaperSet by mutableStateOf(false)
+    var resolvedConfig by mutableStateOf<WallpaperConfig?>(null)
         private set
 
     fun initialize(context: Context) {
-        if (initialized) {
-            return
-        }
+        if (initialized) return
         appContext = context.applicationContext
-        loadCurrentWallpaper()
+        loadPrefs()
         initialized = true
     }
 
-    suspend fun setCustomFromUri(uri: Uri): Boolean {
+    fun resolvedConfig(threadKey: ThreadKey?): WallpaperConfig? {
+        if (threadKey == null) return null
+        val threadScopeKey = "${threadKey.serverId}::${threadKey.threadId}"
+        val threads = prefsData.optJSONObject("threads")
+        val threadConfig = threads?.optJSONObject(threadScopeKey)
+        if (threadConfig != null) return WallpaperConfig.fromJson(threadConfig)
+        val servers = prefsData.optJSONObject("servers")
+        val serverConfig = servers?.optJSONObject(threadKey.serverId)
+        if (serverConfig != null) return WallpaperConfig.fromJson(serverConfig)
+        return null
+    }
+
+    fun setWallpaper(config: WallpaperConfig, scope: WallpaperScope) {
+        when (scope) {
+            is WallpaperScope.Thread -> {
+                val key = "${scope.key.serverId}::${scope.key.threadId}"
+                val threads = prefsData.optJSONObject("threads") ?: JSONObject()
+                threads.put(key, config.toJson())
+                prefsData.put("threads", threads)
+            }
+            is WallpaperScope.Server -> {
+                val servers = prefsData.optJSONObject("servers") ?: JSONObject()
+                servers.put(scope.serverId, config.toJson())
+                prefsData.put("servers", servers)
+            }
+        }
+        savePrefs()
+        refreshResolved()
+    }
+
+    fun clearWallpaper(scope: WallpaperScope) {
+        when (scope) {
+            is WallpaperScope.Thread -> {
+                val key = "${scope.key.serverId}::${scope.key.threadId}"
+                prefsData.optJSONObject("threads")?.remove(key)
+                // Also remove custom image file
+                customImageFile(key)?.delete()
+            }
+            is WallpaperScope.Server -> {
+                prefsData.optJSONObject("servers")?.remove(scope.serverId)
+                customImageFile("server_${scope.serverId}")?.delete()
+            }
+        }
+        savePrefs()
+        refreshResolved()
+    }
+
+    fun setActiveThread(key: ThreadKey?) {
+        activeThreadKey = key
+        refreshResolved()
+    }
+
+    suspend fun setCustomImageFromUri(uri: Uri, scope: WallpaperScope): Boolean {
         val context = appContext ?: return false
         val bitmap = decodeBitmap(context, uri) ?: return false
-        val wroteFile =
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    customWallpaperFile(context).parentFile?.mkdirs()
-                    FileOutputStream(customWallpaperFile(context)).use { stream ->
-                        check(bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)) {
-                            "Bitmap compression failed"
-                        }
-                        stream.fd.sync()
-                    }
-                }.onFailure { error ->
-                    Log.e(TAG, "Failed to write wallpaper file for uri=$uri", error)
-                }.isSuccess
-            }
-        if (!wroteFile) {
-            return false
+        val fileKey = when (scope) {
+            is WallpaperScope.Thread -> "${scope.key.serverId}_${scope.key.threadId}"
+            is WallpaperScope.Server -> "server_${scope.serverId}"
         }
+        val file = File(context.filesDir, "wallpaper_$fileKey.jpg")
+        val wrote = withContext(Dispatchers.IO) {
+            runCatching {
+                file.parentFile?.mkdirs()
+                FileOutputStream(file).use { stream ->
+                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream))
+                    stream.fd.sync()
+                }
+            }.onFailure { Log.e(TAG, "Failed to write wallpaper image", it) }.isSuccess
+        }
+        if (!wrote) return false
 
-        prefs(context)
-            .edit()
-            .putString(CHAT_WALLPAPER_KEY, CHAT_WALLPAPER_CUSTOM)
-            .apply()
-        wallpaperBitmap = bitmap
-        isWallpaperSet = true
+        val config = WallpaperConfig(type = WallpaperType.CUSTOM_IMAGE)
+        setWallpaper(config, scope)
         return true
     }
 
-    fun clear() {
-        val context = appContext ?: return
-        prefs(context)
-            .edit()
-            .putString(CHAT_WALLPAPER_KEY, CHAT_WALLPAPER_NONE)
-            .apply()
-        wallpaperBitmap = null
-        isWallpaperSet = false
-        customWallpaperFile(context).delete()
+    fun generatePatternBitmap(
+        background: Color,
+        accent: Color,
+        patternType: PatternType,
+    ): Bitmap {
+        val cacheKey = "${background.toArgb()}_${accent.toArgb()}_${patternType.name}"
+        bitmapCache[cacheKey]?.let { return it }
+
+        val bitmap = Bitmap.createBitmap(PATTERN_SIZE, PATTERN_SIZE, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val bgPaint = Paint().apply { color = background.toArgb() }
+        canvas.drawRect(0f, 0f, PATTERN_SIZE.toFloat(), PATTERN_SIZE.toFloat(), bgPaint)
+
+        val patternPaint = Paint().apply {
+            color = accent.toArgb()
+            alpha = 25 // ~10% opacity
+            isAntiAlias = true
+            style = Paint.Style.STROKE
+            strokeWidth = 1.5f
+        }
+        val fillPaint = Paint().apply {
+            color = accent.toArgb()
+            alpha = 20
+            isAntiAlias = true
+            style = Paint.Style.FILL
+        }
+
+        val size = PATTERN_SIZE.toFloat()
+        when (patternType) {
+            PatternType.DOT_GRID -> {
+                val spacing = 24f
+                var x = spacing
+                while (x < size) {
+                    var y = spacing
+                    while (y < size) {
+                        canvas.drawCircle(x, y, 1.5f, fillPaint)
+                        y += spacing
+                    }
+                    x += spacing
+                }
+            }
+            PatternType.DIAGONAL_LINES -> {
+                val spacing = 20f
+                var offset = -size
+                while (offset < size * 2) {
+                    canvas.drawLine(offset, 0f, offset + size, size, patternPaint)
+                    offset += spacing
+                }
+            }
+            PatternType.CONCENTRIC_CIRCLES -> {
+                val cx = size / 2
+                val cy = size / 2
+                var r = 30f
+                while (r < size) {
+                    canvas.drawCircle(cx, cy, r, patternPaint)
+                    r += 40f
+                }
+            }
+            PatternType.HEXAGONAL_MESH -> {
+                val hexSize = 30f
+                val w = hexSize * 1.732f
+                val h = hexSize * 2f
+                var row = 0
+                var y = 0f
+                while (y < size + h) {
+                    var x = if (row % 2 == 0) 0f else w / 2f
+                    while (x < size + w) {
+                        drawHexagon(canvas, x, y, hexSize, patternPaint)
+                        x += w
+                    }
+                    y += h * 0.75f
+                    row++
+                }
+            }
+            PatternType.CROSS_HATCH -> {
+                val spacing = 20f
+                var pos = 0f
+                while (pos < size) {
+                    canvas.drawLine(pos, 0f, pos, size, patternPaint)
+                    canvas.drawLine(0f, pos, size, pos, patternPaint)
+                    pos += spacing
+                }
+            }
+            PatternType.WAVE_LINES -> {
+                val amplitude = 15f
+                val wavelength = 60f
+                var y = 20f
+                while (y < size) {
+                    val path = android.graphics.Path()
+                    path.moveTo(0f, y)
+                    var x = 0f
+                    while (x < size) {
+                        val nextX = x + wavelength / 4f
+                        val controlY = y + if (((x / (wavelength / 2f)).toInt() % 2) == 0) -amplitude else amplitude
+                        path.quadTo(x + wavelength / 8f, controlY, nextX, y)
+                        x = nextX
+                    }
+                    canvas.drawPath(path, patternPaint)
+                    y += 30f
+                }
+            }
+        }
+
+        bitmapCache[cacheKey] = bitmap
+        return bitmap
     }
 
-    private fun loadCurrentWallpaper() {
-        val context = appContext ?: return
-        when (prefs(context).getString(CHAT_WALLPAPER_KEY, CHAT_WALLPAPER_NONE)) {
-            CHAT_WALLPAPER_CUSTOM -> {
-                wallpaperBitmap = BitmapFactory.decodeFile(customWallpaperFile(context).absolutePath)
-                isWallpaperSet = wallpaperBitmap != null
+    fun patternTypeForIndex(index: Int): PatternType {
+        val types = PatternType.entries
+        return types[index % types.size]
+    }
+
+    fun resolvedBitmapForConfig(config: WallpaperConfig, threadKey: ThreadKey?): Bitmap? {
+        return when (config.type) {
+            WallpaperType.NONE -> null
+            WallpaperType.THEME -> {
+                val slug = config.themeSlug ?: return null
+                val entry = LitterThemeManager.themeIndex.find { it.slug == slug } ?: return null
+                val bg = colorFromHex(entry.backgroundHex)
+                val accent = colorFromHex(entry.accentHex)
+                val patternIndex = LitterThemeManager.themeIndex.indexOf(entry)
+                generatePatternBitmap(bg, accent, patternTypeForIndex(patternIndex))
             }
-            else -> {
-                wallpaperBitmap = null
-                isWallpaperSet = false
+            WallpaperType.CUSTOM_IMAGE -> {
+                val context = appContext ?: return null
+                val fileKey = if (threadKey != null) {
+                    "${threadKey.serverId}_${threadKey.threadId}"
+                } else {
+                    return null
+                }
+                val file = File(context.filesDir, "wallpaper_$fileKey.jpg")
+                if (!file.exists()) {
+                    // Try server-scoped
+                    val serverFile = File(context.filesDir, "wallpaper_server_${threadKey.serverId}.jpg")
+                    if (serverFile.exists()) {
+                        BitmapFactory.decodeFile(serverFile.absolutePath)
+                    } else null
+                } else {
+                    BitmapFactory.decodeFile(file.absolutePath)
+                }
+            }
+            WallpaperType.SOLID_COLOR -> null // Solid color is handled via Compose background
+        }
+    }
+
+    fun cleanup(knownServerIds: Set<String>, knownThreadKeys: Set<String>) {
+        val threads = prefsData.optJSONObject("threads")
+        if (threads != null) {
+            val keysToRemove = mutableListOf<String>()
+            val iter = threads.keys()
+            while (iter.hasNext()) {
+                val key = iter.next()
+                if (key !in knownThreadKeys) keysToRemove.add(key)
+            }
+            keysToRemove.forEach { threads.remove(it) }
+        }
+        val servers = prefsData.optJSONObject("servers")
+        if (servers != null) {
+            val keysToRemove = mutableListOf<String>()
+            val iter = servers.keys()
+            while (iter.hasNext()) {
+                val key = iter.next()
+                if (key !in knownServerIds) keysToRemove.add(key)
+            }
+            keysToRemove.forEach { servers.remove(it) }
+        }
+        savePrefs()
+        // Clean orphaned image files
+        val context = appContext ?: return
+        context.filesDir.listFiles()?.filter {
+            it.name.startsWith("wallpaper_") && it.name.endsWith(".jpg")
+        }?.forEach { file ->
+            val name = file.nameWithoutExtension.removePrefix("wallpaper_")
+            val isThreadFile = knownThreadKeys.any { key ->
+                val parts = key.split("::")
+                if (parts.size == 2) name == "${parts[0]}_${parts[1]}" else false
+            }
+            val isServerFile = knownServerIds.any { name == "server_$it" }
+            if (!isThreadFile && !isServerFile) file.delete()
+        }
+    }
+
+    fun refreshResolved() {
+        val key = activeThreadKey
+        val config = resolvedConfig(key)
+        resolvedConfig = config
+        resolvedBitmap = if (config != null) resolvedBitmapForConfig(config, key) else null
+    }
+
+    private fun loadPrefs() {
+        val context = appContext ?: return
+        val file = File(context.filesDir, PREFS_FILENAME)
+        if (file.exists()) {
+            prefsData = runCatching {
+                JSONObject(file.readText())
+            }.getOrElse {
+                Log.w(TAG, "Failed to parse wallpaper prefs", it)
+                JSONObject()
             }
         }
     }
 
-    private suspend fun decodeBitmap(
-        context: Context,
-        uri: Uri,
-    ): Bitmap? =
+    private fun savePrefs() {
+        val context = appContext ?: return
+        val file = File(context.filesDir, PREFS_FILENAME)
+        runCatching {
+            file.writeText(prefsData.toString(2))
+        }.onFailure {
+            Log.e(TAG, "Failed to save wallpaper prefs", it)
+        }
+    }
+
+    private fun customImageFile(key: String): File? {
+        val context = appContext ?: return null
+        return File(context.filesDir, "wallpaper_$key.jpg")
+    }
+
+    private fun drawHexagon(canvas: Canvas, cx: Float, cy: Float, size: Float, paint: Paint) {
+        val path = android.graphics.Path()
+        for (i in 0 until 6) {
+            val angle = Math.toRadians((60.0 * i) - 30.0)
+            val x = cx + size * cos(angle).toFloat()
+            val y = cy + size * sin(angle).toFloat()
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        canvas.drawPath(path, paint)
+    }
+
+    private suspend fun decodeBitmap(context: Context, uri: Uri): Bitmap? =
         withContext(Dispatchers.IO) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 runCatching {
@@ -108,69 +409,37 @@ object WallpaperManager {
                     ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
                         decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                         val size = info.size
-                        val largestDimension = maxOf(size.width, size.height)
-                        if (largestDimension > MAX_WALLPAPER_DIMENSION) {
-                            val scale = MAX_WALLPAPER_DIMENSION.toFloat() / largestDimension.toFloat()
-                            val targetWidth = (size.width * scale).toInt().coerceAtLeast(1)
-                            val targetHeight = (size.height * scale).toInt().coerceAtLeast(1)
-                            decoder.setTargetSize(targetWidth, targetHeight)
+                        val largest = maxOf(size.width, size.height)
+                        if (largest > MAX_WALLPAPER_DIMENSION) {
+                            val scale = MAX_WALLPAPER_DIMENSION.toFloat() / largest.toFloat()
+                            decoder.setTargetSize(
+                                (size.width * scale).toInt().coerceAtLeast(1),
+                                (size.height * scale).toInt().coerceAtLeast(1),
+                            )
                         }
                     }
-                }.onFailure { error ->
-                    Log.w(TAG, "ImageDecoder wallpaper decode failed for uri=$uri; falling back", error)
-                }.getOrNull()?.let { decoded ->
-                    return@withContext decoded
-                }
+                }.onFailure {
+                    Log.w(TAG, "ImageDecoder failed for uri=$uri", it)
+                }.getOrNull()?.let { return@withContext it }
             }
 
             val resolver = context.contentResolver
-            val bounds =
-                BitmapFactory.Options().apply {
-                    inJustDecodeBounds = true
-                }
-            resolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, bounds)
-            } ?: return@withContext null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                ?: return@withContext null
 
-            val options =
-                BitmapFactory.Options().apply {
-                    inSampleSize =
-                        calculateInSampleSize(
-                            width = bounds.outWidth,
-                            height = bounds.outHeight,
-                            maxWidth = MAX_WALLPAPER_DIMENSION,
-                            maxHeight = MAX_WALLPAPER_DIMENSION,
-                        )
-                }
-            resolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, options)
-            }.also { decoded ->
-                if (decoded == null) {
-                    Log.e(TAG, "BitmapFactory wallpaper decode returned null for uri=$uri")
-                }
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight)
             }
+            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
         }
 
-    private fun calculateInSampleSize(
-        width: Int,
-        height: Int,
-        maxWidth: Int,
-        maxHeight: Int,
-    ): Int {
+    private fun calculateInSampleSize(width: Int, height: Int): Int {
         var sampleSize = 1
-        if (width <= 0 || height <= 0) {
-            return sampleSize
-        }
-
-        while ((width / sampleSize) > maxWidth || (height / sampleSize) > maxHeight) {
+        if (width <= 0 || height <= 0) return sampleSize
+        while ((width / sampleSize) > MAX_WALLPAPER_DIMENSION || (height / sampleSize) > MAX_WALLPAPER_DIMENSION) {
             sampleSize *= 2
         }
         return sampleSize
     }
-
-    private fun prefs(context: Context) =
-        context.getSharedPreferences(WALLPAPER_PREFS_NAME, Context.MODE_PRIVATE)
-
-    private fun customWallpaperFile(context: Context): File =
-        File(context.filesDir, CUSTOM_WALLPAPER_FILE)
 }

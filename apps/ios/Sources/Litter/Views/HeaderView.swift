@@ -6,6 +6,7 @@ struct HeaderView: View {
     @Environment(\.openURL) private var openURL
     let thread: AppThreadSnapshot
     let onBack: () -> Void
+    var onInfo: (() -> Void)?
     @State private var isReloading = false
     @State private var pulsing = false
     @AppStorage("fastMode") private var fastMode = false
@@ -97,6 +98,8 @@ struct HeaderView: View {
                 Spacer(minLength: 0)
 
                 reloadButton
+
+                infoButton
             }
             .padding(.horizontal, 16)
             .padding(.top, topInset)
@@ -279,6 +282,19 @@ struct HeaderView: View {
         }
         .accessibilityIdentifier("header.reloadButton")
         .disabled(isReloading || server?.isConnected != true)
+    }
+
+    private var infoButton: some View {
+        Button {
+            onInfo?()
+        } label: {
+            Image(systemName: "info.circle")
+                .litterFont(size: 16, weight: .semibold)
+                .foregroundColor(LitterTheme.accent)
+                .frame(width: 44, height: 44)
+                .modifier(GlassCircleModifier())
+        }
+        .accessibilityIdentifier("header.infoButton")
     }
 
     private func handleRemoteLoginIfNeeded() async -> Bool {

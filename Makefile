@@ -26,6 +26,8 @@ CARGO_FEATURES ?=
 ANDROID_ABIS ?= arm64-v8a
 ANDROID_RUST_PROFILE ?= android-dev
 ANDROID_RELEASE_ABIS ?= arm64-v8a,x86_64
+HOST_ARCH := $(shell uname -m)
+ANDROID_EMULATOR_ABIS ?= $(if $(filter arm64 aarch64,$(HOST_ARCH)),arm64-v8a,x86_64)
 
 SCCACHE := $(shell command -v sccache 2>/dev/null)
 ifneq ($(SCCACHE),)
@@ -71,12 +73,12 @@ ANDROID_RUST_SOURCES := $(shell find $(RUST_DIR) \
 
 $(shell mkdir -p $(STAMPS))
 
-.PHONY: all ios ios-sim ios-device ios-device-fast ios-run \
-	android android-fast android-release android-debug android-install \
-	rust-ios rust-ios-package rust-ios-device-fast rust-android rust-check rust-test rust-host-dev \
+.PHONY: all ios ios-sim ios-sim-fast ios-device ios-device-fast ios-run \
+	android android-fast android-emulator-fast android-release android-debug android-install android-emulator-install \
+	rust-ios rust-ios-package rust-ios-device-fast rust-ios-sim-fast rust-android rust-check rust-test rust-host-dev \
 	bindings bindings-swift bindings-kotlin \
 	sync patch unpatch xcgen ios-frameworks \
-	ios-build ios-build-sim ios-build-device ios-build-device-fast \
+	ios-build ios-build-sim ios-build-sim-fast ios-build-device ios-build-device-fast \
 	test test-rust test-ios test-android \
 	testflight play-upload \
 	clean clean-rust clean-ios clean-android \
@@ -89,11 +91,13 @@ all: ios android
 ios-build-sim: rust-ios-package ios-frameworks xcgen
 ios-build-device: rust-ios-package ios-frameworks xcgen
 
-# Fast device lane uses the lightweight rust target instead of full package.
+# Fast lanes use lightweight raw staticlib outputs instead of full packaging.
+ios-build-sim-fast: rust-ios-sim-fast ios-frameworks xcgen
 ios-build-device-fast: rust-ios-device-fast ios-frameworks xcgen
 
 ios: ios-build-sim
 ios-sim: ios-build-sim
+ios-sim-fast: ios-build-sim-fast
 ios-device: ios-build-device
 ios-device-fast: ios-build-device-fast
 ios-run: ios
@@ -101,6 +105,8 @@ ios-run: ios
 
 android: android-fast
 android-fast: rust-android android-debug
+android-emulator-fast:
+	@$(MAKE) android-fast ANDROID_ABIS="$(ANDROID_EMULATOR_ABIS)"
 android-release:
 	@$(MAKE) android-fast ANDROID_RUST_PROFILE=release ANDROID_ABIS="$(ANDROID_RELEASE_ABIS)"
 
@@ -113,6 +119,10 @@ rust-ios-package: $(STAMP_SYNC)
 rust-ios-device-fast: $(STAMP_SYNC)
 	@echo "==> Building Rust for fast iOS device iteration (raw staticlib + headers)..."
 	@cd $(ROOT) && $(DEV_CARGO_ENV) $(IOS_SCRIPTS)/build-rust.sh --preserve-current --fast-device $(CARGO_FEATURES)
+
+rust-ios-sim-fast: $(STAMP_SYNC)
+	@echo "==> Building Rust for fast iOS simulator iteration (raw staticlib + headers)..."
+	@cd $(ROOT) && $(DEV_CARGO_ENV) $(IOS_SCRIPTS)/build-rust.sh --preserve-current --fast-sim $(CARGO_FEATURES)
 
 rust-check:
 	@echo "==> cargo check (host, shared crates)..."
@@ -133,11 +143,14 @@ $(STAMP_RUST_ANDROID): $(STAMP_SYNC) $(STAMP_BINDINGS_K) $(ANDROID_RUST_SOURCES)
 help:
 	@printf '%s\n' \
 		'make ios                full iOS package lane + simulator build' \
+		'make ios-sim-fast       fast simulator lane using raw staticlib outputs' \
 		'make ios-device         full iOS package lane + device build' \
 		'make ios-device-fast    fast device lane using raw staticlib outputs' \
 		'make rust-ios-package   full Rust iOS package lane (bindings + xcframework)' \
+		'make rust-ios-sim-fast  fast Rust iOS simulator lane (raw staticlib only)' \
 		'make rust-ios-device-fast fast Rust iOS device lane (raw staticlib only)' \
 		'make android            fast Android dev build (default ABI/profile: arm64-v8a/android-dev)' \
+		'make android-emulator-fast fast Android dev build using emulator ABI ($(ANDROID_EMULATOR_ABIS))' \
 		'make android-release    Android build using release Rust profile and multi-ABI output' \
 		'make rust-check         host cargo check for shared crates' \
 		'make rust-test          host cargo test for shared crates'
@@ -210,6 +223,14 @@ ios-build-sim:
 		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
 		build | tail -20
 
+ios-build-sim-fast:
+	@echo "==> Building iOS ($(XCODE_CONFIG), fast simulator)..."
+	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
+		-scheme $(IOS_SCHEME) \
+		-configuration $(XCODE_CONFIG) \
+		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
+		build | tail -20
+
 ios-build-device:
 	@echo "==> Building iOS ($(XCODE_CONFIG), device)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
@@ -235,6 +256,10 @@ android-debug:
 android-install: android-debug
 	@echo "==> Installing APK to device..."
 	@adb -d install -r $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk
+
+android-emulator-install: android-emulator-fast
+	@echo "==> Installing APK to emulator..."
+	@adb -e install -r $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk
 
 test: test-rust test-ios test-android
 

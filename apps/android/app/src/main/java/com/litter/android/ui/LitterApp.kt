@@ -22,6 +22,7 @@ import com.litter.android.state.AppModel
 import com.litter.android.state.NetworkDiscovery
 import kotlinx.coroutines.launch
 import com.litter.android.ui.conversation.ApprovalOverlay
+import com.litter.android.ui.conversation.ConversationInfoScreen
 import com.litter.android.ui.conversation.ConversationScreen
 import com.litter.android.ui.discovery.DiscoveryScreen
 import com.litter.android.ui.home.HomeDashboardScreen
@@ -146,6 +147,38 @@ fun LitterApp(appModel: AppModel) {
                     ConversationScreen(
                         threadKey = route.key,
                         onBack = navigateBack,
+                        onInfo = { navigate(Route.ConversationInfo(route.key)) },
+                    )
+                }
+
+                is Route.ConversationInfo -> {
+                    ConversationInfoScreen(
+                        threadKey = route.key,
+                        onBack = navigateBack,
+                        onChangeWallpaper = { navigate(Route.WallpaperSelection(route.key)) },
+                    )
+                }
+
+                is Route.WallpaperSelection -> {
+                    com.litter.android.ui.settings.WallpaperSelectionScreen(
+                        threadKey = route.key,
+                        onBack = navigateBack,
+                        onAdjust = { navigate(Route.WallpaperAdjust(route.key)) },
+                    )
+                }
+
+                is Route.WallpaperAdjust -> {
+                    com.litter.android.ui.settings.WallpaperAdjustScreen(
+                        threadKey = route.key,
+                        onBack = navigateBack,
+                        onApplied = {
+                            // Pop back to conversation
+                            navStack = navStack.filter {
+                                it !is Route.WallpaperSelection &&
+                                    it !is Route.WallpaperAdjust &&
+                                    it !is Route.ConversationInfo
+                            }
+                        },
                     )
                 }
 

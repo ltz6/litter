@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -73,6 +74,7 @@ import uniffi.codex_mobile_client.ThreadKey
 fun HeaderBar(
     thread: AppThreadSnapshot?,
     onBack: () -> Unit,
+    onInfo: (() -> Unit)? = null,
 ) {
     val appModel = LocalAppModel.current
     val context = LocalContext.current
@@ -236,6 +238,21 @@ fun HeaderBar(
                     Icon(
                         Icons.Default.Refresh,
                         contentDescription = "Reload",
+                        tint = LitterTheme.textSecondary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+
+            // Info button
+            if (onInfo != null) {
+                IconButton(
+                    onClick = onInfo,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Info,
+                        contentDescription = "Info",
                         tint = LitterTheme.textSecondary,
                         modifier = Modifier.size(18.dp),
                     )

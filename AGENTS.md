@@ -79,6 +79,7 @@
 - Before adding a new `AppStore` method, ask: is this a real composite/store action, or just an upstream RPC that should be generated on `AppServerRpc`?
 - Before adding a new platform cache, ask: is this canonical runtime data that should live in the Rust store instead?
 - When in doubt, prefer one shared Rust implementation plus a thin platform projection over two parallel native implementations.
+- Do not push `shared/third_party/codex` as part of normal repo work. Keep submodule edits local-only unless the user explicitly asks for a separate submodule commit/push, and do not assume a top-level `git push` captures dirty submodule contents.
 
 ## Dependencies
 ### iOS (SPM via `apps/ios/project.yml`)
@@ -102,6 +103,7 @@ The root `Makefile` is the primary build interface. It orchestrates submodule sy
 
 There are two distinct iOS Rust lanes:
 - Fast dev lane: raw staticlib + generated headers in `apps/ios/GeneratedRust/`, used by Debug/device builds (`make rust-ios-device-fast`, `make ios-device-fast`).
+- Fast simulator lane: raw simulator staticlib + generated headers in `apps/ios/GeneratedRust/ios-sim`, used by Debug/simulator builds (`make rust-ios-sim-fast`, `make ios-sim-fast`).
 - Package lane: device+sim Rust build plus `codex_mobile_client.xcframework` packaging (`make rust-ios-package`, `make ios`, `make ios-device`, `make ios-sim`).
 
 Incremental policy:
@@ -113,15 +115,18 @@ Incremental policy:
 |---|---|
 | `make ios` | Full iOS package lane: sync → patch → bindings → rust (device+sim) → xcframework → ios_system → xcgen → simulator build |
 | `make ios-sim` | Full iOS package lane + simulator build |
+| `make ios-sim-fast` | Fast iOS simulator lane using raw simulator staticlib outputs in `GeneratedRust/ios-sim` |
 | `make ios-device` | Full iOS package lane + device build |
 | `make ios-device-fast` | Fast iOS device lane using raw staticlib outputs in `GeneratedRust/` |
 | `make ios-run` | Full iOS build then opens Xcode |
 | `make android` | Full Android pipeline: sync → kotlin bindings → rust JNI → gradle assemble |
+| `make android-emulator-fast` | Fast Android dev build using the host-appropriate emulator ABI (`arm64-v8a` on Apple Silicon, `x86_64` on Intel) |
 | `make android-remote` | Android remote-only debug APK |
 | `make android-install` | Build + install remote-only APK to emulator |
 | `make all` | Both platforms |
 | `make rust-ios` | Alias for the full Rust iOS package lane |
 | `make rust-ios-package` | Build/package Rust for iOS (device+sim + xcframework) |
+| `make rust-ios-sim-fast` | Build raw Rust simulator staticlib + headers only |
 | `make rust-ios-device-fast` | Build raw Rust device staticlib + headers only |
 | `make rust-android` | Just the Android JNI `.so` files |
 | `make rust-check` | Host `cargo check` for shared Rust crates |
@@ -142,6 +147,7 @@ Incremental policy:
 - `XCODE_CONFIG` — Xcode build configuration (default: `Debug`)
 - `IOS_SCHEME` — Xcode scheme (default: `Litter`)
 - `IOS_DEPLOYMENT_TARGET` — minimum iOS version (default: `18.0`)
+- `ANDROID_SDK_ROOT` / `ANDROID_NDK_HOME` / `JAVA_HOME` — required for Android builds in bare shells; typical local values are `$HOME/Library/Android/sdk`, `$HOME/Library/Android/sdk/ndk/<version>`, and `/Applications/Android Studio.app/Contents/jbr/Contents/Home`
 
 ### Individual scripts (called by Make, can also be run standalone)
 - `./apps/ios/scripts/build-rust.sh` — cross-compile Rust for iOS; in fast mode it emits raw staticlibs + headers to `apps/ios/GeneratedRust/`, and in package mode it also creates `codex_mobile_client.xcframework`
@@ -157,6 +163,18 @@ Incremental policy:
 - Key views have `@ObserveInjection` + `.enableInjection()` wired up (ContentView, ConversationView, HeaderView, SessionSidebarView, MessageBubbleView).
 - Debug builds include `-Xlinker -interposable` in linker flags.
 - Run the app in simulator, open InjectionIII pointed at the project directory, then save any Swift file to see changes without relaunching.
+
+## Autonomous Debugging Runbook
+- Prefer the fast lanes for local iteration before package/release lanes: `make ios-sim-fast`, `make ios-device-fast`, and `make android-emulator-fast`.
+- For iOS simulator debugging, install the latest built app directly from DerivedData instead of trusting an older installed simulator copy: `xcrun simctl install booted <.../Build/Products/Debug-iphonesimulator/Litter.app>` then `xcrun simctl launch booted com.sigkitten.litter`.
+- For Android emulator debugging, build with `make android-emulator-fast`, install with `adb -e install -r apps/android/app/build/outputs/apk/debug/app-debug.apk`, then launch with `adb -e shell am start -n com.sigkitten.litter.android/com.litter.android.MainActivity`.
+- Keep both runtimes available when validating shared Rust changes: boot a simulator with `xcrun simctl boot <device>` or through Simulator.app, and verify an emulator is visible with `adb devices -l`.
+- Start the collector with `cargo run --manifest-path shared/rust-bridge/Cargo.toml -p mobile-log-collector -- serve --bind 0.0.0.0:8585 --token <token> --data-dir /tmp/mobile-log-collector-e2e`.
+- Query stored logs with either raw HTTP or the CLI: `curl -H 'Authorization: Bearer <token>' 'http://127.0.0.1:8585/v1/query?limit=20'` or `cargo run --manifest-path shared/rust-bridge/Cargo.toml -p mobile-log-collector -- query --base-url http://127.0.0.1:8585 --token <token> --device-id <id> --pretty`.
+- iOS simulator log config lives under the app container at `.../Library/Application Support/codex/log-spool/config.json`; use `xcrun simctl get_app_container booted com.sigkitten.litter data` to find the current container, then write the config there.
+- Android log config lives at `files/codex-home/log-spool/config.json` inside the app sandbox; write it with `adb shell run-as com.sigkitten.litter.android ...`. When the collector runs on the host machine, use `http://10.0.2.2:8585` from the Android emulator and `http://127.0.0.1:8585` from the iOS simulator.
+- A minimal debug config should set `enabled: true`, `collector_url`, `bearer_token`, `min_level: "DEBUG"`, and stable `device_id` / `device_name` fields so batches can be filtered reliably.
+- After launch, verify upload by checking that `log-spool/pending` drains, then query the collector for the target `device_id`. If you need direct storage inspection, query `/tmp/mobile-log-collector-e2e/collector.sqlite3` and decompress batch files under `/tmp/mobile-log-collector-e2e/batches/...`.
 
 ## Coding Style & Naming Conventions
 - Swift style follows standard Xcode defaults: 4-space indentation, `UpperCamelCase` for types, `lowerCamelCase` for properties/functions.

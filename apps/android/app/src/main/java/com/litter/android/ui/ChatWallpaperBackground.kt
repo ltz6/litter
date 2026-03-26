@@ -6,24 +6,55 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
+import uniffi.codex_mobile_client.ThreadKey
 
 @Composable
-fun ChatWallpaperBackground(modifier: Modifier = Modifier) {
-    WallpaperBackdrop(modifier = modifier.fillMaxSize())
+fun ChatWallpaperBackground(
+    threadKey: ThreadKey? = null,
+    modifier: Modifier = Modifier,
+) {
+    WallpaperBackdrop(threadKey = threadKey, modifier = modifier.fillMaxSize())
 }
 
 @Composable
-fun WallpaperBackdrop(modifier: Modifier = Modifier) {
-    val wallpaperBitmap = WallpaperManager.wallpaperBitmap
-    if (wallpaperBitmap != null) {
-        Image(
-            bitmap = wallpaperBitmap.asImageBitmap(),
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = modifier,
-        )
+fun WallpaperBackdrop(
+    threadKey: ThreadKey? = null,
+    modifier: Modifier = Modifier,
+) {
+    val config = if (threadKey != null) WallpaperManager.resolvedConfig(threadKey) else null
+    val bitmap = if (config != null) {
+        WallpaperManager.resolvedBitmapForConfig(config, threadKey)
+    } else {
+        null
+    }
+
+    if (config != null && (bitmap != null || config.type == WallpaperType.SOLID_COLOR)) {
+        val blurRadius = (config.blur * 25f).dp
+        val brightnessAlpha = config.brightness.coerceIn(0f, 1f)
+
+        if (config.type == WallpaperType.SOLID_COLOR) {
+            val color = config.colorHex?.let { colorFromHex(it) }
+                ?: LitterTheme.background
+            Box(
+                modifier = modifier
+                    .background(color)
+                    .graphicsLayer { alpha = brightnessAlpha },
+            )
+        } else if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = modifier
+                    .then(if (blurRadius > 0.dp) Modifier.blur(blurRadius) else Modifier)
+                    .graphicsLayer { alpha = brightnessAlpha },
+            )
+        }
     } else {
         Box(
             modifier = modifier.background(LitterTheme.backgroundBrush),

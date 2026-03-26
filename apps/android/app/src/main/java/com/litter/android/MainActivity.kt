@@ -22,6 +22,7 @@ import com.litter.android.ui.AnimatedSplashScreen
 import com.litter.android.ui.LitterApp
 import com.litter.android.ui.LitterAppTheme
 import com.litter.android.ui.WallpaperManager
+import com.litter.android.util.LLog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -39,7 +40,7 @@ class MainActivity : ComponentActivity() {
             WallpaperManager.initialize(this)
             appModel.start()
         } catch (e: Exception) {
-            android.util.Log.e("MainActivity", "AppModel.start() failed", e)
+            LLog.e("MainActivity", "AppModel.start() failed", e)
         }
 
         var showSplash by mutableStateOf(true)
@@ -128,9 +129,9 @@ class MainActivity : ComponentActivity() {
                 ),
             )
             appModel.refreshSnapshot()
-            android.util.Log.i("MainActivity", "Local in-process server connected")
+            LLog.i("MainActivity", "Local in-process server connected")
         } catch (e: Exception) {
-            android.util.Log.w("MainActivity", "Local server failed: ${e.message}")
+            LLog.w("MainActivity", "Local server failed", fields = mapOf("error" to e.message))
         }
     }
 }

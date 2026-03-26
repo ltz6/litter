@@ -75,6 +75,7 @@ import uniffi.codex_mobile_client.TurnInterruptParams
 fun ConversationScreen(
     threadKey: ThreadKey,
     onBack: () -> Unit,
+    onInfo: (() -> Unit)? = null,
     onNavigateToSessions: (() -> Unit)? = null,
     onShowDirectoryPicker: (() -> Unit)? = null,
 ) {
@@ -169,7 +170,7 @@ fun ConversationScreen(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        ChatWallpaperBackground()
+        ChatWallpaperBackground(threadKey = threadKey)
 
         Column(
             modifier = Modifier
@@ -180,6 +181,7 @@ fun ConversationScreen(
             HeaderBar(
                 thread = thread,
                 onBack = onBack,
+                onInfo = onInfo,
             )
 
             // Message list with gradient fade and scroll FAB

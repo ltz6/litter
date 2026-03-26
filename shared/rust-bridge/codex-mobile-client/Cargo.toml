@@ -14,6 +14,7 @@ codex-app-server = { workspace = true }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-ipc = { path = "../codex-ipc" }
+mobile-log-shared = { path = "../mobile-log-shared" }
 codex-protocol = { workspace = true }
 codex-core = { workspace = true }
 codex-config = { workspace = true }
@@ -35,6 +36,11 @@ russh = { workspace = true }
 russh-keys = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
+flate2 = { workspace = true }
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
+arc-swap = { workspace = true }
 
 [features]
 rpc-trace = []

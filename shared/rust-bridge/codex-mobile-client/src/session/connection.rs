@@ -23,31 +23,22 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
+use crate::logging::{LogLevelName, log_rust};
 use crate::ssh::SshClient;
 use crate::transport::{RpcError, TransportError};
 
 const REMOTE_RECONNECT_MAX_ATTEMPTS: u32 = 5;
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
-#[cfg(target_os = "android")]
 fn append_android_debug_log(line: &str) {
-    use std::io::Write;
-
-    let Some(codex_home) = std::env::var_os("CODEX_HOME") else {
-        return;
-    };
-    let path = PathBuf::from(codex_home).join("mobile-debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{line}");
-    }
+    log_rust(
+        LogLevelName::Debug,
+        "session.connection",
+        "bridge",
+        line.to_string(),
+        None,
+    );
 }
-
-#[cfg(not(target_os = "android"))]
-fn append_android_debug_log(_line: &str) {}
 
 // ---------------------------------------------------------------------------
 // InProcessConfig
