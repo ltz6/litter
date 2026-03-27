@@ -44,6 +44,12 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
+      - name: Generate Rust bridge sources
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+        run: make bindings-kotlin
+
       - name: Cargo check (codex-bridge)
         env:
           RUSTC_WRAPPER: sccache
