@@ -404,32 +404,22 @@ struct RealtimeVoiceScreen: View {
 
     @ViewBuilder
     private var apiKeySaveButton: some View {
-        if #available(iOS 26.0, *) {
-            Button {
-                saveApiKeyAndRetry()
-            } label: {
-                apiKeySaveButtonLabel
-            }
-            .buttonStyle(.glassProminent)
-            .disabled(trimmedApiKey.isEmpty || isSavingApiKey)
-        } else {
-            Button {
-                saveApiKeyAndRetry()
-            } label: {
-                apiKeySaveButtonLabel
-                    .background(
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(Color.white.opacity(0.12))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                    )
-            }
-            .buttonStyle(.plain)
-            .disabled(trimmedApiKey.isEmpty || isSavingApiKey)
-            .opacity(trimmedApiKey.isEmpty || isSavingApiKey ? 0.55 : 1)
+        Button {
+            saveApiKeyAndRetry()
+        } label: {
+            apiKeySaveButtonLabel
+                .background(
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(Color.white.opacity(0.12))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
         }
+        .buttonStyle(.plain)
+        .disabled(trimmedApiKey.isEmpty || isSavingApiKey)
+        .opacity(trimmedApiKey.isEmpty || isSavingApiKey ? 0.55 : 1)
     }
 
     private var apiKeySaveButtonLabel: some View {
