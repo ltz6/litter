@@ -1,11 +1,12 @@
 diff --git a/codex-rs/core/src/exec.rs b/codex-rs/core/src/exec.rs
-index 8bb16b2a5..8b9d7616d 100644
+index a4399ddc4..08b899856 100644
 --- a/codex-rs/core/src/exec.rs
 +++ b/codex-rs/core/src/exec.rs
-@@ -40,6 +40,21 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
+@@ -46,6 +46,23 @@ use codex_utils_absolute_path::AbsolutePathBuf;
  use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
  use codex_utils_pty::process_group::kill_child_process_group;
  
++
 +#[cfg(target_os = "ios")]
 +use std::sync::OnceLock;
 +
@@ -21,36 +22,14 @@ index 8bb16b2a5..8b9d7616d 100644
 +    let _ = IOS_EXEC_HOOK.set(f);
 +}
 +
++
  pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
  
  // Hardcode these since it does not seem worth including the libc crate just
-@@ -789,31 +804,63 @@ async fn exec(
+@@ -263,6 +280,37 @@ pub fn build_exec_request(
+     if let Some(network) = network.as_ref() {
          network.apply_to_env(&mut env);
      }
- 
--    let (program, args) = command.split_first().ok_or_else(|| {
--        CodexErr::Io(io::Error::new(
--            io::ErrorKind::InvalidInput,
--            "command args are empty",
--        ))
--    })?;
--    let arg0_ref = arg0.as_deref();
--    let child = spawn_child_async(SpawnChildRequest {
--        program: PathBuf::from(program),
--        args: args.into(),
--        arg0: arg0_ref,
--        cwd,
--        network_sandbox_policy,
--        // The environment already has attempt-scoped proxy settings from
--        // apply_to_env_for_attempt above. Passing network here would reapply
--        // non-attempt proxy vars and drop attempt correlation metadata.
--        network: None,
--        stdio_policy: StdioPolicy::RedirectForShellTool,
--        env,
--    })
--    .await?;
--    if let Some(after_spawn) = after_spawn {
--        after_spawn();
 +    #[cfg(target_os = "ios")]
 +    {
 +        let (code, data) = IOS_EXEC_HOOK
@@ -80,56 +59,30 @@ index 8bb16b2a5..8b9d7616d 100644
 +        });
 +    }
 +
-+    #[cfg(not(target_os = "ios"))]
-+    {
-+        let (program, args) = command.split_first().ok_or_else(|| {
-+            CodexErr::Io(io::Error::new(
-+                io::ErrorKind::InvalidInput,
-+                "command args are empty",
-+            ))
-+        })?;
-+        let arg0_ref = arg0.as_deref();
-+        let child = spawn_child_async(SpawnChildRequest {
-+            program: PathBuf::from(program),
-+            args: args.into(),
-+            arg0: arg0_ref,
-+            cwd,
-+            network_sandbox_policy,
-+            // The environment already has attempt-scoped proxy settings from
-+            // apply_to_env_for_attempt above. Passing network here would reapply
-+            // non-attempt proxy vars and drop attempt correlation metadata.
-+            network: None,
-+            stdio_policy: StdioPolicy::RedirectForShellTool,
-+            env,
-+        })
-+        .await?;
-+        if let Some(after_spawn) = after_spawn {
-+            after_spawn();
-+        }
-+        consume_truncated_output(child, expiration, stdout_stream).await
-     }
--    consume_truncated_output(child, expiration, stdout_stream).await
- }
- 
- #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
++    #[allow(unreachable_code)]
++
+     let (program, args) = command.split_first().ok_or_else(|| {
+         CodexErr::Io(io::Error::new(
+             io::ErrorKind::InvalidInput,
 diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
-index 6494c4f..eca836f 100644
+index 2d992507b..8f8400ead 100644
 --- a/codex-rs/core/src/unified_exec/process_manager.rs
 +++ b/codex-rs/core/src/unified_exec/process_manager.rs
-@@ -161,6 +161,12 @@ impl UnifiedExecProcessManager {
+@@ -166,6 +166,13 @@ impl UnifiedExecProcessManager {
              .workdir
              .clone()
-             .unwrap_or_else(|| context.turn.cwd.clone());
-+
+             .unwrap_or_else(|| context.turn.cwd.to_path_buf());
 +        #[cfg(target_os = "ios")]
 +        {
 +            return self.exec_command_ios(&request, cwd, context).await;
 +        }
 +
++        #[allow(unreachable_code)]
++
          let process = self
              .open_session_with_sandbox(&request, cwd.clone(), context)
              .await;
-@@ -305,6 +311,80 @@ impl UnifiedExecProcessManager {
+@@ -333,6 +340,81 @@ impl UnifiedExecProcessManager {
          Ok(response)
      }
  
@@ -206,6 +159,7 @@ index 6494c4f..eca836f 100644
 +            session_command: Some(request.command.clone()),
 +        })
 +    }
++
 +
      pub(crate) async fn write_stdin(
          &self,

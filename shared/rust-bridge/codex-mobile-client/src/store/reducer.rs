@@ -585,12 +585,27 @@ self.voice_state.reset_thread(key);
                 let generated_notification = generated::ThreadRealtimeStartedNotification {
                     thread_id: notification.thread_id.clone(),
                     session_id: notification.session_id.clone(),
+                    version: format!("{:?}", notification.version),
                 };
                 self.emit(AppUpdate::RealtimeStarted {
                     key: key.clone(),
                     notification: generated_notification,
                 });
                 self.emit(AppUpdate::ThreadChanged { key: key.clone() });
+            }
+            UiEvent::RealtimeTranscriptUpdated { key, role, text } => {
+                for update in self.voice_state.handle_typed_transcript_delta(key, role, text) {
+                    match update {
+                        VoiceDerivedUpdate::Transcript(update) => {
+                            self.apply_voice_transcript_update(key, &update);
+                            self.emit(AppUpdate::RealtimeTranscriptUpdated {
+                                key: key.clone(),
+                                update,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
             }
             UiEvent::RealtimeItemAdded { key, notification } => {
                 if let Ok(generated_item) =
@@ -644,6 +659,7 @@ self.voice_state.reset_thread(key);
                     generated::ThreadRealtimeOutputAudioDeltaNotification {
                         thread_id: notification.thread_id.clone(),
                         audio: generated::ThreadRealtimeAudioChunk {
+                            item_id: notification.audio.item_id.clone(),
                             data: notification.audio.data.clone(),
                             sample_rate: notification.audio.sample_rate,
                             num_channels: notification.audio.num_channels as u32,

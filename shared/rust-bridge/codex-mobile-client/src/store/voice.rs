@@ -49,6 +49,24 @@ impl VoiceRealtimeState {
             .remove(key);
     }
 
+    /// Handle a typed transcript delta directly (from upstream
+    /// `ThreadRealtimeTranscriptUpdated` notification).
+    pub fn handle_typed_transcript_delta(
+        &self,
+        key: &ThreadKey,
+        role: &str,
+        text: &str,
+    ) -> Vec<VoiceDerivedUpdate> {
+        let speaker = if role == "user" {
+            AppVoiceSpeaker::User
+        } else {
+            AppVoiceSpeaker::Assistant
+        };
+        let mut threads = self.threads.lock().expect("voice state lock poisoned");
+        let thread = threads.entry(key.clone()).or_default();
+        thread.handle_transcript_delta_str(text, speaker)
+    }
+
     pub fn handle_item(&self, key: &ThreadKey, item: &JsonValue) -> Vec<VoiceDerivedUpdate> {
         let mut threads = self.threads.lock().expect("voice state lock poisoned");
         let thread = threads.entry(key.clone()).or_default();
@@ -143,7 +161,15 @@ impl VoiceRealtimeThreadState {
         speaker: AppVoiceSpeaker,
     ) -> Vec<VoiceDerivedUpdate> {
         let delta = json_string_for_keys(item, &["delta"]).unwrap_or_default();
-        if delta.is_empty() || self.should_skip_delta(&delta, speaker) {
+        self.handle_transcript_delta_str(&delta, speaker)
+    }
+
+    fn handle_transcript_delta_str(
+        &mut self,
+        delta: &str,
+        speaker: AppVoiceSpeaker,
+    ) -> Vec<VoiceDerivedUpdate> {
+        if delta.is_empty() || self.should_skip_delta(delta, speaker) {
             return Vec::new();
         }
 

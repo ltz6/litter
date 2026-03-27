@@ -51,9 +51,7 @@ DEV_CARGO_ENV := env -u CARGO_INCREMENTAL
 
 PATCH_FILES := \
 	$(PATCHES_DIR)/ios-exec-hook.patch \
-	$(PATCHES_DIR)/realtime-transcript-deltas.patch \
-	$(PATCHES_DIR)/client-controlled-handoff.patch \
-	$(PATCHES_DIR)/android-vendored-openssl.patch
+	$(PATCHES_DIR)/client-controlled-handoff.patch
 
 BOUNDARY_SOURCES := \
 	$(RUST_DIR)/codegen/src/main.rs \

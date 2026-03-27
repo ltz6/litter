@@ -428,12 +428,9 @@ impl ServerSession {
         use codex_app_server_protocol::{ClientInfo, InitializeCapabilities, InitializeParams};
         use codex_arg0::Arg0DispatchPaths;
         use codex_cloud_requirements::cloud_requirements_loader;
-        use codex_core::ThreadManager;
         use codex_core::auth::AuthManager;
         use codex_core::config::ConfigBuilder;
         use codex_core::config_loader::LoaderOverrides;
-        use codex_core::features::Feature;
-        use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
         use codex_feedback::CodexFeedback;
         use codex_protocol::protocol::SessionSource;
 
@@ -519,25 +516,12 @@ impl ServerSession {
         let feedback = CodexFeedback::new();
         let session_source = SessionSource::VSCode;
 
-        let thread_manager = Arc::new(ThreadManager::new(
-            &resolved_config,
-            auth_manager.clone(),
-            session_source.clone(),
-            CollaborationModesConfig {
-                default_mode_request_user_input: resolved_config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
-
         let args = InProcessStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
             config: Arc::new(resolved_config),
             cli_overrides,
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements,
-            auth_manager: Some(auth_manager),
-            thread_manager: Some(thread_manager),
             feedback,
             config_warnings: Vec::new(),
             session_source,
@@ -1043,6 +1027,7 @@ fn remote_connect_args(config: &ServerConfig) -> (String, RemoteAppServerConnect
 
     let args = RemoteAppServerConnectArgs {
         websocket_url: url.clone(),
+        auth_token: None,
         client_name: "Litter".to_string(),
         client_version: "1.0".to_string(),
         experimental_api: true,
@@ -1130,16 +1115,6 @@ fn route_app_server_event(
             info!("remote event notification {:?}", notification);
 let _ = event_tx.send(ServerEvent::Notification(notification.clone()));
         }
-        AppServerEvent::LegacyNotification(notification) => {
-            info!("remote event legacy method={}", notification.method);
-let method = notification.method.clone();
-            let params = notification
-                .params
-                .clone()
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or(JsonValue::Null);
-            let _ = event_tx.send(ServerEvent::LegacyNotification { method, params });
-        }
         AppServerEvent::ServerRequest(request) => {
             info!("remote event server request {:?}", request);
 append_android_debug_log(&format!("server_request={request:?}"));
@@ -1165,15 +1140,6 @@ fn route_in_process_event(
     match event {
         InProcessServerEvent::ServerNotification(notification) => {
             let _ = event_tx.send(ServerEvent::Notification(notification));
-        }
-        InProcessServerEvent::LegacyNotification(notification) => {
-            let method = notification.method.clone();
-            let params = notification
-                .params
-                .clone()
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or(JsonValue::Null);
-            let _ = event_tx.send(ServerEvent::LegacyNotification { method, params });
         }
         InProcessServerEvent::ServerRequest(request) => {
             let _ = event_tx.send(ServerEvent::Request(request));

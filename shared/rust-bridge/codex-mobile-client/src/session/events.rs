@@ -115,6 +115,11 @@ pub enum UiEvent {
         key: ThreadKey,
         notification: codex_app_server_protocol::ThreadRealtimeItemAddedNotification,
     },
+    RealtimeTranscriptUpdated {
+        key: ThreadKey,
+        role: String,
+        text: String,
+    },
     RealtimeOutputAudioDelta {
         key: ThreadKey,
         notification: codex_app_server_protocol::ThreadRealtimeOutputAudioDeltaNotification,
@@ -376,6 +381,14 @@ self.emit(UiEvent::RealtimeStarted {
                 self.emit(UiEvent::RealtimeItemAdded {
                     key,
                     notification: n.clone(),
+                });
+            }
+            ServerNotification::ThreadRealtimeTranscriptUpdated(n) => {
+                let key = Self::make_key(server_id, &n.thread_id);
+                self.emit(UiEvent::RealtimeTranscriptUpdated {
+                    key,
+                    role: n.role.clone(),
+                    text: n.text.clone(),
                 });
             }
             ServerNotification::ThreadRealtimeOutputAudioDelta(n) => {

@@ -7,35 +7,11 @@ REPO_DIR="$(cd "$IOS_DIR/../.." && pwd)"
 SUBMODULE_DIR="$REPO_DIR/shared/third_party/codex"
 PATCH_FILES=(
     "$REPO_DIR/patches/codex/ios-exec-hook.patch"
-    "$REPO_DIR/patches/codex/realtime-transcript-deltas.patch"
     "$REPO_DIR/patches/codex/client-controlled-handoff.patch"
-    "$REPO_DIR/patches/codex/android-vendored-openssl.patch"
 )
 
 patch_already_upstreamed() {
-    local patch_name
-    patch_name="$(basename "$1")"
-    case "$patch_name" in
-        realtime-transcript-deltas.patch)
-            rg -q '"type": "input_transcript_delta"' \
-                "$SUBMODULE_DIR/codex-rs/app-server/src/bespoke_event_handling.rs" \
-                && rg -q '"type": "output_transcript_delta"' \
-                "$SUBMODULE_DIR/codex-rs/app-server/src/bespoke_event_handling.rs"
-            ;;
-        client-controlled-handoff.patch)
-            rg -q 'ThreadRealtimeResolveHandoff' \
-                "$SUBMODULE_DIR/codex-rs/app-server-protocol/src/protocol/common.rs" \
-                && rg -q 'client_controlled_handoff' \
-                "$SUBMODULE_DIR/codex-rs/app-server-protocol/src/protocol/v2.rs" \
-                && rg -q 'gpt-4o-mini-transcribe' \
-                "$SUBMODULE_DIR/codex-rs/codex-api/src/endpoint/realtime_websocket/methods.rs" \
-                && rg -q 'SessionAudioTranscription' \
-                "$SUBMODULE_DIR/codex-rs/codex-api/src/endpoint/realtime_websocket/protocol.rs"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    return 1
 }
 
 SYNC_MODE="${1:---preserve-current}"

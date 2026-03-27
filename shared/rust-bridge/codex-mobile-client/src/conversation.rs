@@ -572,6 +572,7 @@ fn convert_thread_item(
             ConversationItemContent::Divider(DividerData::ContextCompaction { is_complete: true }),
             false,
         ),
+        ThreadItem::HookPrompt { .. } => return None,
     };
 
     Some(ConversationItem {

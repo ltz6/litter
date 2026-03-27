@@ -38,6 +38,7 @@ impl AppServerAdapter {
     ) -> Result<Self, TransportError> {
         let args = RemoteAppServerConnectArgs {
             websocket_url: websocket_url.clone(),
+            auth_token: None,
             client_name,
             client_version,
             experimental_api,
