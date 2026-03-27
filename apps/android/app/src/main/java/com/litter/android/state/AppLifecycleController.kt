@@ -1,7 +1,7 @@
 package com.litter.android.state
 
 import android.content.Context
-import android.util.Log
+import com.litter.android.util.LLog
 import kotlinx.coroutines.sync.Mutex
 import uniffi.codex_mobile_client.ThreadKey
 import uniffi.codex_mobile_client.AppServerHealth
@@ -29,7 +29,7 @@ class AppLifecycleController {
      */
     suspend fun reconnectSavedServers(context: Context, appModel: AppModel) {
         if (!reconnectMutex.tryLock()) {
-            Log.d("AppLifecycleController", "reconnect already in progress; skipping")
+            LLog.t("AppLifecycleController", "reconnect already in progress; skipping")
             return
         }
         try {
@@ -41,7 +41,11 @@ class AppLifecycleController {
                 .mapTo(mutableSetOf()) { it.serverId }
             for (server in saved) {
                 if (server.id in activeServerIds) {
-                    Log.d("AppLifecycleController", "server already active; skipping reconnect ${server.id}")
+                    LLog.t(
+                        "AppLifecycleController",
+                        "server already active; skipping reconnect",
+                        fields = mapOf("serverId" to server.id),
+                    )
                     continue
                 }
                 try {
@@ -76,13 +80,23 @@ class AppLifecycleController {
                             )
                         }
                         else -> {
-                            Log.d("AppLifecycleController", "skipping reconnect for ${server.id}; no valid saved transport")
+                            LLog.t(
+                                "AppLifecycleController",
+                                "skipping reconnect; no valid saved transport",
+                                fields = mapOf("serverId" to server.id),
+                            )
                             continue
                         }
                     }
                     activeServerIds.add(server.id)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                     // Best-effort reconnection — server may be offline
+                    LLog.e(
+                        "AppLifecycleController",
+                        "saved server reconnect failed",
+                        e,
+                        fields = mapOf("serverId" to server.id, "host" to server.hostname, "os" to server.os),
+                    )
                 }
             }
             appModel.refreshSnapshot()
@@ -96,6 +110,17 @@ class AppLifecycleController {
         server: SavedServer,
         credential: SavedSshCredential,
     ) {
+        LLog.t(
+            "AppLifecycleController",
+            "reconnecting saved SSH server",
+            fields = mapOf(
+                "serverId" to server.id,
+                "host" to server.hostname,
+                "sshPort" to server.resolvedSshPort,
+                "authMethod" to credential.method.name,
+                "os" to server.os,
+            ),
+        )
         when (credential.method) {
             SshAuthMethod.PASSWORD -> {
                 appModel.ssh.sshConnectRemoteServer(

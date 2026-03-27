@@ -46,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -76,6 +77,7 @@ import uniffi.codex_mobile_client.HydratedConversationItem
 import uniffi.codex_mobile_client.HydratedConversationItemContent
 import uniffi.codex_mobile_client.HydratedPlanStepStatus
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 
 /**
  * Renders a single [HydratedConversationItem] by matching on its content type.
@@ -87,6 +89,8 @@ fun ConversationTimelineItem(
     serverId: String,
     agentDirectoryVersion: ULong,
     isLiveTurn: Boolean = false,
+    isStreamingMessage: Boolean = false,
+    onStreamingSnapshotRendered: (() -> Unit)? = null,
     onEditMessage: ((UInt) -> Unit)? = null,
     onForkFromMessage: ((UInt) -> Unit)? = null,
 ) {
@@ -103,6 +107,8 @@ fun ConversationTimelineItem(
             data = content.v1,
             serverId = serverId,
             agentDirectoryVersion = agentDirectoryVersion,
+            isStreamingMessage = isStreamingMessage,
+            onStreamingSnapshotRendered = onStreamingSnapshotRendered,
         )
 
         is HydratedConversationItemContent.Reasoning -> ReasoningRow(
@@ -255,9 +261,14 @@ private fun AssistantMessageRow(
     data: uniffi.codex_mobile_client.HydratedAssistantMessageData,
     serverId: String,
     agentDirectoryVersion: ULong,
+    isStreamingMessage: Boolean,
+    onStreamingSnapshotRendered: (() -> Unit)?,
 ) {
     val appModel = LocalAppModel.current
-    val segments = remember(itemId, data.text, serverId, agentDirectoryVersion) {
+    val segments = remember(itemId, data.text, serverId, agentDirectoryVersion, isStreamingMessage) {
+        if (isStreamingMessage) {
+            emptyList()
+        } else {
         MessageRenderCache.getSegments(
             key = MessageRenderCache.CacheKey(
                 itemId = itemId,
@@ -267,6 +278,41 @@ private fun AssistantMessageRow(
             parser = appModel.parser,
             text = data.text,
         )
+        }
+    }
+    var renderedText by remember(itemId) { mutableStateOf(data.text) }
+    var pendingText by remember(itemId) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(itemId) {
+        renderedText = data.text
+        pendingText = null
+        if (isStreamingMessage) {
+            onStreamingSnapshotRendered?.invoke()
+        }
+    }
+
+    LaunchedEffect(data.text, isStreamingMessage) {
+        if (!isStreamingMessage) {
+            renderedText = data.text
+            pendingText = null
+            return@LaunchedEffect
+        }
+        if (data.text == renderedText) return@LaunchedEffect
+        if (renderedText.isEmpty()) {
+            renderedText = data.text
+            onStreamingSnapshotRendered?.invoke()
+        } else {
+            pendingText = data.text
+        }
+    }
+
+    LaunchedEffect(pendingText, isStreamingMessage) {
+        val nextText = pendingText ?: return@LaunchedEffect
+        if (!isStreamingMessage) return@LaunchedEffect
+        delay(60)
+        renderedText = nextText
+        pendingText = null
+        onStreamingSnapshotRendered?.invoke()
     }
 
     Column(
@@ -292,8 +338,8 @@ private fun AssistantMessageRow(
             Spacer(Modifier.height(2.dp))
         }
 
-        if (segments.isEmpty()) {
-            MarkdownText(text = data.text)
+        if (isStreamingMessage || segments.isEmpty()) {
+            MarkdownText(text = renderedText)
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 segments.forEachIndexed { index, segment ->

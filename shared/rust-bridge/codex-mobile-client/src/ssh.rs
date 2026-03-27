@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::logging::{LogLevelName, log_rust};
 use base64::Engine;
@@ -36,6 +36,24 @@ fn append_android_debug_log(line: &str) {
 
 fn append_bridge_info_log(line: &str) {
     append_bridge_log(LogLevelName::Info, line);
+}
+
+fn remote_shell_name(shell: RemoteShell) -> &'static str {
+    match shell {
+        RemoteShell::Posix => "posix",
+        RemoteShell::PowerShell => "powershell",
+    }
+}
+
+fn remote_platform_name(platform: RemotePlatform) -> &'static str {
+    match platform {
+        RemotePlatform::MacosArm64 => "macos-arm64",
+        RemotePlatform::MacosX64 => "macos-x64",
+        RemotePlatform::LinuxArm64 => "linux-arm64",
+        RemotePlatform::LinuxX64 => "linux-x64",
+        RemotePlatform::WindowsX64 => "windows-x64",
+        RemotePlatform::WindowsArm64 => "windows-arm64",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +739,13 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
         prefer_ipv6: bool,
         shell: RemoteShell,
     ) -> Result<SshBootstrapResult, SshError> {
+        info!(
+            "ssh bootstrap begin binary={} shell={} prefer_ipv6={} working_dir={}",
+            codex_binary.path(),
+            remote_shell_name(shell),
+            prefer_ipv6,
+            working_dir.unwrap_or("<none>")
+        );
         // --- 2. Try candidate ports until one works ---------------------
         let cd_prefix = match (shell, working_dir) {
             (RemoteShell::Posix, Some(dir)) => format!("cd {} && ", shell_quote(dir)),
@@ -732,6 +757,12 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
 
         for offset in 0..PORT_CANDIDATES {
             let port = DEFAULT_REMOTE_PORT + offset;
+            trace!(
+                "ssh bootstrap port candidate shell={} port={} attempt={}",
+                remote_shell_name(shell),
+                port,
+                offset + 1
+            );
             append_bridge_info_log(&format!(
                 "ssh_bootstrap_candidate port={} attempt={}",
                 port,
@@ -835,6 +866,14 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
 
             let launch_result = self.exec_shell(&launch_cmd, shell).await?;
             let pid: Option<u32> = launch_result.stdout.trim().parse().ok();
+            info!(
+                "ssh bootstrap launched shell={} port={} pid={:?} stdout_len={} stderr_len={}",
+                remote_shell_name(shell),
+                port,
+                pid,
+                launch_result.stdout.trim().len(),
+                launch_result.stderr.trim().len()
+            );
             append_bridge_info_log(&format!(
                 "ssh_bootstrap_launch_result port={} pid={:?} stdout={} stderr={}",
                 port,
@@ -862,8 +901,21 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
                             )
                             .await;
                         if tail.to_ascii_lowercase().contains("address already in use") {
+                            info!(
+                                "ssh bootstrap process exited due to occupied port shell={} port={} pid={:?}",
+                                remote_shell_name(shell),
+                                port,
+                                pid
+                            );
                             break; // try next port
                         }
+                        warn!(
+                            "ssh bootstrap process exited before listen shell={} port={} pid={:?} tail={}",
+                            remote_shell_name(shell),
+                            port,
+                            pid,
+                            tail
+                        );
                         return Err(SshError::ExecFailed {
                             exit_code: 1,
                             stderr: if tail.is_empty() {
@@ -883,8 +935,19 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
                     .fetch_process_log_tail_shell(&log_path, stderr_log_path.as_deref(), shell)
                     .await;
                 if tail.to_ascii_lowercase().contains("address already in use") {
+                    info!(
+                        "ssh bootstrap listen timeout due to occupied port shell={} port={}",
+                        remote_shell_name(shell),
+                        port
+                    );
                     continue; // try next port
                 }
+                warn!(
+                    "ssh bootstrap timed out waiting for listen shell={} port={} tail={}",
+                    remote_shell_name(shell),
+                    port,
+                    tail
+                );
                 if offset == PORT_CANDIDATES - 1 {
                     return Err(SshError::ExecFailed {
                         exit_code: 1,
@@ -943,6 +1006,14 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             let version = self
                 .read_server_version_shell(codex_binary.path(), shell)
                 .await;
+            info!(
+                "ssh bootstrap complete shell={} remote_port={} local_port={} pid={:?} version={}",
+                remote_shell_name(shell),
+                port,
+                local_port,
+                pid,
+                version.clone().unwrap_or_else(|| "<unknown>".to_string())
+            );
             append_bridge_info_log(&format!(
                 "ssh_bootstrap_success port={} local_port={} pid={:?} version={}",
                 port,
@@ -1007,6 +1078,10 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             Some(s) => s,
             None => self.detect_remote_shell().await,
         };
+        trace!(
+            "ssh resolve codex binary shell={}",
+            remote_shell_name(shell)
+        );
 
         let script = match shell {
             RemoteShell::PowerShell => resolve_codex_binary_script_powershell(),
@@ -1016,14 +1091,33 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
         let result = self.exec_shell(&script, shell).await?;
         let raw = result.stdout.trim();
         if raw.is_empty() {
+            info!(
+                "ssh resolve codex binary missing shell={}",
+                remote_shell_name(shell)
+            );
             return Ok(None);
         }
         if let Some(path) = raw.strip_prefix("codex:") {
+            info!(
+                "ssh resolve codex binary found selector=codex shell={} path={}",
+                remote_shell_name(shell),
+                path
+            );
             return Ok(Some(RemoteCodexBinary::Codex(path.to_string())));
         }
         if let Some(path) = raw.strip_prefix("app-server:") {
+            info!(
+                "ssh resolve codex binary found selector=app-server shell={} path={}",
+                remote_shell_name(shell),
+                path
+            );
             return Ok(Some(RemoteCodexBinary::AppServer(path.to_string())));
         }
+        warn!(
+            "ssh resolve codex binary unexpected selector shell={} raw={}",
+            remote_shell_name(shell),
+            raw
+        );
         Err(SshError::ExecFailed {
             exit_code: 1,
             stderr: format!("unexpected remote codex binary selector: {raw}"),
@@ -1276,6 +1370,7 @@ fi"#
                 out, result.exit_code
             ));
             if out == "Windows_NT" {
+                info!("ssh detect shell result=powershell via=cmd_probe");
                 return RemoteShell::PowerShell;
             }
         }
@@ -1287,10 +1382,12 @@ fi"#
                 out, result.exit_code
             ));
             if out.contains("Windows") {
+                info!("ssh detect shell result=powershell via=ps_probe");
                 return RemoteShell::PowerShell;
             }
         }
         append_bridge_info_log("ssh_detect_shell result=Posix");
+        info!("ssh detect shell result=posix");
         RemoteShell::Posix
     }
 
@@ -1302,6 +1399,11 @@ fi"#
         command: &str,
         shell: RemoteShell,
     ) -> Result<ExecResult, SshError> {
+        trace!(
+            "ssh exec shell={} command_len={}",
+            remote_shell_name(shell),
+            command.len()
+        );
         match shell {
             RemoteShell::Posix => self.exec(command).await,
             RemoteShell::PowerShell => {
@@ -1339,6 +1441,10 @@ fi"#
             Some(s) => s,
             None => self.detect_remote_shell().await,
         };
+        info!(
+            "ssh detect platform start shell={}",
+            remote_shell_name(shell)
+        );
 
         match shell {
             RemoteShell::PowerShell => {
@@ -1351,7 +1457,7 @@ fi"#
                 let mut lines = result.stdout.lines();
                 let os = lines.next().unwrap_or_default().trim();
                 let arch = lines.next().unwrap_or_default().trim();
-                match (os, arch) {
+                let platform = match (os, arch) {
                     ("Windows_NT", "AMD64") | ("Windows_NT", "x86_64") => {
                         Ok(RemotePlatform::WindowsX64)
                     }
@@ -1362,7 +1468,15 @@ fi"#
                         exit_code: 1,
                         stderr: format!("unsupported Windows platform: os={os} arch={arch}"),
                     }),
-                }
+                }?;
+                info!(
+                    "ssh detect platform result shell={} os={} arch={} platform={}",
+                    remote_shell_name(shell),
+                    os,
+                    arch,
+                    remote_platform_name(platform)
+                );
+                Ok(platform)
             }
             RemoteShell::Posix => {
                 let result = self
@@ -1371,7 +1485,7 @@ fi"#
                 let mut lines = result.stdout.lines();
                 let os = lines.next().unwrap_or_default().trim();
                 let arch = lines.next().unwrap_or_default().trim();
-                match (os, arch) {
+                let platform = match (os, arch) {
                     ("Darwin", "arm64") | ("Darwin", "aarch64") => Ok(RemotePlatform::MacosArm64),
                     ("Darwin", "x86_64") | ("Darwin", "amd64") => Ok(RemotePlatform::MacosX64),
                     ("Linux", "aarch64") | ("Linux", "arm64") => Ok(RemotePlatform::LinuxArm64),
@@ -1380,7 +1494,15 @@ fi"#
                         exit_code: 1,
                         stderr: format!("unsupported remote platform: os={os} arch={arch}"),
                     }),
-                }
+                }?;
+                info!(
+                    "ssh detect platform result shell={} os={} arch={} platform={}",
+                    remote_shell_name(shell),
+                    os,
+                    arch,
+                    remote_platform_name(platform)
+                );
+                Ok(platform)
             }
         }
     }
@@ -1389,10 +1511,24 @@ fi"#
         &self,
         platform: RemotePlatform,
     ) -> Result<RemoteCodexBinary, SshError> {
+        info!(
+            "ssh install codex start platform={}",
+            remote_platform_name(platform)
+        );
         if platform.is_windows() {
+            info!(
+                "ssh install codex using npm platform={}",
+                remote_platform_name(platform)
+            );
             return self.install_codex_via_npm(RemoteShell::PowerShell).await;
         }
         let release = fetch_latest_stable_codex_release(platform).await?;
+        info!(
+            "ssh install codex using release platform={} tag={} asset={}",
+            remote_platform_name(platform),
+            release.tag_name,
+            release.asset_name
+        );
         let install_script = format!(
             r#"set -e
 tag={tag}
@@ -1450,6 +1586,11 @@ printf '%s' "$stable_bin""#,
             });
         }
         let installed_path = result.stdout.trim();
+        info!(
+            "ssh install codex completed platform={} path={}",
+            remote_platform_name(platform),
+            if installed_path.is_empty() { "$HOME/.litter/bin/codex" } else { installed_path }
+        );
         Ok(RemoteCodexBinary::Codex(if installed_path.is_empty() {
             "$HOME/.litter/bin/codex".to_string()
         } else {
@@ -1463,6 +1604,10 @@ printf '%s' "$stable_bin""#,
         &self,
         shell: RemoteShell,
     ) -> Result<RemoteCodexBinary, SshError> {
+        info!(
+            "ssh npm install codex start shell={}",
+            remote_shell_name(shell)
+        );
         let script = match shell {
             RemoteShell::PowerShell => {
                 r#"$ErrorActionPreference = 'Stop'
@@ -1492,6 +1637,12 @@ if [ -x "$bin" ]; then printf 'CODEX_PATH:%s' "$bin"; else echo "codex not found
 
         let result = self.exec_shell(&script, shell).await?;
         if result.exit_code != 0 {
+            warn!(
+                "ssh npm install codex failed shell={} exit_code={} stderr={}",
+                remote_shell_name(shell),
+                result.exit_code,
+                result.stderr.trim()
+            );
             return Err(SshError::ExecFailed {
                 exit_code: result.exit_code,
                 stderr: if result.stderr.trim().is_empty() {
@@ -1507,7 +1658,14 @@ if [ -x "$bin" ]; then printf 'CODEX_PATH:%s' "$bin"; else echo "codex not found
             .find_map(|line| line.trim().strip_prefix("CODEX_PATH:"))
             .map(|p| p.trim().to_string());
         match installed_path {
-            Some(path) if !path.is_empty() => Ok(RemoteCodexBinary::Codex(path)),
+            Some(path) if !path.is_empty() => {
+                info!(
+                    "ssh npm install codex completed shell={} path={}",
+                    remote_shell_name(shell),
+                    path
+                );
+                Ok(RemoteCodexBinary::Codex(path))
+            }
             _ => {
                 append_bridge_info_log(&format!(
                     "ssh_npm_install_no_path stdout={:?} stderr={:?}",

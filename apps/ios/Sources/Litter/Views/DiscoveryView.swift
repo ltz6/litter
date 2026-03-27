@@ -231,6 +231,15 @@ struct DiscoveryView: View {
         ) { snapshot in
             Button("Install") {
                 Task {
+                    LLog.trace(
+                        "discovery",
+                        "responding to install prompt",
+                        fields: [
+                            "serverId": snapshot.serverId,
+                            "install": true,
+                            "detail": snapshot.connectionProgressDetail ?? ""
+                        ]
+                    )
                     _ = try? await appModel.ssh.sshRespondToInstallPrompt(
                         serverId: snapshot.serverId,
                         install: true
@@ -239,6 +248,15 @@ struct DiscoveryView: View {
             }
             Button("Cancel", role: .cancel) {
                 Task {
+                    LLog.trace(
+                        "discovery",
+                        "responding to install prompt",
+                        fields: [
+                            "serverId": snapshot.serverId,
+                            "install": false,
+                            "detail": snapshot.connectionProgressDetail ?? ""
+                        ]
+                    )
                     _ = try? await appModel.ssh.sshRespondToInstallPrompt(
                         serverId: snapshot.serverId,
                         install: false
@@ -820,6 +838,22 @@ struct DiscoveryView: View {
         credentials: SSHCredentials,
         port: UInt16
     ) async throws -> String {
+        let authMethod: String = switch credentials {
+        case .password:
+            "password"
+        case .key:
+            "private_key"
+        }
+        LLog.trace(
+            "discovery",
+            "starting guided SSH connect",
+            fields: [
+                "serverId": serverId,
+                "host": host,
+                "sshPort": Int(port),
+                "authMethod": authMethod
+            ]
+        )
         switch credentials {
         case .password(let username, let password):
             return try await appModel.ssh.sshStartRemoteServerConnect(

@@ -100,7 +100,7 @@ $(shell mkdir -p $(STAMPS))
 	sync patch unpatch xcgen ios-frameworks \
 	ios-build ios-build-sim ios-build-sim-fast ios-build-device ios-build-device-fast \
 	test test-rust test-ios test-android \
-	testflight play-upload \
+	testflight play-upload play-release \
 	clean clean-rust clean-ios clean-android \
 	rebuild-bindings tui tui-run help
 
@@ -175,8 +175,11 @@ android-device-run: android-fast
 	} && \
 	adb -s "$$DEVICE" shell am start -n $(ANDROID_PACKAGE)/$(ANDROID_ACTIVITY)
 
-android-release:
-	@$(MAKE) android-fast ANDROID_RUST_PROFILE=release ANDROID_ABIS="$(ANDROID_RELEASE_ABIS)"
+android-release: ANDROID_RUST_PROFILE=release
+android-release: ANDROID_ABIS=$(ANDROID_RELEASE_ABIS)
+android-release: rust-android
+	@echo "==> Building Android release..."
+	@cd $(ANDROID_DIR) && $(ANDROID_ENV) ./gradlew :app:assembleRelease
 
 rust-ios: rust-ios-package
 
@@ -380,11 +383,19 @@ test-android:
 
 testflight: ios
 	@echo "==> Uploading to TestFlight..."
-	@$(IOS_SCRIPTS)/testflight-upload.sh
+	@MARKETING_VERSION=1.0.1 $(IOS_SCRIPTS)/testflight-upload.sh
 
 play-upload: android-release
 	@echo "==> Uploading to Google Play..."
 	@$(ANDROID_DIR)/scripts/play-upload.sh
+
+play-release:
+	@if [ -n "$$LITTER_VERSION_CODE_OVERRIDE" ]; then \
+		echo "==> Using overridden Android versionCode $$LITTER_VERSION_CODE_OVERRIDE"; \
+	else \
+		$(ANDROID_DIR)/scripts/bump-version.sh; \
+	fi
+	@$(MAKE) play-upload
 
 clean: clean-rust clean-ios clean-android
 	@rm -rf $(STAMPS)

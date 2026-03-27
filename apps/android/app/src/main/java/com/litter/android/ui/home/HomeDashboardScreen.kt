@@ -67,6 +67,8 @@ import com.litter.android.state.isIpcConnected
 import com.litter.android.state.statusColor
 import com.litter.android.state.statusLabel
 import com.litter.android.ui.LocalAppModel
+import com.litter.android.ui.ExperimentalFeatures
+import com.litter.android.ui.LitterFeature
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.AppServerSnapshot
@@ -244,7 +246,11 @@ fun HomeDashboardScreen(
     }
 
     // Voice orb FAB
-    if (onStartVoice != null && servers.isNotEmpty()) {
+    if (
+        onStartVoice != null &&
+            servers.isNotEmpty() &&
+            ExperimentalFeatures.isEnabled(LitterFeature.REALTIME_VOICE)
+    ) {
         val voiceController = remember { com.litter.android.state.VoiceRuntimeController.shared }
         val voiceSession by voiceController.activeVoiceSession.collectAsState()
         val snapshot by appModel.snapshot.collectAsState()

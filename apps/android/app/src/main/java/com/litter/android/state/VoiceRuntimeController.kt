@@ -75,6 +75,7 @@ class VoiceRuntimeController {
     private var captureJob: Job? = null
     private var handoffManager: HandoffManager? = null
     private var aecBridge: AecBridge? = null
+    private var stopRequestedThreadKey: ThreadKey? = null
 
     // Audio I/O
     private var audioRecord: AudioRecord? = null
@@ -115,13 +116,34 @@ class VoiceRuntimeController {
 
     suspend fun stopActiveVoiceSession(appModel: AppModel) {
         val session = _activeSession.value ?: return
+        val key = session.threadKey
+        synchronized(sessionLock) {
+            if (stopRequestedThreadKey == key) {
+                return
+            }
+            stopRequestedThreadKey = key
+        }
+        cleanup(clearStopRequest = false)
         try {
             appModel.rpc.threadRealtimeStop(
-                session.threadKey.serverId,
-                ThreadRealtimeStopParams(threadId = session.threadKey.threadId),
+                key.serverId,
+                ThreadRealtimeStopParams(threadId = key.threadId),
             )
         } catch (_: Exception) {}
-        cleanup()
+        synchronized(sessionLock) {
+            if (stopRequestedThreadKey == key) {
+                stopRequestedThreadKey = null
+            }
+        }
+    }
+
+    suspend fun stopVoiceSessionIfActive(appModel: AppModel, threadKey: ThreadKey) {
+        val shouldStop = synchronized(sessionLock) {
+            _activeSession.value?.threadKey == threadKey || stopRequestedThreadKey == threadKey
+        }
+        if (shouldStop) {
+            stopActiveVoiceSession(appModel)
+        }
     }
 
     // ── Audio capture ────────────────────────────────────────────────────────
@@ -213,9 +235,10 @@ class VoiceRuntimeController {
 
         captureJob = scope.launch {
             val buffer = ShortArray(bufferSize / 2)
-            while (isCapturing) {
+            while (shouldContinueCapturing(threadKey)) {
                 val read = recorder.read(buffer, 0, buffer.size)
                 if (read <= 0) continue
+                if (!shouldContinueCapturing(threadKey)) break
 
                 // Compute input level (RMS)
                 val rms = computeRms(buffer, read)
@@ -243,6 +266,7 @@ class VoiceRuntimeController {
                 val base64Data = Base64.encodeToString(pcm16, Base64.NO_WRAP)
 
                 // Send to server
+                if (!shouldContinueCapturing(threadKey)) break
                 try {
                     appModel.rpc.threadRealtimeAppendAudio(
                         threadKey.serverId,
@@ -556,6 +580,7 @@ class VoiceRuntimeController {
             is AppStoreUpdateRecord.RealtimeStarted -> {
                 android.util.Log.i("VoiceRuntime", "RealtimeStarted!")
                 val threadKey = _activeSession.value?.threadKey ?: return
+                if (update.key != threadKey || isStopRequested(threadKey)) return
                 startAudioCapture(appModel, threadKey)
             }
 
@@ -567,7 +592,10 @@ class VoiceRuntimeController {
                     "VoiceSessionChanged: active=${voiceSession?.activeThread != null} phase=${voiceSession?.phase} error=${voiceSession?.lastError}",
                 )
                 // VoiceSessionChanged while CONNECTING means the server accepted and session is live
-                if (session.threadKey == voiceSession?.activeThread && !isCapturing) {
+                if (session.threadKey == voiceSession?.activeThread &&
+                    !isCapturing &&
+                    !isStopRequested(session.threadKey)
+                ) {
                     android.util.Log.i("VoiceRuntime", "Voice session active in snapshot, starting audio")
                     startAudioCapture(appModel, session.threadKey)
                 }
@@ -582,16 +610,22 @@ class VoiceRuntimeController {
                 playOutputAudio(audio.data, audio.sampleRate.toInt())
             }
             is AppStoreUpdateRecord.RealtimeError -> {
+                if (!matchesCurrentSession(update.key)) return
                 android.util.Log.e(
                     "VoiceRuntime",
                     "RealtimeError thread=${update.key.threadId} message=${update.notification.message}",
                 )
+                if (!update.notification.message.contains("active response in progress", ignoreCase = true)) {
+                    cleanupForThread(update.key)
+                }
             }
             is AppStoreUpdateRecord.RealtimeClosed -> {
+                if (!matchesCurrentSession(update.key)) return
                 android.util.Log.i(
                     "VoiceRuntime",
                     "RealtimeClosed thread=${update.key.threadId} reason=${update.notification.reason}",
                 )
+                cleanupForThread(update.key)
             }
             else -> {}
         }
@@ -924,7 +958,30 @@ class VoiceRuntimeController {
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
 
-    private fun cleanup() {
+    private fun shouldContinueCapturing(threadKey: ThreadKey): Boolean {
+        val isSessionCurrent = synchronized(sessionLock) {
+            _activeSession.value?.threadKey == threadKey && stopRequestedThreadKey != threadKey
+        }
+        val captureActive = synchronized(captureLock) {
+            isCapturing
+        }
+        return isSessionCurrent && captureActive
+    }
+
+    private fun isStopRequested(threadKey: ThreadKey): Boolean =
+        synchronized(sessionLock) { stopRequestedThreadKey == threadKey }
+
+    private fun matchesCurrentSession(threadKey: ThreadKey): Boolean =
+        synchronized(sessionLock) {
+            _activeSession.value?.threadKey == threadKey || stopRequestedThreadKey == threadKey
+        }
+
+    private fun cleanupForThread(threadKey: ThreadKey, clearStopRequest: Boolean = true) {
+        if (!matchesCurrentSession(threadKey)) return
+        cleanup(clearStopRequest = clearStopRequest)
+    }
+
+    private fun cleanup(clearStopRequest: Boolean = true) {
         synchronized(captureLock) {
             isCapturing = false
             captureJob?.cancel()
@@ -960,6 +1017,11 @@ class VoiceRuntimeController {
         inputDecayToken = null
         outputDecayToken = null
         captureSampleRate = TARGET_SAMPLE_RATE
+        if (clearStopRequest) {
+            synchronized(sessionLock) {
+                stopRequestedThreadKey = null
+            }
+        }
         _activeSession.value = null
     }
 }

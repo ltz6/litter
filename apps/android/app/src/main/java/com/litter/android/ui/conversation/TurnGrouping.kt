@@ -93,7 +93,6 @@ data class TranscriptTurn(
  */
 fun buildTranscriptTurns(
     items: List<HydratedConversationItem>,
-    activeTurnId: String?,
     isStreaming: Boolean,
     expandedRecentTurnCount: Int,
 ): List<TranscriptTurn> {
@@ -109,7 +108,7 @@ fun buildTranscriptTurns(
             id = turnIdentifier(turnItems, index),
             turnId = turnId,
             items = turnItems,
-            isActiveTurn = (isStreaming && index == lastIndex) || turnId == activeTurnId,
+            isActiveTurn = isStreaming && index == lastIndex,
             isCollapsedByDefault = index < collapseBoundary,
         )
     }

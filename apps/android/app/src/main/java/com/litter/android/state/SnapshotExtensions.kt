@@ -8,6 +8,7 @@ import uniffi.codex_mobile_client.AppServerConnectionStepState
 import uniffi.codex_mobile_client.AppServerSnapshot
 import uniffi.codex_mobile_client.AppThreadSnapshot
 import uniffi.codex_mobile_client.HydratedConversationItemContent
+import uniffi.codex_mobile_client.ThreadSummaryStatus
 
 /** Accent green matching iOS theme. */
 private val AccentGreen = Color(0xFF00FF9C)
@@ -87,8 +88,11 @@ val AppServerSnapshot.statusColor: Color
 
 // --- AppThreadSnapshot extensions --------------------------------------------
 
+val ThreadSummaryStatus.isActiveStatus: Boolean
+    get() = this == ThreadSummaryStatus.ACTIVE
+
 val AppThreadSnapshot.hasActiveTurn: Boolean
-    get() = activeTurnId != null
+    get() = activeTurnId?.trim()?.isNotEmpty() == true || info.status.isActiveStatus
 
 val AppThreadSnapshot.resolvedModel: String
     get() = model ?: info.model ?: ""
