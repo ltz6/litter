@@ -173,8 +173,9 @@ jobs:
           if [ -d "$SHARED_PREP_ROOT/shared" ]; then
             SHARED_PREP_ROOT="$SHARED_PREP_ROOT/shared"
           fi
+          SHARED_PREP_PATCH="$PWD/$SHARED_PREP_ROOT/codex-submodule.patch"
 
-          git -C shared/third_party/codex apply --binary "$SHARED_PREP_ROOT/codex-submodule.patch"
+          git -C shared/third_party/codex apply --binary "$SHARED_PREP_PATCH"
           tar -xzf "$SHARED_PREP_ROOT/generated-mobile-sources.tgz" -C .
           mkdir -p .build-stamps
           touch .build-stamps/sync .build-stamps/bindings-kotlin
@@ -243,8 +244,9 @@ jobs:
           if [ -d "$SHARED_PREP_ROOT/shared" ]; then
             SHARED_PREP_ROOT="$SHARED_PREP_ROOT/shared"
           fi
+          SHARED_PREP_PATCH="$PWD/$SHARED_PREP_ROOT/codex-submodule.patch"
 
-          git -C shared/third_party/codex apply --binary "$SHARED_PREP_ROOT/codex-submodule.patch"
+          git -C shared/third_party/codex apply --binary "$SHARED_PREP_PATCH"
           tar -xzf "$SHARED_PREP_ROOT/generated-mobile-sources.tgz" -C .
 
       - name: Build Rust for iOS simulator
