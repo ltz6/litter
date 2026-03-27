@@ -17,6 +17,7 @@ import uniffi.codex_mobile_client.AppServerRpc
 import uniffi.codex_mobile_client.AppSnapshotRecord
 import uniffi.codex_mobile_client.AppStore
 import uniffi.codex_mobile_client.AppStoreSubscription
+import uniffi.codex_mobile_client.AppThreadSnapshot
 import uniffi.codex_mobile_client.AppStoreUpdateRecord
 import uniffi.codex_mobile_client.DiscoveryBridge
 import uniffi.codex_mobile_client.HandoffManager
@@ -149,9 +150,8 @@ class AppModel private constructor(context: android.content.Context) {
 
     suspend fun refreshSnapshot() {
         try {
-            val snap = applySavedServerNames(store.snapshot())
-            _snapshot.value = snap
-            _lastError.value = null
+            val snap = store.snapshot()
+            applySnapshot(snap)
             val serverSummary = snap.servers.joinToString(separator = " | ") { server ->
                 "${server.serverId}:${server.displayName}:${server.host}:${server.port}:${server.health}"
             }
@@ -162,6 +162,13 @@ class AppModel private constructor(context: android.content.Context) {
             )
         } catch (e: Exception) {
             _lastError.value = e.message
+        }
+    }
+
+    private fun applySnapshot(snapshot: AppSnapshotRecord?) {
+        _snapshot.value = snapshot?.let(::applySavedServerNames)
+        if (snapshot != null) {
+            _lastError.value = null
         }
     }
 
@@ -334,10 +341,74 @@ class AppModel private constructor(context: android.content.Context) {
     // --- Internal event handling ----------------------------------------------
 
     private suspend fun handleUpdate(update: AppStoreUpdateRecord) {
-        // All update types trigger a snapshot refresh.
-        // Rust's AppStore handles fine-grained state management internally.
-        // We could optimize to only refresh affected parts, but snapshot()
-        // is cheap since Rust builds it from in-memory state.
-        refreshSnapshot()
+        when (update) {
+            is AppStoreUpdateRecord.ThreadChanged -> refreshThreadSnapshot(update.key)
+            is AppStoreUpdateRecord.ThreadRemoved -> removeThreadSnapshot(update.key)
+            is AppStoreUpdateRecord.ActiveThreadChanged -> {
+                updateActiveThread(update.key)
+                if (update.key != null && snapshot.value?.threads?.any { it.key == update.key } != true) {
+                    refreshThreadSnapshot(update.key)
+                }
+            }
+            is AppStoreUpdateRecord.PendingApprovalsChanged -> refreshSnapshot()
+            is AppStoreUpdateRecord.PendingUserInputsChanged -> refreshSnapshot()
+            is AppStoreUpdateRecord.ServerChanged -> refreshSnapshot()
+            is AppStoreUpdateRecord.ServerRemoved -> refreshSnapshot()
+            is AppStoreUpdateRecord.FullResync -> refreshSnapshot()
+            is AppStoreUpdateRecord.VoiceSessionChanged -> refreshSnapshot()
+            is AppStoreUpdateRecord.RealtimeTranscriptUpdated -> Unit
+            is AppStoreUpdateRecord.RealtimeHandoffRequested -> Unit
+            is AppStoreUpdateRecord.RealtimeSpeechStarted -> Unit
+            is AppStoreUpdateRecord.RealtimeStarted -> refreshSnapshot()
+            is AppStoreUpdateRecord.RealtimeOutputAudioDelta -> Unit
+            is AppStoreUpdateRecord.RealtimeError -> refreshSnapshot()
+            is AppStoreUpdateRecord.RealtimeClosed -> refreshSnapshot()
+        }
+    }
+
+    private suspend fun refreshThreadSnapshot(key: ThreadKey) {
+        if (_snapshot.value == null) {
+            refreshSnapshot()
+            return
+        }
+
+        try {
+            val threadSnapshot = store.threadSnapshot(key)
+            if (threadSnapshot == null) {
+                removeThreadSnapshot(key)
+                return
+            }
+            applyThreadSnapshot(threadSnapshot)
+        } catch (e: Exception) {
+            _lastError.value = e.message
+            refreshSnapshot()
+        }
+    }
+
+    private fun applyThreadSnapshot(thread: AppThreadSnapshot) {
+        val current = _snapshot.value ?: return
+        val existingIndex = current.threads.indexOfFirst { it.key == thread.key }
+        val updatedThreads = current.threads.toMutableList().apply {
+            if (existingIndex >= 0) {
+                this[existingIndex] = thread
+            } else {
+                add(thread)
+            }
+        }
+        _snapshot.value = current.copy(threads = updatedThreads)
+        _lastError.value = null
+    }
+
+    private fun removeThreadSnapshot(key: ThreadKey) {
+        val current = _snapshot.value ?: return
+        _snapshot.value = current.copy(
+            threads = current.threads.filterNot { it.key == key },
+            activeThread = if (current.activeThread == key) null else current.activeThread,
+        )
+    }
+
+    private fun updateActiveThread(key: ThreadKey?) {
+        val current = _snapshot.value ?: return
+        _snapshot.value = current.copy(activeThread = key)
     }
 }

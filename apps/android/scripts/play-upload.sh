@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ANDROID_DIR="$REPO_DIR/apps/android"
+GRADLEW="$ANDROID_DIR/gradlew"
 
 VARIANT="${VARIANT:-Release}"
 UPLOAD="${UPLOAD:-1}"
@@ -43,7 +44,7 @@ if [[ "$UPLOAD" == "1" ]]; then
 
     TASK=":app:publish${VARIANT}Bundle"
     echo "==> Publishing $VARIANT bundle to Google Play track '$TRACK'"
-    gradle -p "$ANDROID_DIR" "$TASK" \
+    "$GRADLEW" -p "$ANDROID_DIR" "$TASK" \
         -PLITTER_PLAY_SERVICE_ACCOUNT_JSON="$LITTER_PLAY_SERVICE_ACCOUNT_JSON" \
         -PLITTER_PLAY_TRACK="$TRACK" \
         -PLITTER_UPLOAD_STORE_FILE="$LITTER_UPLOAD_STORE_FILE" \
@@ -53,7 +54,7 @@ if [[ "$UPLOAD" == "1" ]]; then
 else
     TASK=":app:bundle${VARIANT}"
     echo "==> Building local AAB for $VARIANT (no upload)"
-    gradle -p "$ANDROID_DIR" "$TASK"
+    "$GRADLEW" -p "$ANDROID_DIR" "$TASK"
 fi
 
 echo "==> Done"

@@ -14,7 +14,7 @@ APP_STORE_APP_ID="${APP_STORE_APP_ID:-}"
 TEAM_ID="${TEAM_ID:-}"
 PROVISIONING_PROFILE_SPECIFIER="${PROVISIONING_PROFILE_SPECIFIER:-Litter App Store}"
 EXPORT_SIGNING_STYLE="${EXPORT_SIGNING_STYLE:-automatic}"
-MARKETING_VERSION="${MARKETING_VERSION:-}"
+MARKETING_VERSION="${MARKETING_VERSION:-1.0.1}"
 BUILD_NUMBER="${BUILD_NUMBER:-}"
 ASSIGN_BETA_GROUP="${ASSIGN_BETA_GROUP:-1}"
 INTERNAL_BETA_GROUP_NAME="${INTERNAL_BETA_GROUP_NAME:-Internal Testers}"
@@ -65,6 +65,11 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
+if [[ "$MARKETING_VERSION" != "1.0.1" ]]; then
+    echo "TestFlight uploads must use MARKETING_VERSION=1.0.1 (got $MARKETING_VERSION)" >&2
+    exit 1
+fi
+
 trim() {
     local value="$1"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -111,13 +116,6 @@ if [[ -z "$TEAM_ID" ]]; then
     )"
 fi
 
-if [[ -z "$MARKETING_VERSION" ]]; then
-    MARKETING_VERSION="$(
-        xcodebuild -project "$PROJECT_PATH" -scheme "$SCHEME" -configuration "$CONFIGURATION" -showBuildSettings |
-            awk -F' = ' '/ MARKETING_VERSION = / {print $2; exit}'
-    )"
-fi
-
 if [[ -z "$TEAM_ID" && "$EXPORT_SIGNING_STYLE" == "manual" ]]; then
     TEAM_ID="$(resolve_team_from_profile "$PROVISIONING_PROFILE_SPECIFIER" || true)"
 fi
@@ -130,12 +128,6 @@ fi
 if [[ -z "$TEAM_ID" ]]; then
     echo "Unable to resolve DEVELOPMENT_TEAM for signing." >&2
     echo "Set TEAM_ID explicitly or ensure the project build settings or provisioning profile can resolve it." >&2
-    exit 1
-fi
-
-if [[ -z "$MARKETING_VERSION" ]]; then
-    echo "Unable to resolve MARKETING_VERSION for release." >&2
-    echo "Set MARKETING_VERSION explicitly or ensure the project build settings define it." >&2
     exit 1
 fi
 

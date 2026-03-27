@@ -47,6 +47,11 @@ object LLog {
         }
     }
 
+    fun t(tag: String, message: String, fields: Map<String, Any?> = emptyMap(), payloadJson: String? = null) {
+        Log.v(tag, message)
+        emit(LogLevel.TRACE, tag, message, fields, payloadJson)
+    }
+
     fun d(tag: String, message: String, fields: Map<String, Any?> = emptyMap(), payloadJson: String? = null) {
         Log.d(tag, message)
         emit(LogLevel.DEBUG, tag, message, fields, payloadJson)

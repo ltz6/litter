@@ -6,7 +6,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use url::Url;
 
 use crate::discovery::{DiscoveredServer, DiscoveryConfig, DiscoveryService, MdnsSeed};
@@ -228,7 +228,7 @@ impl MobileClient {
         info!(
             "MobileClient: connect_remote_over_ssh start server_id={} host={} ssh_port={} accept_unknown_host={} working_dir={}",
             server_id,
-            ssh_credentials.host,
+            ssh_credentials.host.as_str(),
             ssh_credentials.port,
             accept_unknown_host,
             working_dir.as_deref().unwrap_or("<none>")
@@ -249,7 +249,7 @@ impl MobileClient {
         );
         info!(
             "MobileClient: SSH transport established server_id={} host={} ssh_port={}",
-            config.server_id, ssh_credentials.host, ssh_credentials.port
+            config.server_id, ssh_credentials.host.as_str(), ssh_credentials.port
         );
 
         let use_ipv6 = config.host.contains(':');
@@ -265,7 +265,7 @@ impl MobileClient {
                 );
                 warn!(
                     "MobileClient: remote ssh bootstrap failed server_id={} host={} error={}",
-                    config.server_id, ssh_credentials.host, error
+                    config.server_id, ssh_credentials.host.as_str(), error
                 );
                 ssh_client.disconnect().await;
                 return Err(map_ssh_transport_error(error));
@@ -274,7 +274,7 @@ impl MobileClient {
         info!(
             "MobileClient: remote ssh bootstrap succeeded server_id={} host={} remote_port={} local_tunnel_port={} pid={:?}",
             config.server_id,
-            ssh_credentials.host,
+            ssh_credentials.host.as_str(),
             bootstrap.server_port,
             bootstrap.tunnel_local_port,
             bootstrap.pid
@@ -299,6 +299,15 @@ impl MobileClient {
         ipc_socket_path_override: Option<String>,
     ) -> Result<String, TransportError> {
         let server_id = config.server_id.clone();
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh start server_id={} host={} bootstrap_remote_port={} bootstrap_local_port={} pid={:?} ipc_socket_path_override={}",
+            server_id,
+            ssh_credentials.host.as_str(),
+            bootstrap.server_port,
+            bootstrap.tunnel_local_port,
+            bootstrap.pid,
+            ipc_socket_path_override.as_deref().unwrap_or("<none>")
+        );
 
         config.port = bootstrap.server_port;
         config.websocket_url = Some(format!("ws://127.0.0.1:{}", bootstrap.tunnel_local_port));
@@ -308,6 +317,11 @@ impl MobileClient {
         let ipc_ssh_client = None;
         let ipc_bridge_pid = None;
 
+        #[cfg(target_os = "android")]
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh attaching IPC over SSH server_id={}",
+            server_id
+        );
         #[cfg(target_os = "android")]
         let ipc_client = match AssertUnwindSafe(attach_ipc_client_via_ssh(
             &ssh_client,
@@ -328,12 +342,22 @@ impl MobileClient {
         };
 
         #[cfg(not(target_os = "android"))]
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh attaching IPC over SSH server_id={}",
+            server_id
+        );
+        #[cfg(not(target_os = "android"))]
         let ipc_client = attach_ipc_client_via_ssh(
             &ssh_client,
             config.server_id.as_str(),
             ipc_socket_path_override.as_deref(),
         )
         .await;
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh IPC attach result server_id={} attached={}",
+            server_id,
+            ipc_client.is_some()
+        );
 
         let session = match ServerSession::connect_remote_with_resources(
             config,
@@ -355,7 +379,7 @@ impl MobileClient {
                 );
                 warn!(
                     "MobileClient: remote ssh session connect failed server_id={} host={} error={}",
-                    server_id, ssh_credentials.host, error
+                    server_id, ssh_credentials.host.as_str(), error
                 );
                 ssh_client.disconnect().await;
                 return Err(error);
@@ -364,6 +388,11 @@ impl MobileClient {
 
         self.app_store
             .upsert_server(session.config(), ServerHealthSnapshot::Connected);
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh session connected server_id={} websocket_url={}",
+            server_id,
+            session.config().websocket_url.as_deref().unwrap_or("<none>")
+        );
         if session.has_ipc() {
             self.app_store
                 .update_server_ipc_state(server_id.as_str(), true);
@@ -379,6 +408,10 @@ impl MobileClient {
         if let Err(error) = self.sync_server_account(server_id.as_str()).await {
             warn!("MobileClient: failed to sync account for {server_id}: {error}");
         }
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh account sync completed server_id={}",
+            server_id
+        );
         if let Err(error) = refresh_thread_list_from_app_server(
             Arc::clone(&session),
             Arc::clone(&self.app_store),
@@ -388,6 +421,10 @@ impl MobileClient {
         {
             warn!("MobileClient: failed to refresh thread list for {server_id}: {error}");
         }
+        trace!(
+            "MobileClient: finish_connect_remote_over_ssh thread refresh completed server_id={}",
+            server_id
+        );
 
         info!("MobileClient: connected remote SSH server {server_id}");
         Ok(server_id)

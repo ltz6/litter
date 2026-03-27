@@ -1,6 +1,4 @@
 package com.litter.android.ui.discovery
-
-import android.util.Log
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -69,6 +67,7 @@ import com.litter.android.state.statusColor
 import com.litter.android.state.statusLabel
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.LocalAppModel
+import com.litter.android.util.LLog
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -193,7 +192,7 @@ fun DiscoveryScreen(
         try {
             val connected = connectedSnapshot(entry, snapshot?.servers ?: emptyList())
             if (connected?.isConnected == true) {
-                Log.d(logTag, "server already connected: ${entry.id}")
+                LLog.t(logTag, "server already connected", fields = mapOf("serverId" to entry.id))
                 onDismiss()
                 return
             }
@@ -255,7 +254,16 @@ fun DiscoveryScreen(
                 }
             }
         } catch (e: Exception) {
-            Log.e(logTag, "server connect failed for ${entry.id}", e)
+            LLog.e(
+                logTag,
+                "server connect failed",
+                e,
+                fields = mapOf(
+                    "serverId" to entry.id,
+                    "host" to entry.hostname,
+                    "preferredConnectionMode" to entry.preferredConnectionMode,
+                ),
+            )
             connectError = e.message ?: "Unable to connect."
         }
     }
@@ -419,7 +427,17 @@ fun DiscoveryScreen(
                                         appModel.refreshSnapshot()
                                         onDismiss()
                                     } catch (e: Exception) {
-                                        Log.e(logTag, "direct codex connect failed for ${server.id}", e)
+                                        LLog.e(
+                                            logTag,
+                                            "direct codex connect failed",
+                                            e,
+                                            fields = mapOf(
+                                                "serverId" to server.id,
+                                                "host" to server.hostname,
+                                                "codexPort" to port,
+                                                "os" to server.os,
+                                            ),
+                                        )
                                         connectError = e.message ?: "Unable to connect."
                                     }
                                 }
@@ -463,7 +481,17 @@ fun DiscoveryScreen(
             onDismiss = { sshServer = null },
             onConnect = { credential, rememberCredentials ->
                 try {
-                    Log.d(logTag, "starting SSH connect for ${server.id} host=${server.hostname}:${server.resolvedSshPort}")
+                    LLog.t(
+                        logTag,
+                        "starting guided SSH connect",
+                        fields = mapOf(
+                            "serverId" to server.id,
+                            "host" to server.hostname,
+                            "sshPort" to server.resolvedSshPort,
+                            "authMethod" to credential.method.name,
+                            "os" to server.os,
+                        ),
+                    )
                     when (credential.method) {
                         SshAuthMethod.PASSWORD -> {
                             appModel.ssh.sshStartRemoteServerConnect(
@@ -509,11 +537,30 @@ fun DiscoveryScreen(
                     reloadSavedServers()
                     appModel.refreshSnapshot()
                     pendingAutoNavigateServerId = server.id
-                    Log.d(logTag, "SSH bootstrap started for ${server.id}")
+                    LLog.t(
+                        logTag,
+                        "guided SSH bootstrap started",
+                        fields = mapOf(
+                            "serverId" to server.id,
+                            "host" to server.hostname,
+                            "sshPort" to server.resolvedSshPort,
+                        ),
+                    )
                     sshServer = null
                     null
                 } catch (e: Exception) {
-                    Log.e(logTag, "SSH connect failed for ${server.id}", e)
+                    LLog.e(
+                        logTag,
+                        "guided SSH connect failed",
+                        e,
+                        fields = mapOf(
+                            "serverId" to server.id,
+                            "host" to server.hostname,
+                            "sshPort" to server.resolvedSshPort,
+                            "authMethod" to credential.method.name,
+                            "os" to server.os,
+                        ),
+                    )
                     e.message ?: "Unable to connect over SSH."
                 }
             },
@@ -552,6 +599,15 @@ fun DiscoveryScreen(
                 TextButton(
                     onClick = {
                         scope.launch {
+                            LLog.t(
+                                logTag,
+                                "responding to install prompt",
+                                fields = mapOf(
+                                    "serverId" to serverSnapshot.serverId,
+                                    "install" to true,
+                                    "detail" to serverSnapshot.connectionProgressDetail,
+                                ),
+                            )
                             appModel.ssh.sshRespondToInstallPrompt(serverSnapshot.serverId, true)
                         }
                     },
@@ -563,6 +619,15 @@ fun DiscoveryScreen(
                 TextButton(
                     onClick = {
                         scope.launch {
+                            LLog.t(
+                                logTag,
+                                "responding to install prompt",
+                                fields = mapOf(
+                                    "serverId" to serverSnapshot.serverId,
+                                    "install" to false,
+                                    "detail" to serverSnapshot.connectionProgressDetail,
+                                ),
+                            )
                             appModel.ssh.sshRespondToInstallPrompt(serverSnapshot.serverId, false)
                         }
                     },

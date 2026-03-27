@@ -56,6 +56,7 @@ fun LitterApp(appModel: AppModel) {
     LaunchedEffect(Unit) {
         TextSizePrefs.initialize(context)
         ConversationPrefs.initialize(context)
+        ExperimentalFeatures.initialize(context)
     }
 
     CompositionLocalProvider(

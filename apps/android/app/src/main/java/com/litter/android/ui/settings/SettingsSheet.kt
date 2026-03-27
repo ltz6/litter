@@ -85,6 +85,8 @@ import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterColorThemeType
 import com.litter.android.ui.BerkeleyMono
 import com.litter.android.ui.ConversationPrefs
+import com.litter.android.ui.ExperimentalFeatures
+import com.litter.android.ui.LitterFeature
 import com.litter.android.ui.WallpaperBackdrop
 import com.litter.android.ui.WallpaperManager
 import com.litter.android.ui.LitterTheme
@@ -93,8 +95,6 @@ import com.litter.android.ui.LitterThemeManager
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.Account
 import uniffi.codex_mobile_client.AppServerSnapshot
-import uniffi.codex_mobile_client.ExperimentalFeature
-import uniffi.codex_mobile_client.ExperimentalFeatureListParams
 import uniffi.codex_mobile_client.LoginAccountParams
 
 /**
@@ -526,6 +526,7 @@ private fun AppearanceScreen(onBack: () -> Unit) {
             item {
                 val scale = com.litter.android.ui.ConversationTextSize.fromStep(textSizeStep.toInt()).scale
                 val previewFontSize = (14f * scale).sp
+                val previewCodeFontSize = (13f * scale).sp
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -543,6 +544,7 @@ private fun AppearanceScreen(onBack: () -> Unit) {
                             "Hey, why is prod on fire",
                             color = LitterTheme.textPrimary,
                             fontSize = previewFontSize,
+                            lineHeight = (previewFontSize.value * 1.3f).sp,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(LitterTheme.surface.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
@@ -563,16 +565,48 @@ private fun AppearanceScreen(onBack: () -> Unit) {
                             Text("0.3s", color = LitterTheme.textMuted, fontSize = 10.sp)
                         }
                         // Assistant bubble
-                        Text(
-                            "Found the issue. Someone deployed this:\n\n```python\nif is_friday():\n    yolo_deploy(skip_tests=True)\n```\n\nI'm not mad, just disappointed.",
-                            color = LitterTheme.textBody,
-                            fontSize = previewFontSize,
-                        )
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                "Found the issue. Someone deployed this:",
+                                color = LitterTheme.textBody,
+                                fontSize = previewFontSize,
+                                lineHeight = (previewFontSize.value * 1.3f).sp,
+                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    "PYTHON",
+                                    color = LitterTheme.textSecondary,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(LitterTheme.codeBackground, RoundedCornerShape(8.dp))
+                                        .padding(10.dp),
+                                ) {
+                                    Text(
+                                        "if is_friday():\n    yolo_deploy(skip_tests=True)",
+                                        color = LitterTheme.textBody,
+                                        fontFamily = LitterTheme.monoFont,
+                                        fontSize = previewCodeFontSize,
+                                        lineHeight = (previewCodeFontSize.value * 1.35f).sp,
+                                    )
+                                }
+                            }
+                            Text(
+                                "I'm not mad, just disappointed.",
+                                color = LitterTheme.textBody,
+                                fontSize = previewFontSize,
+                                lineHeight = (previewFontSize.value * 1.3f).sp,
+                            )
+                        }
                         // User reply
                         Text(
                             "That was you",
                             color = LitterTheme.textPrimary,
                             fontSize = previewFontSize,
+                            lineHeight = (previewFontSize.value * 1.3f).sp,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(LitterTheme.surface.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
@@ -774,22 +808,8 @@ private fun ThemePickerButton(entry: LitterThemeIndexEntry?, onClick: () -> Unit
 
 @Composable
 private fun ExperimentalScreen(onBack: () -> Unit) {
-    val appModel = LocalAppModel.current
-    val snapshot by appModel.snapshot.collectAsState()
-    var features by remember { mutableStateOf<List<ExperimentalFeature>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(true) }
-
-    val serverId = remember(snapshot) { snapshot?.servers?.firstOrNull { it.isConnected }?.serverId }
-
-    LaunchedEffect(serverId) {
-        if (serverId != null) {
-            try {
-                val resp = appModel.rpc.experimentalFeatureList(serverId, ExperimentalFeatureListParams(cursor = null, limit = null))
-                features = resp.data
-            } catch (_: Exception) {}
-        }
-        isLoading = false
-    }
+    val context = LocalContext.current
+    val features = remember { LitterFeature.entries }
 
     Column(
         Modifier
@@ -811,35 +831,30 @@ private fun ExperimentalScreen(onBack: () -> Unit) {
         Spacer(Modifier.height(16.dp))
 
         SectionHeader("Features")
-
-        if (isLoading) {
-            Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = LitterTheme.accent)
-            }
-        } else if (features.isEmpty()) {
-            Text("No experimental features available.", color = LitterTheme.textMuted, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
-        } else {
-            Column(
-                Modifier.fillMaxWidth().background(LitterTheme.surface.copy(alpha = 0.6f), RoundedCornerShape(10.dp)),
-            ) {
-                features.forEachIndexed { idx, feature ->
-                    var enabled by remember { mutableStateOf(false) }
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(feature.displayName ?: feature.name, color = LitterTheme.textPrimary, fontSize = 14.sp)
-                            feature.description?.let { Text(it, color = LitterTheme.textSecondary, fontSize = 11.sp) }
-                        }
-                        Switch(checked = enabled, onCheckedChange = { enabled = it }, colors = SwitchDefaults.colors(checkedTrackColor = LitterTheme.accent))
+        Column(
+            Modifier.fillMaxWidth().background(LitterTheme.surface.copy(alpha = 0.6f), RoundedCornerShape(10.dp)),
+        ) {
+            features.forEachIndexed { idx, feature ->
+                val enabled = ExperimentalFeatures.isEnabled(feature)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(feature.displayName, color = LitterTheme.textPrimary, fontSize = 14.sp)
+                        Text(feature.description, color = LitterTheme.textSecondary, fontSize = 11.sp)
                     }
-                    if (idx < features.lastIndex) HorizontalDivider(color = LitterTheme.divider)
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { ExperimentalFeatures.setEnabled(context, feature, it) },
+                        colors = SwitchDefaults.colors(checkedTrackColor = LitterTheme.accentStrong),
+                    )
                 }
+                if (idx < features.lastIndex) HorizontalDivider(color = LitterTheme.divider)
             }
-            Spacer(Modifier.height(8.dp))
-            Text("Experimental features may be unstable or change without notice.", color = LitterTheme.textMuted, fontSize = 11.sp, modifier = Modifier.padding(start = 4.dp))
         }
+        Spacer(Modifier.height(8.dp))
+        Text("Experimental features may be unstable or change without notice.", color = LitterTheme.textMuted, fontSize = 11.sp, modifier = Modifier.padding(start = 4.dp))
     }
 }
 

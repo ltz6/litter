@@ -101,6 +101,22 @@ final class AppLifecycleController {
         port: UInt16,
         credentials: SSHCredentials
     ) async throws {
+        let authMethod: String = switch credentials {
+        case .password:
+            "password"
+        case .key:
+            "private_key"
+        }
+        LLog.trace(
+            "lifecycle",
+            "reconnecting saved SSH server",
+            fields: [
+                "serverId": serverId,
+                "host": host,
+                "sshPort": Int(port),
+                "authMethod": authMethod
+            ]
+        )
         switch credentials {
         case .password(let username, let password):
             _ = try await appModel.ssh.sshConnectRemoteServer(

@@ -65,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import com.litter.android.state.contextPercent
 import com.litter.android.state.hasActiveTurn
 import com.litter.android.state.isIpcConnected
+import com.litter.android.state.isActiveStatus
 import com.litter.android.ui.ChatWallpaperBackground
 import com.litter.android.ui.ConversationPrefs
 import com.litter.android.ui.LocalAppModel
@@ -100,21 +101,40 @@ fun ConversationScreen(
         snapshot?.servers?.find { it.serverId == threadKey.serverId }
     }
     val items = thread?.hydratedConversationItems ?: emptyList()
-    val isThinking = thread?.hasActiveTurn == true
+    val normalizedActiveTurnId = thread?.activeTurnId?.trim()?.takeIf { it.isNotEmpty() }
+    val isThinking = thread?.info?.status?.isActiveStatus == true
     val collapseTurns = ConversationPrefs.areTurnsCollapsed
     val agentDirectoryVersion = snapshot?.agentDirectoryVersion ?: 0uL
-    val transcriptTurns = remember(items, thread?.activeTurnId, isThinking, collapseTurns) {
+    val transcriptTurns = remember(items, thread?.info?.status, isThinking, collapseTurns) {
         buildTranscriptTurns(
             items = items,
-            activeTurnId = thread?.activeTurnId,
             isStreaming = isThinking,
             expandedRecentTurnCount = if (collapseTurns) 1 else Int.MAX_VALUE,
         )
     }
+    val transcriptContentSignature = remember(items, normalizedActiveTurnId, isThinking) {
+        var hash = 17
+        items.forEach { item ->
+            hash = 31 * hash + item.hashCode()
+        }
+        hash = 31 * hash + (normalizedActiveTurnId?.hashCode() ?: 0)
+        hash = 31 * hash + if (isThinking) 1 else 0
+        hash
+    }
     var expandedTurnIds by remember(threadKey, collapseTurns) { mutableStateOf(setOf<String>()) }
+    var streamingRenderTick by remember(threadKey) { mutableStateOf(0) }
+    var followScrollToken by remember(threadKey) { mutableStateOf(0) }
+    var lastObservedUpdatedAt by remember(threadKey) { mutableStateOf<Long?>(null) }
     LaunchedEffect(transcriptTurns.map { it.id to it.isCollapsedByDefault }) {
         val validIds = transcriptTurns.mapTo(mutableSetOf()) { it.id }
         expandedTurnIds = expandedTurnIds.intersect(validIds)
+    }
+    LaunchedEffect(thread?.info?.updatedAt, isThinking) {
+        val updatedAt = thread?.info?.updatedAt
+        if (updatedAt != null && updatedAt != lastObservedUpdatedAt && isThinking) {
+            followScrollToken += 1
+        }
+        lastObservedUpdatedAt = updatedAt
     }
 
     // Load thread content on first open — resume it so Rust hydrates conversation items
@@ -217,6 +237,24 @@ fun ConversationScreen(
         }
     }
 
+    LaunchedEffect(transcriptContentSignature, isAtBottom, isThinking) {
+        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
+            listState.scrollToItem(transcriptTurns.size)
+        }
+    }
+
+    LaunchedEffect(followScrollToken, isThinking, isAtBottom) {
+        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
+            listState.scrollToItem(transcriptTurns.size)
+        }
+    }
+
+    LaunchedEffect(streamingRenderTick, isThinking, isAtBottom) {
+        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
+            listState.scrollToItem(transcriptTurns.size)
+        }
+    }
+
     val wallpaperVersion = WallpaperManager.version
     val hasWallpaper = remember(threadKey, wallpaperVersion) {
         WallpaperManager.resolvedConfig(threadKey)?.type?.let { it != WallpaperType.NONE } == true
@@ -284,6 +322,15 @@ fun ConversationScreen(
                             key = { it.id },
                         ) { turn ->
                             val isExpanded = !turn.isCollapsedByDefault || expandedTurnIds.contains(turn.id)
+                            val streamingAssistantItemId = remember(turn.items, turn.isActiveTurn) {
+                                if (!turn.isActiveTurn) {
+                                    null
+                                } else {
+                                    turn.items.lastOrNull {
+                                        it.content is HydratedConversationItemContent.Assistant
+                                    }?.id
+                                }
+                            }
                             if (isExpanded) {
                                 val timelineEntries = remember(turn.items, turn.isActiveTurn) {
                                     buildTimelineEntries(turn.items, turn.isActiveTurn)
@@ -297,6 +344,12 @@ fun ConversationScreen(
                                                     serverId = threadKey.serverId,
                                                     agentDirectoryVersion = agentDirectoryVersion,
                                                     isLiveTurn = turn.isActiveTurn,
+                                                    isStreamingMessage = entry.item.id == streamingAssistantItemId,
+                                                    onStreamingSnapshotRendered = if (entry.item.id == streamingAssistantItemId) {
+                                                        { streamingRenderTick += 1 }
+                                                    } else {
+                                                        null
+                                                    },
                                                     onEditMessage = { turnIndex ->
                                                         scope.launch {
                                                             val prefill = appModel.store.editMessage(threadKey, turnIndex)
