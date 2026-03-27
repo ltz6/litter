@@ -596,7 +596,7 @@ class VoiceRuntimeController {
             Available servers:
             $serverLines
             When using the codex tool, you MUST specify the "server" parameter.
-            IMPORTANT: To list servers, list sessions, or read session history, you MUST use server="local".
+            IMPORTANT: Use the local discovery tools for server and session lookup.
             The "local" server has special tools that can see sessions across ALL connected servers in one call.
             Remote servers do NOT have these tools - never ask a remote server to list sessions.
             Use a remote server name ONLY to run coding tasks, shell commands, or file operations on that machine.
@@ -620,30 +620,6 @@ class VoiceRuntimeController {
                     ),
                 ),
                 emptyList(),
-            ),
-            deferLoading = false,
-        ),
-        DynamicToolSpec(
-            name = "read_session",
-            description = "Read the full conversation history of a session on a specific server.",
-            inputSchema = jsonObject(
-                mapOf(
-                    "server" to jsonStringSchema("Server name where the session lives."),
-                    "session_id" to jsonStringSchema("The session/thread ID to read."),
-                ),
-                listOf("server", "session_id"),
-            ),
-            deferLoading = false,
-        ),
-        DynamicToolSpec(
-            name = "run_on_server",
-            description = "Run a prompt on a remote server. Creates or reuses a thread and waits for the turn to complete.",
-            inputSchema = jsonObject(
-                mapOf(
-                    "server" to jsonStringSchema("Server name to run the prompt on."),
-                    "prompt" to jsonStringSchema("The prompt to send."),
-                ),
-                listOf("server", "prompt"),
             ),
             deferLoading = false,
         ),

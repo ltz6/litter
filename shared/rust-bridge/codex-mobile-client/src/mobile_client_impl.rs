@@ -953,12 +953,7 @@ impl MobileClient {
                             let app_store = Arc::clone(&app_store);
                             MobileClient::spawn_detached(async move {
                                 if let Err(error) = handle_dynamic_tool_call_request(
-                                    session,
-                                    sessions,
-                                    app_store,
-                                    server_id.clone(),
-                                    request_id,
-                                    params,
+                                    session, sessions, app_store, request_id, params,
                                 )
                                 .await
                                 {
@@ -1561,17 +1556,10 @@ async fn handle_dynamic_tool_call_request(
     session: Arc<ServerSession>,
     sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
     app_store: Arc<AppStoreReducer>,
-    calling_server_id: String,
     request_id: upstream::RequestId,
     params: upstream::DynamicToolCallParams,
 ) -> Result<(), RpcError> {
-    let response = match execute_dynamic_tool_call(
-        sessions,
-        Arc::clone(&app_store),
-        &calling_server_id,
-        &params,
-    )
-    .await
+    let response = match execute_dynamic_tool_call(sessions, Arc::clone(&app_store), &params).await
     {
         Ok(text) => generated::DynamicToolCallResponse {
             content_items: vec![generated::DynamicToolCallOutputContentItem::InputText { text }],
@@ -1597,7 +1585,6 @@ async fn handle_dynamic_tool_call_request(
 async fn execute_dynamic_tool_call(
     sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
     app_store: Arc<AppStoreReducer>,
-    calling_server_id: &str,
     params: &upstream::DynamicToolCallParams,
 ) -> Result<String, String> {
     let targets = snapshot_dynamic_tool_sessions(&sessions);
@@ -1605,11 +1592,6 @@ async fn execute_dynamic_tool_call(
     match params.tool.as_str() {
         "list_servers" => Ok(list_servers_tool_output(&targets)),
         "list_sessions" => list_sessions_tool_output(&targets, app_store, &params.arguments).await,
-        "read_session" => read_session_tool_output(&targets, app_store, &params.arguments).await,
-        "run_on_server" => {
-            run_on_server_tool_output(&targets, app_store, calling_server_id, &params.arguments)
-                .await
-        }
         tool => Err(format!("Unknown dynamic tool: {tool}")),
     }
 }
@@ -1703,26 +1685,6 @@ fn dynamic_tool_u32(arguments: &serde_json::Value, keys: &[&str]) -> Option<u32>
         Some(serde_json::Value::String(value)) => value.trim().parse::<u32>().ok(),
         _ => None,
     })
-}
-
-fn dynamic_tool_reasoning_effort(value: Option<String>) -> Option<generated::ReasoningEffort> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "none" => Some(generated::ReasoningEffort::None),
-        "minimal" => Some(generated::ReasoningEffort::Minimal),
-        "low" => Some(generated::ReasoningEffort::Low),
-        "medium" => Some(generated::ReasoningEffort::Medium),
-        "high" => Some(generated::ReasoningEffort::High),
-        "xhigh" | "x_high" | "extra_high" | "extra-high" => Some(generated::ReasoningEffort::XHigh),
-        _ => None,
-    }
-}
-
-fn dynamic_tool_service_tier(value: Option<String>) -> Option<generated::ServiceTier> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "fast" => Some(generated::ServiceTier::Fast),
-        "flex" => Some(generated::ServiceTier::Flex),
-        _ => None,
-    }
 }
 
 fn truncate_dynamic_tool_text(text: &str, max_bytes: usize) -> String {
@@ -1854,214 +1816,6 @@ async fn list_sessions_tool_output(
     Ok(serialize_dynamic_tool_payload(payload, 64_000))
 }
 
-async fn read_session_tool_output(
-    targets: &[DynamicToolSessionTarget],
-    app_store: Arc<AppStoreReducer>,
-    arguments: &serde_json::Value,
-) -> Result<String, String> {
-    let requested_server = dynamic_tool_string(arguments, &["server_id", "server"]);
-    let thread_id = dynamic_tool_string(arguments, &["thread_id", "session_id"])
-        .ok_or_else(|| "read_session requires server and thread_id.".to_string())?;
-    let limit = dynamic_tool_u32(arguments, &["limit"])
-        .unwrap_or(50)
-        .clamp(1, 50) as usize;
-
-    let target = dynamic_tool_sessions_for_request(targets, requested_server.as_deref(), false)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No matching server connection.".to_string())?;
-
-    let response = dynamic_tool_request_typed::<generated::ThreadReadResponse, _>(
-        &target.session,
-        "thread/read",
-        &generated::ThreadReadParams {
-            thread_id: thread_id.clone(),
-            include_turns: true,
-        },
-    )
-    .await?;
-
-    let snapshot =
-        thread_snapshot_from_generated_thread(&target.server_id, response.thread, None, None)
-            .map_err(|error| format!("thread/read snapshot: {error}"))?;
-    app_store.upsert_thread_snapshot(snapshot.clone());
-
-    Ok(serialize_dynamic_tool_payload(
-        serde_json::json!({
-            "type": "session",
-            "serverId": target.server_id,
-            "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
-            "threadId": thread_id,
-            "threadTitle": snapshot.info.title,
-            "items": readable_dynamic_tool_items(&snapshot, limit),
-        }),
-        96_000,
-    ))
-}
-
-async fn run_on_server_tool_output(
-    targets: &[DynamicToolSessionTarget],
-    app_store: Arc<AppStoreReducer>,
-    calling_server_id: &str,
-    arguments: &serde_json::Value,
-) -> Result<String, String> {
-    let requested_server = dynamic_tool_string(arguments, &["server_id", "server"]);
-    let prompt = dynamic_tool_string(arguments, &["prompt"])
-        .ok_or_else(|| "run_on_server requires prompt.".to_string())?;
-    let model = dynamic_tool_string(arguments, &["model"]);
-    let effort = dynamic_tool_reasoning_effort(dynamic_tool_string(arguments, &["effort"]));
-    let service_tier = dynamic_tool_service_tier(dynamic_tool_string(arguments, &["service_tier"]));
-
-    let target = dynamic_tool_sessions_for_request(targets, requested_server.as_deref(), false)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No matching server connection.".to_string())?;
-
-    if target.config.is_local && target.server_id == calling_server_id {
-        return Err(
-            "Cannot run_on_server targeting 'local'. Use your own tools instead.".to_string(),
-        );
-    }
-
-    let thread_id =
-        if let Some(thread_id) = dynamic_tool_string(arguments, &["thread_id", "session_id"]) {
-            thread_id
-        } else {
-            let response = dynamic_tool_request_typed::<generated::ThreadStartResponse, _>(
-                &target.session,
-                "thread/start",
-                &generated::ThreadStartParams {
-                    model: model.clone(),
-                    model_provider: None,
-                    service_tier: service_tier.clone().map(Some),
-                    cwd: Some(if target.config.is_local {
-                        "/".to_string()
-                    } else {
-                        "/tmp".to_string()
-                    }),
-                    approval_policy: Some(generated::AskForApproval::Never),
-                    approvals_reviewer: None,
-                    sandbox: (!target.config.is_local)
-                        .then_some(generated::SandboxMode::DangerFullAccess),
-                    config: None,
-                    service_name: None,
-                    base_instructions: None,
-                    developer_instructions: None,
-                    personality: None,
-                    ephemeral: None,
-                    dynamic_tools: None,
-                    mock_experimental_field: None,
-                    experimental_raw_events: false,
-                    persist_extended_history: true,
-                },
-            )
-            .await?;
-
-            let snapshot = thread_snapshot_from_generated_thread(
-                &target.server_id,
-                response.thread.clone(),
-                model.clone(),
-                effort.clone().map(reasoning_effort_string),
-            )
-            .map_err(|error| format!("thread/start snapshot: {error}"))?;
-            app_store.upsert_thread_snapshot(snapshot);
-            response.thread.id
-        };
-
-    let turn_response = dynamic_tool_request_typed::<generated::TurnStartResponse, _>(
-        &target.session,
-        "turn/start",
-        &generated::TurnStartParams {
-            thread_id: thread_id.clone(),
-            input: vec![generated::UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-            cwd: None,
-            approval_policy: Some(generated::AskForApproval::Never),
-            approvals_reviewer: None,
-            sandbox_policy: (!target.config.is_local)
-                .then_some(generated::SandboxPolicy::DangerFullAccess),
-            model: model.clone(),
-            service_tier: service_tier.clone().map(Some),
-            effort: effort.clone(),
-            summary: None,
-            personality: None,
-            output_schema: None,
-            collaboration_mode: None,
-        },
-    )
-    .await?;
-
-    let turn_id = turn_response.turn.id;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut last_snapshot: Option<ThreadSnapshot> = None;
-    let mut timed_out = true;
-
-    while std::time::Instant::now() < deadline {
-        let response = dynamic_tool_request_typed::<generated::ThreadReadResponse, _>(
-            &target.session,
-            "thread/read",
-            &generated::ThreadReadParams {
-                thread_id: thread_id.clone(),
-                include_turns: true,
-            },
-        )
-        .await?;
-
-        let info = thread_info_from_generated_thread(response.thread.clone())
-            .ok_or_else(|| "thread/read response missing thread info".to_string())?;
-        let snapshot = thread_snapshot_from_generated_thread(
-            &target.server_id,
-            response.thread,
-            model.clone(),
-            effort.clone().map(reasoning_effort_string),
-        )
-        .map_err(|error| format!("thread/read snapshot: {error}"))?;
-        app_store.upsert_thread_snapshot(snapshot.clone());
-        let is_active = matches!(info.status, crate::types::ThreadSummaryStatus::Active);
-        last_snapshot = Some(snapshot);
-        if !is_active {
-            timed_out = false;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-
-    let snapshot =
-        last_snapshot.ok_or_else(|| "thread/read did not return a thread snapshot".to_string())?;
-    let assistant_result = snapshot
-        .items
-        .iter()
-        .rev()
-        .find_map(|item| match &item.content {
-            crate::conversation::ConversationItemContent::Assistant(data)
-                if !data.text.trim().is_empty() =>
-            {
-                Some(truncate_dynamic_tool_text(&data.text, 8_000))
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    let mut payload = serde_json::json!({
-        "type": "run_on_server",
-        "serverId": target.server_id,
-        "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
-        "threadId": thread_id,
-        "turnId": turn_id,
-        "result": assistant_result,
-        "items": readable_dynamic_tool_items(&snapshot, 12),
-    });
-    if let serde_json::Value::Object(object) = &mut payload
-        && timed_out
-    {
-        object.insert("timedOut".to_string(), serde_json::Value::Bool(true));
-    }
-
-    Ok(serialize_dynamic_tool_payload(payload, 96_000))
-}
-
 async fn dynamic_tool_request_typed<R, P>(
     session: &Arc<ServerSession>,
     method: &str,
@@ -2079,81 +1833,6 @@ where
         .map_err(|error| format!("{method} request failed: {error}"))?;
     serde_json::from_value(response)
         .map_err(|error| format!("deserialize {method} response: {error}"))
-}
-
-fn readable_dynamic_tool_items(snapshot: &ThreadSnapshot, limit: usize) -> Vec<serde_json::Value> {
-    let mapped = snapshot
-        .items
-        .iter()
-        .filter_map(readable_dynamic_tool_item)
-        .collect::<Vec<_>>();
-    let start = mapped.len().saturating_sub(limit);
-    mapped.into_iter().skip(start).collect()
-}
-
-fn readable_dynamic_tool_item(
-    item: &crate::conversation::ConversationItem,
-) -> Option<serde_json::Value> {
-    match &item.content {
-        crate::conversation::ConversationItemContent::User(data)
-            if !data.text.trim().is_empty() =>
-        {
-            Some(serde_json::json!({
-                "role": "user",
-                "text": truncate_dynamic_tool_text(&data.text, 4_000),
-            }))
-        }
-        crate::conversation::ConversationItemContent::Assistant(data)
-            if !data.text.trim().is_empty() =>
-        {
-            Some(serde_json::json!({
-                "role": "assistant",
-                "text": truncate_dynamic_tool_text(&data.text, 4_000),
-            }))
-        }
-        crate::conversation::ConversationItemContent::Reasoning(data) => {
-            let text = if !data.content.is_empty() {
-                data.content.join("\n")
-            } else {
-                data.summary.join("\n")
-            };
-            (!text.trim().is_empty()).then(|| {
-                serde_json::json!({
-                    "role": "reasoning",
-                    "text": truncate_dynamic_tool_text(&text, 2_000),
-                })
-            })
-        }
-        crate::conversation::ConversationItemContent::DynamicToolCall(data) => data
-            .content_summary
-            .as_ref()
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| {
-                serde_json::json!({
-                    "role": "tool",
-                    "tool": data.tool,
-                    "status": data.status,
-                    "text": truncate_dynamic_tool_text(text, 2_000),
-                })
-            }),
-        crate::conversation::ConversationItemContent::McpToolCall(data) => data
-            .content_summary
-            .as_ref()
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| {
-                serde_json::json!({
-                    "role": "tool",
-                    "tool": data.tool,
-                    "status": data.status,
-                    "text": truncate_dynamic_tool_text(text, 2_000),
-                })
-            }),
-        crate::conversation::ConversationItemContent::Error(data) => Some(serde_json::json!({
-            "role": "error",
-            "text": truncate_dynamic_tool_text(&data.message, 2_000),
-        })),
-        _ => None,
-    }
 }
 
 pub fn thread_info_from_generated_thread(thread: generated::Thread) -> Option<ThreadInfo> {

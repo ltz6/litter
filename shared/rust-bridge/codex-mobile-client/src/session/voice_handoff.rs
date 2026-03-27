@@ -630,31 +630,6 @@ impl HandoffManager {
         let payload = serde_json::json!({ "type": "servers", "items": items });
         serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string())
     }
-
-    /// Resolve target server for a `run_on_server` tool call.
-    /// Returns (server_id, is_local) or an error message.
-    pub fn resolve_run_on_server_target(
-        &self,
-        server_name: &str,
-        calling_server_id: &str,
-    ) -> Result<(String, bool), String> {
-        let inner = self.inner.lock().unwrap();
-        if server_name.eq_ignore_ascii_case("local") {
-            if calling_server_id == inner.local_server_id {
-                return Err(
-                    "Cannot run_on_server targeting 'local'. Use your own tools instead."
-                        .to_string(),
-                );
-            }
-            return Ok((inner.local_server_id.clone(), true));
-        }
-        for (id, srv) in &inner.servers {
-            if !srv.is_local && srv.is_connected && srv.name.eq_ignore_ascii_case(server_name) {
-                return Ok((id.clone(), false));
-            }
-        }
-        Err(format!("Server '{}' is not connected.", server_name))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -927,54 +902,6 @@ pub fn voice_dynamic_tools() -> Vec<DynamicToolSpec> {
                 "additionalProperties": false
             }),
         },
-        DynamicToolSpec {
-            name: "read_session".into(),
-            description: "Read messages from a specific conversation thread.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_id": {
-                        "type": "string",
-                        "description": "The server that owns the thread."
-                    },
-                    "thread_id": {
-                        "type": "string",
-                        "description": "The thread to read."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of messages to return (default 50)."
-                    }
-                },
-                "required": ["server_id", "thread_id"],
-                "additionalProperties": false
-            }),
-        },
-        DynamicToolSpec {
-            name: "run_on_server".into(),
-            description:
-                "Start a turn on a remote server, sending a prompt and polling for completion."
-                    .into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_id": {
-                        "type": "string",
-                        "description": "Target server to run the prompt on."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "The prompt/instruction to send to the remote server."
-                    },
-                    "thread_id": {
-                        "type": "string",
-                        "description": "Optional thread ID to continue. Omit to start a new thread."
-                    }
-                },
-                "required": ["server_id", "prompt"],
-                "additionalProperties": false
-            }),
-        },
     ]
 }
 
@@ -1007,7 +934,7 @@ pub struct ServerInfo {
 pub fn build_voice_system_prompt(servers: &[ServerInfo]) -> String {
     let mut prompt = String::from(
         "You are a helpful voice assistant with access to multiple Codex coding servers. \
-         You can run code, read sessions, and manage tasks across servers.\n\n",
+         You can inspect connected servers, browse recent sessions, and delegate work across servers.\n\n",
     );
 
     // Server listing
@@ -1029,11 +956,10 @@ pub fn build_voice_system_prompt(servers: &[ServerInfo]) -> String {
         "\n## Tool Usage\n\
          - Use `list_servers` to see available servers.\n\
          - Use `list_sessions` to browse conversation threads.\n\
-         - Use `read_session` to read messages from a thread.\n\
-         - Use `run_on_server` to execute a prompt on a specific server and get the result.\n\
          \n\
          When the user asks you to do something on a particular machine or project, \
-         identify the correct server and use `run_on_server` to carry out the task. \
+         identify the correct server and use the realtime `codex` tool with a `server` parameter \
+         to carry out the task. \
          Summarise the result concisely for voice output.\n",
     );
 
@@ -1323,7 +1249,7 @@ mod tests {
                 thread_id: "t1".into(),
             },
             target_server_id: "s2".into(),
-            tool_name: "run_on_server".into(),
+            tool_name: "codex".into(),
             arguments: serde_json::json!({"prompt": "hello"}),
         };
         let cloned = req.clone();
@@ -1364,15 +1290,7 @@ mod tests {
     fn voice_dynamic_tools_names() {
         let tools = voice_dynamic_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "list_servers",
-                "list_sessions",
-                "read_session",
-                "run_on_server"
-            ]
-        );
+        assert_eq!(names, ["list_servers", "list_sessions"]);
     }
 
     #[test]
@@ -1391,26 +1309,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_session_requires_server_and_thread() {
-        let tools = voice_dynamic_tools();
-        let read = tools.iter().find(|t| t.name == "read_session").unwrap();
-        let required = read.parameters["required"].as_array().unwrap();
-        let req_strs: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(req_strs.contains(&"server_id"));
-        assert!(req_strs.contains(&"thread_id"));
-    }
-
-    #[test]
-    fn run_on_server_requires_server_and_prompt() {
-        let tools = voice_dynamic_tools();
-        let run = tools.iter().find(|t| t.name == "run_on_server").unwrap();
-        let required = run.parameters["required"].as_array().unwrap();
-        let req_strs: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(req_strs.contains(&"server_id"));
-        assert!(req_strs.contains(&"prompt"));
-    }
-
     // -- Rich tool detection --
 
     #[test]
@@ -1421,8 +1319,7 @@ mod tests {
 
     #[test]
     fn is_rich_tool_non_rich() {
-        assert!(!is_rich_tool("read_session"));
-        assert!(!is_rich_tool("run_on_server"));
+        assert!(!is_rich_tool("codex"));
         assert!(!is_rich_tool("unknown_tool"));
     }
 
@@ -1457,7 +1354,7 @@ mod tests {
         assert!(prompt.contains("local"));
         assert!(prompt.contains("Dev Box"));
         assert!(prompt.contains("remote"));
-        assert!(prompt.contains("run_on_server"));
+        assert!(prompt.contains("realtime `codex` tool"));
     }
 
     // -- VoiceHandoffManager (legacy) --
@@ -1470,7 +1367,7 @@ mod tests {
                 thread_id: "t1".into(),
             },
             target_server_id: "s2".into(),
-            tool_name: "run_on_server".into(),
+            tool_name: "codex".into(),
             arguments: serde_json::json!({}),
         }
     }
