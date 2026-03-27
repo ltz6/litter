@@ -1228,11 +1228,16 @@ fi"#
                     .flat_map(|c| c.to_le_bytes())
                     .collect();
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16);
-                self.exec(&format!(
-                    "powershell -NoProfile -NonInteractive -EncodedCommand {}",
-                    encoded
-                ))
-                .await
+                let mut result = self
+                    .exec(&format!(
+                        "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+                        encoded
+                    ))
+                    .await?;
+                // Strip CLIXML noise that PowerShell emits over SSH.
+                result.stdout = strip_clixml(&result.stdout);
+                result.stderr = strip_clixml(&result.stderr);
+                Ok(result)
             }
         }
     }
@@ -1253,7 +1258,7 @@ fi"#
         match shell {
             RemoteShell::PowerShell => {
                 let result = self
-                    .exec_shell(r#"Write-Host "$env:OS`n$env:PROCESSOR_ARCHITECTURE""#, shell)
+                    .exec_shell(r#"Write-Output "$env:OS"; Write-Output "$env:PROCESSOR_ARCHITECTURE""#, shell)
                     .await?;
                 let mut lines = result.stdout.lines();
                 let os = lines.next().unwrap_or_default().trim();
@@ -1534,7 +1539,10 @@ async fn proxy_connection(
 // ---------------------------------------------------------------------------
 
 /// Shell snippet that sources common profile files to pick up PATH additions.
-const PROFILE_INIT: &str = r#"for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do [ -f "$f" ] && . "$f" 2>/dev/null; done;"#;
+/// Runs each file in a subshell so zsh-specific syntax (plugins, eval
+/// `starship init zsh`, etc.) cannot crash the parent bash process.
+/// The subshell exports PATH changes via a temp file.
+const PROFILE_INIT: &str = r#"_litter_pf="/tmp/.litter_path_$$"; for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do [ -f "$f" ] && (. "$f" 2>/dev/null; echo "$PATH") > "$_litter_pf" 2>/dev/null && PATH="$(cat "$_litter_pf")" ; done; rm -f "$_litter_pf" 2>/dev/null;"#;
 
 fn resolve_codex_binary_script_posix() -> String {
     format!(
@@ -1577,13 +1585,13 @@ fi"#,
 
 fn resolve_codex_binary_script_powershell() -> String {
     r#"$litterBin = Join-Path $env:USERPROFILE '.litter\bin\codex.cmd'
-if (Test-Path $litterBin) { Write-Host "codex:$litterBin"; exit 0 }
+if (Test-Path $litterBin) { Write-Output "codex:$litterBin"; exit 0 }
 $litterNpm = Join-Path $env:USERPROFILE '.litter\codex\node_modules\.bin\codex.cmd'
-if (Test-Path $litterNpm) { Write-Host "codex:$litterNpm"; exit 0 }
+if (Test-Path $litterNpm) { Write-Output "codex:$litterNpm"; exit 0 }
 $found = Get-Command codex -ErrorAction SilentlyContinue
-if ($found) { Write-Host "codex:$($found.Source)"; exit 0 }
+if ($found) { Write-Output "codex:$($found.Source)"; exit 0 }
 $found = Get-Command codex-app-server -ErrorAction SilentlyContinue
-if ($found) { Write-Host "app-server:$($found.Source)"; exit 0 }"#
+if ($found) { Write-Output "app-server:$($found.Source)"; exit 0 }"#
         .to_string()
 }
 
@@ -1643,6 +1651,20 @@ fn normalize_host(host: &str) -> String {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Strip PowerShell CLIXML noise from SSH output.
+/// PowerShell over SSH emits `#< CLIXML` headers and `<Objs ...>...</Objs>`
+/// XML blocks (often as one long line) for progress and error streams.
+fn strip_clixml(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("#< CLIXML") && !trimmed.starts_with("<Objs ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Quote a string for PowerShell (single-quoted, no variable expansion).
