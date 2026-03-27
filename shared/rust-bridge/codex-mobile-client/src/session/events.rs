@@ -254,21 +254,21 @@ impl EventProcessor {
                 });
             }
             ServerNotification::TurnStarted(n) => {
-let key = Self::make_key(server_id, &n.thread_id);
+                let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnStarted {
                     key,
                     turn_id: n.turn.id.clone(),
                 });
             }
             ServerNotification::TurnCompleted(n) => {
-let key = Self::make_key(server_id, &n.thread_id);
+                let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnCompleted {
                     key,
                     turn_id: n.turn.id.clone(),
                 });
             }
             ServerNotification::TurnDiffUpdated(n) => {
-let key = Self::make_key(server_id, &n.thread_id);
+                let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnDiffUpdated {
                     key,
                     notification: n.clone(),
@@ -371,7 +371,7 @@ let key = Self::make_key(server_id, &n.thread_id);
             // ── Realtime / voice ────────────────────────────────────
             ServerNotification::ThreadRealtimeStarted(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-self.emit(UiEvent::RealtimeStarted {
+                self.emit(UiEvent::RealtimeStarted {
                     key,
                     notification: n.clone(),
                 });
@@ -413,14 +413,14 @@ self.emit(UiEvent::RealtimeStarted {
             }
             ServerNotification::ThreadRealtimeError(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-self.emit(UiEvent::RealtimeError {
+                self.emit(UiEvent::RealtimeError {
                     key,
                     notification: n.clone(),
                 });
             }
             ServerNotification::ThreadRealtimeClosed(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-self.emit(UiEvent::RealtimeClosed {
+                self.emit(UiEvent::RealtimeClosed {
                     key,
                     notification: n.clone(),
                 });
@@ -711,12 +711,14 @@ mod tests {
             id: id.to_string(),
             text: String::new(),
             phase: None,
+            memory_citation: None,
         }
     }
 
     fn upstream_item_id(item: &proto::ThreadItem) -> &str {
         match item {
             proto::ThreadItem::UserMessage { id, .. }
+            | proto::ThreadItem::HookPrompt { id, .. }
             | proto::ThreadItem::AgentMessage { id, .. }
             | proto::ThreadItem::Plan { id, .. }
             | proto::ThreadItem::Reasoning { id, .. }
@@ -798,14 +800,21 @@ mod tests {
         let notification =
             ServerNotification::ThreadStatusChanged(proto::ThreadStatusChangedNotification {
                 thread_id: "thr_1".to_string(),
-                status: proto::ThreadStatus::Active { active_flags: vec![] },
+                status: proto::ThreadStatus::Active {
+                    active_flags: vec![],
+                },
             });
         let evt = process_and_recv("srv1", &notification).expect("should emit UiEvent");
         match evt {
             UiEvent::ThreadStatusChanged { key, notification } => {
                 assert_eq!(key.thread_id, "thr_1");
                 assert_eq!(notification.thread_id, "thr_1");
-                assert_eq!(notification.status, proto::ThreadStatus::Active { active_flags: vec![] });
+                assert_eq!(
+                    notification.status,
+                    proto::ThreadStatus::Active {
+                        active_flags: vec![]
+                    }
+                );
             }
             other => panic!("expected ThreadStatusChanged, got {other:?}"),
         }
@@ -1077,6 +1086,7 @@ mod tests {
             ServerNotification::ThreadRealtimeStarted(proto::ThreadRealtimeStartedNotification {
                 thread_id: "thr_1".to_string(),
                 session_id: Some("sess_abc".to_string()),
+                version: codex_protocol::protocol::RealtimeConversationVersion::V2,
             });
         let evt = process_and_recv("srv1", &notification).expect("should emit");
         match evt {
@@ -1119,6 +1129,7 @@ mod tests {
                     sample_rate: 24000,
                     num_channels: 1,
                     samples_per_channel: None,
+                    item_id: None,
                 },
             },
         );

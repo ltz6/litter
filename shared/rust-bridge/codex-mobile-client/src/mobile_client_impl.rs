@@ -1,3 +1,4 @@
+#[cfg(target_os = "android")]
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::future::Future;
@@ -36,7 +37,7 @@ use codex_ipc::{
 /// discovery, auth, caching, and voice handoff into a single facade.
 /// All methods are safe to call from any thread (`Send + Sync`).
 pub struct MobileClient {
-    pub(crate) sessions: RwLock<HashMap<String, Arc<ServerSession>>>,
+    pub(crate) sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
     pub(crate) event_processor: Arc<EventProcessor>,
     pub(crate) app_store: Arc<AppStoreReducer>,
     pub(crate) discovery: RwLock<DiscoveryService>,
@@ -56,7 +57,7 @@ impl MobileClient {
         let app_store = Arc::new(AppStoreReducer::new());
         spawn_store_listener(Arc::clone(&app_store), event_processor.subscribe());
         Self {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_processor,
             app_store,
             discovery: RwLock::new(DiscoveryService::new(DiscoveryConfig::default())),
@@ -504,12 +505,16 @@ impl MobileClient {
                     server_id,
                     upstream::ClientRequest::CancelLoginAccount {
                         request_id: upstream::RequestId::Integer(crate::rpc::next_request_id()),
-                        params: upstream::CancelLoginAccountParams { login_id: login_id.clone() },
+                        params: upstream::CancelLoginAccountParams {
+                            login_id: login_id.clone(),
+                        },
                     },
                 )
                 .await;
             return Err(RpcError::Transport(TransportError::ConnectionFailed(
-                format!("failed to open localhost callback tunnel on port {callback_port}: {error}"),
+                format!(
+                    "failed to open localhost callback tunnel on port {callback_port}: {error}"
+                ),
             )));
         }
         self.replace_oauth_callback_tunnel(server_id, &login_id, callback_port)
@@ -529,7 +534,10 @@ impl MobileClient {
                 "desktop IPC is not connected".to_string(),
             ))
         })?;
-        info!("IPC out: external_resume_thread server={} thread={}", server_id, thread_id);
+        info!(
+            "IPC out: external_resume_thread server={} thread={}",
+            server_id, thread_id
+        );
         ipc_client
             .external_resume_thread(ExternalResumeThreadParams {
                 conversation_id: thread_id.to_string(),
@@ -537,7 +545,10 @@ impl MobileClient {
             })
             .await
             .map_err(|error| {
-                warn!("IPC out: external_resume_thread failed server={} error={}", server_id, error);
+                warn!(
+                    "IPC out: external_resume_thread failed server={} error={}",
+                    server_id, error
+                );
                 RpcError::Deserialization(format!("IPC external resume: {error}"))
             })?;
         refresh_thread_snapshot_from_app_server(
@@ -563,7 +574,10 @@ impl MobileClient {
             let turn_start_params: upstream::TurnStartParams =
                 crate::rpc::convert_generated_field(params)
                     .map_err(|error| RpcError::Deserialization(error.to_string()))?;
-            info!("IPC out: start_turn server={} thread={}", server_id, thread_id);
+            info!(
+                "IPC out: start_turn server={} thread={}",
+                server_id, thread_id
+            );
             let ipc_result = ipc_client
                 .start_turn(ThreadFollowerStartTurnParams {
                     conversation_id: thread_id.clone(),
@@ -572,7 +586,10 @@ impl MobileClient {
                 .await;
             match ipc_result {
                 Ok(_) => {
-                    debug!("IPC out: start_turn ok server={} thread={}", server_id, thread_id);
+                    debug!(
+                        "IPC out: start_turn ok server={} thread={}",
+                        server_id, thread_id
+                    );
                     refresh_thread_snapshot_from_app_server(
                         Arc::clone(&session),
                         Arc::clone(&self.app_store),
@@ -674,7 +691,7 @@ impl MobileClient {
                     base_instructions: None,
                     developer_instructions,
                     ephemeral: false,
-                    persist_extended_history: true,
+                    persist_extended_history,
                 },
             )
             .await
@@ -878,6 +895,8 @@ impl MobileClient {
         let processor = Arc::clone(&self.event_processor);
         let oauth_callback_tunnels = Arc::clone(&self.oauth_callback_tunnels);
         let oauth_session = Arc::clone(&session);
+        let sessions = Arc::clone(&self.sessions);
+        let app_store = Arc::clone(&self.app_store);
         Self::spawn_detached(async move {
             loop {
                 match events.recv().await {
@@ -905,23 +924,61 @@ impl MobileClient {
                                 ssh_client.abort_forward_port(tunnel.local_port).await;
                             }
                         }
-                        debug!("event reader server_id={} notification={:?}", server_id, notification);
+                        debug!(
+                            "event reader server_id={} notification={:?}",
+                            server_id, notification
+                        );
                         processor.process_notification(&server_id, &notification);
                     }
                     Ok(ServerEvent::LegacyNotification { method, params }) => {
-                        debug!("event reader server_id={} legacy_method={} params={}", server_id, method, params);
+                        debug!(
+                            "event reader server_id={} legacy_method={} params={}",
+                            server_id, method, params
+                        );
                         processor.process_legacy_notification(&server_id, &method, &params);
                     }
                     Ok(ServerEvent::Request(request)) => {
                         debug!("event reader server_id={} request={:?}", server_id, request);
+                        let dynamic_tool_request = match &request {
+                            upstream::ServerRequest::DynamicToolCall { request_id, params } => {
+                                Some((request_id.clone(), params.clone()))
+                            }
+                            _ => None,
+                        };
                         processor.process_server_request(&server_id, &request);
+                        if let Some((request_id, params)) = dynamic_tool_request {
+                            let server_id = server_id.clone();
+                            let session = Arc::clone(&oauth_session);
+                            let sessions = Arc::clone(&sessions);
+                            let app_store = Arc::clone(&app_store);
+                            MobileClient::spawn_detached(async move {
+                                if let Err(error) = handle_dynamic_tool_call_request(
+                                    session,
+                                    sessions,
+                                    app_store,
+                                    server_id.clone(),
+                                    request_id,
+                                    params,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "MobileClient: failed to handle dynamic tool call on {}: {}",
+                                        server_id, error
+                                    );
+                                }
+                            });
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("event stream closed for {server_id}");
                         break;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("event reader lagged server_id={} skipped={}", server_id, skipped);
+                        warn!(
+                            "event reader lagged server_id={} skipped={}",
+                            server_id, skipped
+                        );
                     }
                 }
             }
@@ -983,49 +1040,92 @@ impl MobileClient {
                         ) {
                             Ok(()) => {}
                             Err(StreamHandleError::VersionGap) => {
-                                debug!("IPC: version gap for thread={}, falling back to RPC", params.conversation_id);
+                                debug!(
+                                    "IPC: version gap for thread={}, falling back to RPC",
+                                    params.conversation_id
+                                );
                                 stream_cache.remove(&params.conversation_id);
                                 if let Err(e) = refresh_thread_snapshot_from_app_server(
-                                    Arc::clone(&session), Arc::clone(&app_store),
-                                    &loop_server_id, &params.conversation_id,
-                                ).await {
-                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                    Arc::clone(&session),
+                                    Arc::clone(&app_store),
+                                    &loop_server_id,
+                                    &params.conversation_id,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "IPC: RPC fallback failed for thread {}: {}",
+                                        params.conversation_id, e
+                                    );
                                 }
                             }
                             Err(StreamHandleError::NoCachedState) => {
-                                debug!("IPC: no cached state for thread={}, falling back to RPC", params.conversation_id);
+                                debug!(
+                                    "IPC: no cached state for thread={}, falling back to RPC",
+                                    params.conversation_id
+                                );
                                 if let Err(e) = refresh_thread_snapshot_from_app_server(
-                                    Arc::clone(&session), Arc::clone(&app_store),
-                                    &loop_server_id, &params.conversation_id,
-                                ).await {
-                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                    Arc::clone(&session),
+                                    Arc::clone(&app_store),
+                                    &loop_server_id,
+                                    &params.conversation_id,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "IPC: RPC fallback failed for thread {}: {}",
+                                        params.conversation_id, e
+                                    );
                                 }
                             }
                             Err(StreamHandleError::DeserializeFailed(msg)) => {
-                                warn!("IPC: deserialize failed for thread={}: {}", params.conversation_id, msg);
+                                warn!(
+                                    "IPC: deserialize failed for thread={}: {}",
+                                    params.conversation_id, msg
+                                );
                                 stream_cache.remove(&params.conversation_id);
                                 if let Err(e) = refresh_thread_snapshot_from_app_server(
-                                    Arc::clone(&session), Arc::clone(&app_store),
-                                    &loop_server_id, &params.conversation_id,
-                                ).await {
-                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                    Arc::clone(&session),
+                                    Arc::clone(&app_store),
+                                    &loop_server_id,
+                                    &params.conversation_id,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "IPC: RPC fallback failed for thread {}: {}",
+                                        params.conversation_id, e
+                                    );
                                 }
                             }
                             Err(StreamHandleError::PatchFailed(msg)) => {
-                                warn!("IPC: patch failed for thread={}: {}", params.conversation_id, msg);
+                                warn!(
+                                    "IPC: patch failed for thread={}: {}",
+                                    params.conversation_id, msg
+                                );
                                 stream_cache.remove(&params.conversation_id);
                                 if let Err(e) = refresh_thread_snapshot_from_app_server(
-                                    Arc::clone(&session), Arc::clone(&app_store),
-                                    &loop_server_id, &params.conversation_id,
-                                ).await {
-                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                    Arc::clone(&session),
+                                    Arc::clone(&app_store),
+                                    &loop_server_id,
+                                    &params.conversation_id,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "IPC: RPC fallback failed for thread {}: {}",
+                                        params.conversation_id, e
+                                    );
                                 }
                             }
                         }
                     }
                     Ok(TypedBroadcast::ThreadArchived(ref params)) => {
                         stream_cache.remove(&params.conversation_id);
-                        debug!("IPC in: ThreadArchived server={} thread={}", loop_server_id, params.conversation_id);
+                        debug!(
+                            "IPC in: ThreadArchived server={} thread={}",
+                            loop_server_id, params.conversation_id
+                        );
                         if let Err(error) = refresh_thread_list_from_app_server(
                             Arc::clone(&session),
                             Arc::clone(&app_store),
@@ -1042,7 +1142,10 @@ impl MobileClient {
                     Ok(TypedBroadcast::ThreadUnarchived(_))
                     | Ok(TypedBroadcast::ThreadQueuedFollowupsChanged(_))
                     | Ok(TypedBroadcast::QueryCacheInvalidate(_)) => {
-                        debug!("IPC in: thread list change broadcast server={}", loop_server_id);
+                        debug!(
+                            "IPC in: thread list change broadcast server={}",
+                            loop_server_id
+                        );
                         if let Err(error) = refresh_thread_list_from_app_server(
                             Arc::clone(&session),
                             Arc::clone(&app_store),
@@ -1057,7 +1160,10 @@ impl MobileClient {
                         }
                     }
                     Ok(TypedBroadcast::ClientStatusChanged(params)) => {
-                        debug!("IPC in: ClientStatusChanged server={} client_type={} status={:?}", loop_server_id, params.client_type, params.status);
+                        debug!(
+                            "IPC in: ClientStatusChanged server={} client_type={} status={:?}",
+                            loop_server_id, params.client_type, params.status
+                        );
                         if params.client_type != "mobile" {
                             match params.status {
                                 ClientStatus::Connected => {
@@ -1217,7 +1323,10 @@ async fn attach_ipc_client_via_ssh(
         .await
     {
         Ok(Some(socket_path)) => {
-            info!("IPC socket detected server={} path={}", server_id, socket_path);
+            info!(
+                "IPC socket detected server={} path={}",
+                server_id, socket_path
+            );
             let ipc_config = IpcClientConfig {
                 socket_path: std::path::PathBuf::from(&socket_path),
                 client_type: "mobile".to_string(),
@@ -1441,6 +1550,612 @@ fn spawn_store_listener(app_store: Arc<AppStoreReducer>, mut rx: broadcast::Rece
     });
 }
 
+#[derive(Clone)]
+struct DynamicToolSessionTarget {
+    server_id: String,
+    session: Arc<ServerSession>,
+    config: ServerConfig,
+}
+
+async fn handle_dynamic_tool_call_request(
+    session: Arc<ServerSession>,
+    sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
+    app_store: Arc<AppStoreReducer>,
+    calling_server_id: String,
+    request_id: upstream::RequestId,
+    params: upstream::DynamicToolCallParams,
+) -> Result<(), RpcError> {
+    let response = match execute_dynamic_tool_call(
+        sessions,
+        Arc::clone(&app_store),
+        &calling_server_id,
+        &params,
+    )
+    .await
+    {
+        Ok(text) => generated::DynamicToolCallResponse {
+            content_items: vec![generated::DynamicToolCallOutputContentItem::InputText { text }],
+            success: true,
+        },
+        Err(message) => generated::DynamicToolCallResponse {
+            content_items: vec![generated::DynamicToolCallOutputContentItem::InputText {
+                text: message,
+            }],
+            success: false,
+        },
+    };
+
+    let request_id = serde_json::to_value(request_id).map_err(|error| {
+        RpcError::Deserialization(format!("serialize dynamic tool request id: {error}"))
+    })?;
+    let result = serde_json::to_value(response).map_err(|error| {
+        RpcError::Deserialization(format!("serialize dynamic tool response: {error}"))
+    })?;
+    session.respond(request_id, result).await
+}
+
+async fn execute_dynamic_tool_call(
+    sessions: Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
+    app_store: Arc<AppStoreReducer>,
+    calling_server_id: &str,
+    params: &upstream::DynamicToolCallParams,
+) -> Result<String, String> {
+    let targets = snapshot_dynamic_tool_sessions(&sessions);
+
+    match params.tool.as_str() {
+        "list_servers" => Ok(list_servers_tool_output(&targets)),
+        "list_sessions" => list_sessions_tool_output(&targets, app_store, &params.arguments).await,
+        "read_session" => read_session_tool_output(&targets, app_store, &params.arguments).await,
+        "run_on_server" => {
+            run_on_server_tool_output(&targets, app_store, calling_server_id, &params.arguments)
+                .await
+        }
+        tool => Err(format!("Unknown dynamic tool: {tool}")),
+    }
+}
+
+fn snapshot_dynamic_tool_sessions(
+    sessions: &Arc<RwLock<HashMap<String, Arc<ServerSession>>>>,
+) -> Vec<DynamicToolSessionTarget> {
+    let guard = match sessions.read() {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!("MobileClient: recovering poisoned sessions read lock");
+            error.into_inner()
+        }
+    };
+
+    let mut targets = guard
+        .iter()
+        .map(|(server_id, session)| DynamicToolSessionTarget {
+            server_id: server_id.clone(),
+            session: Arc::clone(session),
+            config: session.config().clone(),
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|lhs, rhs| dynamic_tool_server_name(lhs).cmp(&dynamic_tool_server_name(rhs)));
+    targets
+}
+
+fn dynamic_tool_server_name(target: &DynamicToolSessionTarget) -> String {
+    if target.config.is_local {
+        "local".to_string()
+    } else {
+        target.config.display_name.clone()
+    }
+}
+
+fn dynamic_tool_matches_server(target: &DynamicToolSessionTarget, requested_server: &str) -> bool {
+    let requested = requested_server.trim();
+    if requested.is_empty() {
+        return false;
+    }
+    target.server_id.eq_ignore_ascii_case(requested)
+        || target.config.display_name.eq_ignore_ascii_case(requested)
+        || target.config.host.eq_ignore_ascii_case(requested)
+        || (target.config.is_local && requested.eq_ignore_ascii_case("local"))
+}
+
+fn dynamic_tool_sessions_for_request(
+    targets: &[DynamicToolSessionTarget],
+    requested_server: Option<&str>,
+    allow_all_if_missing: bool,
+) -> Result<Vec<DynamicToolSessionTarget>, String> {
+    match requested_server
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(requested_server) => {
+            let matches = targets
+                .iter()
+                .filter(|target| dynamic_tool_matches_server(target, requested_server))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                Err(format!("Server '{requested_server}' is not connected."))
+            } else {
+                Ok(matches)
+            }
+        }
+        None if allow_all_if_missing => Ok(targets.to_vec()),
+        None => Err("A server name or ID is required.".to_string()),
+    }
+}
+
+fn dynamic_tool_string(arguments: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = arguments.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn dynamic_tool_u32(arguments: &serde_json::Value, keys: &[&str]) -> Option<u32> {
+    let object = arguments.as_object()?;
+    keys.iter().find_map(|key| match object.get(*key) {
+        Some(serde_json::Value::Number(value)) => {
+            value.as_u64().and_then(|n| u32::try_from(n).ok())
+        }
+        Some(serde_json::Value::String(value)) => value.trim().parse::<u32>().ok(),
+        _ => None,
+    })
+}
+
+fn dynamic_tool_reasoning_effort(value: Option<String>) -> Option<generated::ReasoningEffort> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(generated::ReasoningEffort::None),
+        "minimal" => Some(generated::ReasoningEffort::Minimal),
+        "low" => Some(generated::ReasoningEffort::Low),
+        "medium" => Some(generated::ReasoningEffort::Medium),
+        "high" => Some(generated::ReasoningEffort::High),
+        "xhigh" | "x_high" | "extra_high" | "extra-high" => Some(generated::ReasoningEffort::XHigh),
+        _ => None,
+    }
+}
+
+fn dynamic_tool_service_tier(value: Option<String>) -> Option<generated::ServiceTier> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "fast" => Some(generated::ServiceTier::Fast),
+        "flex" => Some(generated::ServiceTier::Flex),
+        _ => None,
+    }
+}
+
+fn truncate_dynamic_tool_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].trim_end().to_string();
+    truncated.push_str("...");
+    truncated
+}
+
+fn serialize_dynamic_tool_payload(payload: serde_json::Value, max_bytes: usize) -> String {
+    let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    truncate_dynamic_tool_text(&text, max_bytes)
+}
+
+fn list_servers_tool_output(targets: &[DynamicToolSessionTarget]) -> String {
+    let items = targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "id": target.server_id,
+                "name": dynamic_tool_server_name(target),
+                "hostname": truncate_dynamic_tool_text(&target.config.host, 200),
+                "isConnected": true,
+                "isLocal": target.config.is_local,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serialize_dynamic_tool_payload(
+        serde_json::json!({
+            "type": "servers",
+            "items": items,
+        }),
+        24_000,
+    )
+}
+
+async fn list_sessions_tool_output(
+    targets: &[DynamicToolSessionTarget],
+    app_store: Arc<AppStoreReducer>,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    let limit = dynamic_tool_u32(arguments, &["limit"])
+        .unwrap_or(20)
+        .clamp(1, 40);
+    let requested_server = dynamic_tool_string(arguments, &["server_id", "server"]);
+    let targets = dynamic_tool_sessions_for_request(targets, requested_server.as_deref(), true)?;
+
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+
+    for target in targets {
+        let response = dynamic_tool_request_typed::<generated::ThreadListResponse, _>(
+            &target.session,
+            "thread/list",
+            &generated::ThreadListParams {
+                cursor: None,
+                limit: Some(limit),
+                sort_key: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: None,
+                cwd: None,
+                search_term: None,
+            },
+        )
+        .await;
+
+        match response {
+            Ok(response) => {
+                let threads = response
+                    .data
+                    .into_iter()
+                    .filter_map(thread_info_from_generated_thread)
+                    .collect::<Vec<_>>();
+                app_store.sync_thread_list(&target.server_id, &threads);
+                items.extend(threads.into_iter().map(|thread| {
+                    serde_json::json!({
+                        "id": thread.id,
+                        "preview": thread.preview.map(|value| truncate_dynamic_tool_text(&value, 280)),
+                        "modelProvider": thread.model_provider,
+                        "updatedAt": thread.updated_at,
+                        "cwd": thread.cwd.map(|value| truncate_dynamic_tool_text(&value, 240)),
+                        "serverId": target.server_id,
+                        "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
+                    })
+                }));
+            }
+            Err(error) => {
+                errors.push(serde_json::json!({
+                    "serverId": target.server_id,
+                    "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
+                    "message": truncate_dynamic_tool_text(&error, 240),
+                }));
+            }
+        }
+    }
+
+    items.sort_by(|lhs, rhs| {
+        let lhs_updated = lhs
+            .get("updatedAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        let rhs_updated = rhs
+            .get("updatedAt")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        rhs_updated.cmp(&lhs_updated)
+    });
+    if items.len() > limit as usize {
+        items.truncate(limit as usize);
+    }
+
+    let mut payload = serde_json::json!({
+        "type": "sessions",
+        "items": items,
+    });
+    if let serde_json::Value::Object(object) = &mut payload
+        && !errors.is_empty()
+    {
+        object.insert("errors".to_string(), serde_json::Value::Array(errors));
+    }
+    Ok(serialize_dynamic_tool_payload(payload, 64_000))
+}
+
+async fn read_session_tool_output(
+    targets: &[DynamicToolSessionTarget],
+    app_store: Arc<AppStoreReducer>,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    let requested_server = dynamic_tool_string(arguments, &["server_id", "server"]);
+    let thread_id = dynamic_tool_string(arguments, &["thread_id", "session_id"])
+        .ok_or_else(|| "read_session requires server and thread_id.".to_string())?;
+    let limit = dynamic_tool_u32(arguments, &["limit"])
+        .unwrap_or(50)
+        .clamp(1, 50) as usize;
+
+    let target = dynamic_tool_sessions_for_request(targets, requested_server.as_deref(), false)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No matching server connection.".to_string())?;
+
+    let response = dynamic_tool_request_typed::<generated::ThreadReadResponse, _>(
+        &target.session,
+        "thread/read",
+        &generated::ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: true,
+        },
+    )
+    .await?;
+
+    let snapshot =
+        thread_snapshot_from_generated_thread(&target.server_id, response.thread, None, None)
+            .map_err(|error| format!("thread/read snapshot: {error}"))?;
+    app_store.upsert_thread_snapshot(snapshot.clone());
+
+    Ok(serialize_dynamic_tool_payload(
+        serde_json::json!({
+            "type": "session",
+            "serverId": target.server_id,
+            "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
+            "threadId": thread_id,
+            "threadTitle": snapshot.info.title,
+            "items": readable_dynamic_tool_items(&snapshot, limit),
+        }),
+        96_000,
+    ))
+}
+
+async fn run_on_server_tool_output(
+    targets: &[DynamicToolSessionTarget],
+    app_store: Arc<AppStoreReducer>,
+    calling_server_id: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    let requested_server = dynamic_tool_string(arguments, &["server_id", "server"]);
+    let prompt = dynamic_tool_string(arguments, &["prompt"])
+        .ok_or_else(|| "run_on_server requires prompt.".to_string())?;
+    let model = dynamic_tool_string(arguments, &["model"]);
+    let effort = dynamic_tool_reasoning_effort(dynamic_tool_string(arguments, &["effort"]));
+    let service_tier = dynamic_tool_service_tier(dynamic_tool_string(arguments, &["service_tier"]));
+
+    let target = dynamic_tool_sessions_for_request(targets, requested_server.as_deref(), false)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No matching server connection.".to_string())?;
+
+    if target.config.is_local && target.server_id == calling_server_id {
+        return Err(
+            "Cannot run_on_server targeting 'local'. Use your own tools instead.".to_string(),
+        );
+    }
+
+    let thread_id =
+        if let Some(thread_id) = dynamic_tool_string(arguments, &["thread_id", "session_id"]) {
+            thread_id
+        } else {
+            let response = dynamic_tool_request_typed::<generated::ThreadStartResponse, _>(
+                &target.session,
+                "thread/start",
+                &generated::ThreadStartParams {
+                    model: model.clone(),
+                    model_provider: None,
+                    service_tier: service_tier.clone().map(Some),
+                    cwd: Some(if target.config.is_local {
+                        "/".to_string()
+                    } else {
+                        "/tmp".to_string()
+                    }),
+                    approval_policy: Some(generated::AskForApproval::Never),
+                    approvals_reviewer: None,
+                    sandbox: (!target.config.is_local)
+                        .then_some(generated::SandboxMode::DangerFullAccess),
+                    config: None,
+                    service_name: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    personality: None,
+                    ephemeral: None,
+                    dynamic_tools: None,
+                    mock_experimental_field: None,
+                    experimental_raw_events: false,
+                    persist_extended_history: true,
+                },
+            )
+            .await?;
+
+            let snapshot = thread_snapshot_from_generated_thread(
+                &target.server_id,
+                response.thread.clone(),
+                model.clone(),
+                effort.clone().map(reasoning_effort_string),
+            )
+            .map_err(|error| format!("thread/start snapshot: {error}"))?;
+            app_store.upsert_thread_snapshot(snapshot);
+            response.thread.id
+        };
+
+    let turn_response = dynamic_tool_request_typed::<generated::TurnStartResponse, _>(
+        &target.session,
+        "turn/start",
+        &generated::TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![generated::UserInput::Text {
+                text: prompt,
+                text_elements: Vec::new(),
+            }],
+            cwd: None,
+            approval_policy: Some(generated::AskForApproval::Never),
+            approvals_reviewer: None,
+            sandbox_policy: (!target.config.is_local)
+                .then_some(generated::SandboxPolicy::DangerFullAccess),
+            model: model.clone(),
+            service_tier: service_tier.clone().map(Some),
+            effort: effort.clone(),
+            summary: None,
+            personality: None,
+            output_schema: None,
+            collaboration_mode: None,
+        },
+    )
+    .await?;
+
+    let turn_id = turn_response.turn.id;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut last_snapshot: Option<ThreadSnapshot> = None;
+    let mut timed_out = true;
+
+    while std::time::Instant::now() < deadline {
+        let response = dynamic_tool_request_typed::<generated::ThreadReadResponse, _>(
+            &target.session,
+            "thread/read",
+            &generated::ThreadReadParams {
+                thread_id: thread_id.clone(),
+                include_turns: true,
+            },
+        )
+        .await?;
+
+        let info = thread_info_from_generated_thread(response.thread.clone())
+            .ok_or_else(|| "thread/read response missing thread info".to_string())?;
+        let snapshot = thread_snapshot_from_generated_thread(
+            &target.server_id,
+            response.thread,
+            model.clone(),
+            effort.clone().map(reasoning_effort_string),
+        )
+        .map_err(|error| format!("thread/read snapshot: {error}"))?;
+        app_store.upsert_thread_snapshot(snapshot.clone());
+        let is_active = matches!(info.status, crate::types::ThreadSummaryStatus::Active);
+        last_snapshot = Some(snapshot);
+        if !is_active {
+            timed_out = false;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    let snapshot =
+        last_snapshot.ok_or_else(|| "thread/read did not return a thread snapshot".to_string())?;
+    let assistant_result = snapshot
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match &item.content {
+            crate::conversation::ConversationItemContent::Assistant(data)
+                if !data.text.trim().is_empty() =>
+            {
+                Some(truncate_dynamic_tool_text(&data.text, 8_000))
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut payload = serde_json::json!({
+        "type": "run_on_server",
+        "serverId": target.server_id,
+        "serverName": truncate_dynamic_tool_text(&dynamic_tool_server_name(&target), 160),
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "result": assistant_result,
+        "items": readable_dynamic_tool_items(&snapshot, 12),
+    });
+    if let serde_json::Value::Object(object) = &mut payload
+        && timed_out
+    {
+        object.insert("timedOut".to_string(), serde_json::Value::Bool(true));
+    }
+
+    Ok(serialize_dynamic_tool_payload(payload, 96_000))
+}
+
+async fn dynamic_tool_request_typed<R, P>(
+    session: &Arc<ServerSession>,
+    method: &str,
+    params: &P,
+) -> Result<R, String>
+where
+    R: serde::de::DeserializeOwned,
+    P: serde::Serialize,
+{
+    let params_json = serde_json::to_value(params)
+        .map_err(|error| format!("serialize {method} params: {error}"))?;
+    let response = session
+        .request(method, params_json)
+        .await
+        .map_err(|error| format!("{method} request failed: {error}"))?;
+    serde_json::from_value(response)
+        .map_err(|error| format!("deserialize {method} response: {error}"))
+}
+
+fn readable_dynamic_tool_items(snapshot: &ThreadSnapshot, limit: usize) -> Vec<serde_json::Value> {
+    let mapped = snapshot
+        .items
+        .iter()
+        .filter_map(readable_dynamic_tool_item)
+        .collect::<Vec<_>>();
+    let start = mapped.len().saturating_sub(limit);
+    mapped.into_iter().skip(start).collect()
+}
+
+fn readable_dynamic_tool_item(
+    item: &crate::conversation::ConversationItem,
+) -> Option<serde_json::Value> {
+    match &item.content {
+        crate::conversation::ConversationItemContent::User(data)
+            if !data.text.trim().is_empty() =>
+        {
+            Some(serde_json::json!({
+                "role": "user",
+                "text": truncate_dynamic_tool_text(&data.text, 4_000),
+            }))
+        }
+        crate::conversation::ConversationItemContent::Assistant(data)
+            if !data.text.trim().is_empty() =>
+        {
+            Some(serde_json::json!({
+                "role": "assistant",
+                "text": truncate_dynamic_tool_text(&data.text, 4_000),
+            }))
+        }
+        crate::conversation::ConversationItemContent::Reasoning(data) => {
+            let text = if !data.content.is_empty() {
+                data.content.join("\n")
+            } else {
+                data.summary.join("\n")
+            };
+            (!text.trim().is_empty()).then(|| {
+                serde_json::json!({
+                    "role": "reasoning",
+                    "text": truncate_dynamic_tool_text(&text, 2_000),
+                })
+            })
+        }
+        crate::conversation::ConversationItemContent::DynamicToolCall(data) => data
+            .content_summary
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                serde_json::json!({
+                    "role": "tool",
+                    "tool": data.tool,
+                    "status": data.status,
+                    "text": truncate_dynamic_tool_text(text, 2_000),
+                })
+            }),
+        crate::conversation::ConversationItemContent::McpToolCall(data) => data
+            .content_summary
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                serde_json::json!({
+                    "role": "tool",
+                    "tool": data.tool,
+                    "status": data.status,
+                    "text": truncate_dynamic_tool_text(text, 2_000),
+                })
+            }),
+        crate::conversation::ConversationItemContent::Error(data) => Some(serde_json::json!({
+            "role": "error",
+            "text": truncate_dynamic_tool_text(&data.message, 2_000),
+        })),
+        _ => None,
+    }
+}
+
 pub fn thread_info_from_generated_thread(thread: generated::Thread) -> Option<ThreadInfo> {
     thread_info_from_generated_thread_list_item(thread, None, None)
 }
@@ -1496,12 +2211,12 @@ fn remote_oauth_callback_port(auth_url: &str) -> Result<u16, RpcError> {
         .find(|(key, _)| key == "redirect_uri")
         .map(|(_, value)| value.into_owned())
         .ok_or_else(|| {
-            RpcError::Deserialization(
-                "missing redirect_uri in remote OAuth auth URL".to_string(),
-            )
+            RpcError::Deserialization("missing redirect_uri in remote OAuth auth URL".to_string())
         })?;
     let redirect = Url::parse(&redirect_uri).map_err(|error| {
-        RpcError::Deserialization(format!("invalid redirect_uri in remote OAuth auth URL: {error}"))
+        RpcError::Deserialization(format!(
+            "invalid redirect_uri in remote OAuth auth URL: {error}"
+        ))
     })?;
     let host = redirect.host_str().unwrap_or_default();
     if host != "localhost" && host != "127.0.0.1" {
@@ -1510,9 +2225,7 @@ fn remote_oauth_callback_port(auth_url: &str) -> Result<u16, RpcError> {
         )));
     }
     redirect.port_or_known_default().ok_or_else(|| {
-        RpcError::Deserialization(
-            "missing callback port in remote OAuth redirect_uri".to_string(),
-        )
+        RpcError::Deserialization("missing callback port in remote OAuth redirect_uri".to_string())
     })
 }
 
@@ -1707,18 +2420,14 @@ fn handle_stream_state_change(
 ) -> Result<(), StreamHandleError> {
     match &params.change {
         StreamChange::Snapshot { conversation_state } => {
-            let mut snapshot =
-                thread_snapshot_from_conversation_json(server_id, conversation_state)
-                    .map_err(|e| {
-                        let preview: String = conversation_state
-                            .to_string()
-                            .chars()
-                            .take(500)
-                            .collect();
-                        StreamHandleError::DeserializeFailed(format!(
-                            "{e}; json preview: {preview}"
-                        ))
-                    })?;
+            let mut snapshot = thread_snapshot_from_conversation_json(
+                server_id,
+                conversation_state,
+            )
+            .map_err(|e| {
+                let preview: String = conversation_state.to_string().chars().take(500).collect();
+                StreamHandleError::DeserializeFailed(format!("{e}; json preview: {preview}"))
+            })?;
 
             let key = ThreadKey {
                 server_id: server_id.to_string(),
@@ -1747,9 +2456,8 @@ fn handle_stream_state_change(
             crate::immer_patch::apply_patches(cached_json, patches)
                 .map_err(|e| StreamHandleError::PatchFailed(e.to_string()))?;
 
-            let mut snapshot =
-                thread_snapshot_from_conversation_json(server_id, cached_json)
-                    .map_err(StreamHandleError::DeserializeFailed)?;
+            let mut snapshot = thread_snapshot_from_conversation_json(server_id, cached_json)
+                .map_err(StreamHandleError::DeserializeFailed)?;
 
             let key = ThreadKey {
                 server_id: server_id.to_string(),
@@ -1772,7 +2480,13 @@ async fn send_ipc_approval_response(
     thread_id: &str,
     decision: ApprovalDecisionValue,
 ) -> Result<bool, RpcError> {
-    tracing::info!("IPC out: approval_response thread={} request_id={} kind={:?} decision={:?}", thread_id, approval.id, approval.kind, decision);
+    tracing::info!(
+        "IPC out: approval_response thread={} request_id={} kind={:?} decision={:?}",
+        thread_id,
+        approval.id,
+        approval.kind,
+        decision
+    );
     match approval.kind {
         crate::types::ApprovalKind::Command => {
             ipc_client
@@ -1845,7 +2559,11 @@ async fn send_ipc_user_input_response(
     let response = serde_json::from_value(response_json).map_err(|error| {
         RpcError::Deserialization(format!("deserialize IPC user input response: {error}"))
     })?;
-    tracing::info!("IPC out: submit_user_input thread={} request_id={}", thread_id, request_id);
+    tracing::info!(
+        "IPC out: submit_user_input thread={} request_id={}",
+        thread_id,
+        request_id
+    );
     ipc_client
         .submit_user_input(ThreadFollowerSubmitUserInputParams {
             conversation_id: thread_id.to_string(),

@@ -514,12 +514,12 @@ final class VoiceRuntimeController: VoiceActions {
         voiceThreadId: String,
         text: String
     ) async {
+        _ = handoffId
         _ = try? await requireAppModel().rpc.threadRealtimeResolveHandoff(
             serverId: voiceServerId,
             params: ThreadRealtimeResolveHandoffParams(
                 threadId: voiceThreadId,
-                handoffId: handoffId,
-                outputText: text
+                toolCallOutput: text
             )
         )
         processHandoffActions()
@@ -533,8 +533,7 @@ final class VoiceRuntimeController: VoiceActions {
         _ = try? await requireAppModel().rpc.threadRealtimeFinalizeHandoff(
             serverId: voiceServerId,
             params: ThreadRealtimeFinalizeHandoffParams(
-                threadId: voiceThreadId,
-                handoffId: handoffId
+                threadId: voiceThreadId
             )
         )
         handoffManager.reportFinalized(handoffId: handoffId)

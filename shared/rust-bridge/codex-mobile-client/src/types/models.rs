@@ -280,6 +280,7 @@ mod tests {
                 depth,
                 agent_nickname,
                 agent_role,
+                ..
             }) => {
                 assert_eq!(parent_thread_id, "parent-1");
                 assert_eq!(depth, 2);
@@ -291,38 +292,43 @@ mod tests {
 
         // Convert to upstream Thread (which has the From<Thread> for ThreadInfo impl)
         // by re-deserializing from the same JSON shape, using valid UUIDs for ThreadId fields.
-        let upstream_thread: codex_app_server_protocol::Thread = serde_json::from_value(serde_json::json!({
-            "id": "01234567-89ab-cdef-0123-456789abcdef",
-            "preview": "hi",
-            "ephemeral": false,
-            "modelProvider": "openai",
-            "createdAt": 1,
-            "updatedAt": 2,
-            "status": {
-                "type": "active",
-                "activeFlags": ["waitingOnApproval"]
-            },
-            "path": "/tmp/thread",
-            "cwd": "/tmp/thread",
-            "cliVersion": "1.0.0",
-            "source": {
-                "subAgent": {
-                    "thread_spawn": {
-                        "parent_thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-                        "depth": 2,
-                        "agent_nickname": "Scout",
-                        "agent_role": "reviewer"
+        let upstream_thread: codex_app_server_protocol::Thread =
+            serde_json::from_value(serde_json::json!({
+                "id": "01234567-89ab-cdef-0123-456789abcdef",
+                "preview": "hi",
+                "ephemeral": false,
+                "modelProvider": "openai",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval"]
+                },
+                "path": "/tmp/thread",
+                "cwd": "/tmp/thread",
+                "cliVersion": "1.0.0",
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                            "depth": 2,
+                            "agent_nickname": "Scout",
+                            "agent_role": "reviewer"
+                        }
                     }
-                }
-            },
-            "agentNickname": "Scout",
-            "agentRole": "reviewer",
-            "gitInfo": null,
-            "name": "child",
-            "turns": []
-        })).expect("upstream Thread should deserialize");
+                },
+                "agentNickname": "Scout",
+                "agentRole": "reviewer",
+                "gitInfo": null,
+                "name": "child",
+                "turns": []
+            }))
+            .expect("upstream Thread should deserialize");
         let info = ThreadInfo::from(upstream_thread);
-        assert_eq!(info.parent_thread_id.as_deref(), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(
+            info.parent_thread_id.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
         assert_eq!(info.agent_nickname.as_deref(), Some("Scout"));
         assert_eq!(info.agent_role.as_deref(), Some("reviewer"));
     }

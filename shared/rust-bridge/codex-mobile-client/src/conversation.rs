@@ -892,6 +892,7 @@ mod tests {
                 id: "a1".into(),
                 text: " Response text ".into(),
                 phase: None,
+                memory_citation: None,
             }],
         )];
         let opts = HydrationOptions {
@@ -920,6 +921,7 @@ mod tests {
                 id: "a1".into(),
                 text: "  \n  ".into(),
                 phase: None,
+                memory_citation: None,
             }],
         )];
         let items = hydrate_turns(&turns, &HydrationOptions::default());
@@ -956,6 +958,7 @@ mod tests {
                 command: "ls -la".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("p1".into()),
+                source: Default::default(),
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Read {
                     command: "cat foo.rs".into(),
@@ -1048,6 +1051,7 @@ mod tests {
                     id: "a1".into(),
                     text: "World".into(),
                     phase: None,
+                    memory_citation: None,
                 }],
             ),
         ];

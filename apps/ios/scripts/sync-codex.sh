@@ -8,6 +8,7 @@ SUBMODULE_DIR="$REPO_DIR/shared/third_party/codex"
 PATCH_FILES=(
     "$REPO_DIR/patches/codex/ios-exec-hook.patch"
     "$REPO_DIR/patches/codex/client-controlled-handoff.patch"
+    "$REPO_DIR/patches/codex/mobile-code-mode-stub.patch"
 )
 
 patch_already_upstreamed() {

@@ -28,6 +28,8 @@ import uniffi.codex_mobile_client.HandoffManager
 import uniffi.codex_mobile_client.ThreadKey
 import uniffi.codex_mobile_client.ThreadRealtimeAppendAudioParams
 import uniffi.codex_mobile_client.ThreadRealtimeAudioChunk
+import uniffi.codex_mobile_client.ThreadRealtimeFinalizeHandoffParams
+import uniffi.codex_mobile_client.ThreadRealtimeResolveHandoffParams
 import uniffi.codex_mobile_client.ThreadRealtimeStartParams
 import uniffi.codex_mobile_client.ThreadRealtimeStopParams
 import java.nio.ByteBuffer
@@ -248,6 +250,7 @@ class VoiceRuntimeController {
                                 sampleRate = TARGET_SAMPLE_RATE.toUInt(),
                                 numChannels = 1u,
                                 samplesPerChannel = targetSamples.size.toUInt(),
+                                itemId = null,
                             ),
                         ),
                     )
@@ -547,18 +550,25 @@ class VoiceRuntimeController {
 
             is uniffi.codex_mobile_client.HandoffAction.ResolveHandoff -> {
                 try {
-                    // Send the resolved text back to the voice thread via appendText
-                    appModel.rpc.threadRealtimeAppendText(
+                    appModel.rpc.threadRealtimeResolveHandoff(
                         action.voiceThreadKey.serverId,
-                        uniffi.codex_mobile_client.ThreadRealtimeAppendTextParams(
+                        ThreadRealtimeResolveHandoffParams(
                             threadId = action.voiceThreadKey.threadId,
-                            text = action.text,
+                            toolCallOutput = action.text,
                         ),
                     )
                 } catch (_: Exception) {}
             }
 
             is uniffi.codex_mobile_client.HandoffAction.FinalizeHandoff -> {
+                try {
+                    appModel.rpc.threadRealtimeFinalizeHandoff(
+                        action.voiceThreadKey.serverId,
+                        ThreadRealtimeFinalizeHandoffParams(
+                            threadId = action.voiceThreadKey.threadId,
+                        ),
+                    )
+                } catch (_: Exception) {}
                 handoffManager?.uniffiReportFinalized(action.handoffId)
                 appModel.store.setVoiceHandoffThread(key = null)
             }

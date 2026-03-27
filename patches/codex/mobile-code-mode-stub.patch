@@ -1,0 +1,32 @@
+diff --git a/codex-rs/code-mode/Cargo.toml b/codex-rs/code-mode/Cargo.toml
+index e821ca0e4..3019a550d 100644
+--- a/codex-rs/code-mode/Cargo.toml
++++ b/codex-rs/code-mode/Cargo.toml
+@@ -19,6 +19,8 @@ serde_json = { workspace = true }
+ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ tokio-util = { workspace = true, features = ["rt"] }
+ tracing = { workspace = true }
++
++[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+ v8 = { workspace = true }
+ 
+ [dev-dependencies]
+diff --git a/codex-rs/code-mode/src/lib.rs b/codex-rs/code-mode/src/lib.rs
+index 841e568be..3a555ff5b 100644
+--- a/codex-rs/code-mode/src/lib.rs
++++ b/codex-rs/code-mode/src/lib.rs
+@@ -1,6 +1,14 @@
+ mod description;
+ mod response;
++#[cfg(not(any(target_os = "ios", target_os = "android")))]
+ mod runtime;
++#[cfg(any(target_os = "ios", target_os = "android"))]
++#[path = "runtime_stub.rs"]
++mod runtime;
++#[cfg(not(any(target_os = "ios", target_os = "android")))]
++mod service;
++#[cfg(any(target_os = "ios", target_os = "android"))]
++#[path = "service_stub.rs"]
+ mod service;
+ 
+ pub use description::CODE_MODE_PRAGMA_PREFIX;

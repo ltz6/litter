@@ -1,12 +1,11 @@
 diff --git a/codex-rs/core/src/exec.rs b/codex-rs/core/src/exec.rs
-index a4399ddc4..08b899856 100644
+index a4399ddc4..0ec92221b 100644
 --- a/codex-rs/core/src/exec.rs
 +++ b/codex-rs/core/src/exec.rs
-@@ -46,6 +46,23 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -46,6 +46,21 @@ use codex_utils_absolute_path::AbsolutePathBuf;
  use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
  use codex_utils_pty::process_group::kill_child_process_group;
  
-+
 +#[cfg(target_os = "ios")]
 +use std::sync::OnceLock;
 +
@@ -22,11 +21,10 @@ index a4399ddc4..08b899856 100644
 +    let _ = IOS_EXEC_HOOK.set(f);
 +}
 +
-+
  pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
  
  // Hardcode these since it does not seem worth including the libc crate just
-@@ -263,6 +280,37 @@ pub fn build_exec_request(
+@@ -854,6 +869,34 @@ async fn exec(
      if let Some(network) = network.as_ref() {
          network.apply_to_env(&mut env);
      }
@@ -58,17 +56,14 @@ index a4399ddc4..08b899856 100644
 +            timed_out: false,
 +        });
 +    }
-+
-+    #[allow(unreachable_code)]
-+
+ 
      let (program, args) = command.split_first().ok_or_else(|| {
          CodexErr::Io(io::Error::new(
-             io::ErrorKind::InvalidInput,
 diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
-index 2d992507b..8f8400ead 100644
+index 2d992507b..4e021fb66 100644
 --- a/codex-rs/core/src/unified_exec/process_manager.rs
 +++ b/codex-rs/core/src/unified_exec/process_manager.rs
-@@ -166,6 +166,13 @@ impl UnifiedExecProcessManager {
+@@ -166,6 +166,12 @@ impl UnifiedExecProcessManager {
              .workdir
              .clone()
              .unwrap_or_else(|| context.turn.cwd.to_path_buf());
@@ -78,11 +73,10 @@ index 2d992507b..8f8400ead 100644
 +        }
 +
 +        #[allow(unreachable_code)]
-+
          let process = self
              .open_session_with_sandbox(&request, cwd.clone(), context)
              .await;
-@@ -333,6 +340,81 @@ impl UnifiedExecProcessManager {
+@@ -333,6 +339,80 @@ impl UnifiedExecProcessManager {
          Ok(response)
      }
  
@@ -159,7 +153,6 @@ index 2d992507b..8f8400ead 100644
 +            session_command: Some(request.command.clone()),
 +        })
 +    }
-+
 +
      pub(crate) async fn write_stdin(
          &self,

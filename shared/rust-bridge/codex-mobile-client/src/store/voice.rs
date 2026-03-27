@@ -98,7 +98,7 @@ impl VoiceRealtimeThreadState {
             "output_transcript_delta" => {
                 self.handle_transcript_delta(item, AppVoiceSpeaker::Assistant)
             }
-            "speech_started" => {
+            "speech_started" | "input_audio_buffer.speech_started" => {
                 let mut updates = Vec::new();
                 if let Some(update) = self.flush_live_transcript(AppVoiceSpeaker::Assistant) {
                     updates.push(update);
@@ -616,5 +616,30 @@ mod tests {
         assert_eq!(request.input_transcript, "Search docs");
         assert_eq!(request.active_transcript, "user: Search docs");
         assert_eq!(request.server_hint.as_deref(), Some("remote"));
+    }
+
+    #[test]
+    fn speech_started_aliases_emit_same_update() {
+        let key = ThreadKey {
+            server_id: "local".into(),
+            thread_id: "voice-thread".into(),
+        };
+
+        let legacy_state = VoiceRealtimeState::default();
+        let legacy = legacy_state.handle_item(&key, &json_value(json!({"type": "speech_started"})));
+        assert!(matches!(
+            legacy.as_slice(),
+            [VoiceDerivedUpdate::SpeechStarted]
+        ));
+
+        let upstream_state = VoiceRealtimeState::default();
+        let upstream = upstream_state.handle_item(
+            &key,
+            &json_value(json!({"type": "input_audio_buffer.speech_started"})),
+        );
+        assert!(matches!(
+            upstream.as_slice(),
+            [VoiceDerivedUpdate::SpeechStarted]
+        ));
     }
 }

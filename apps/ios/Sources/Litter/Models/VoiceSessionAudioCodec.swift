@@ -59,7 +59,8 @@ enum VoiceSessionAudioCodec {
             data: data.base64EncodedString(),
             sampleRate: UInt32(targetSampleRate.rounded()),
             numChannels: UInt32(channels),
-            samplesPerChannel: UInt32(samples.count)
+            samplesPerChannel: UInt32(samples.count),
+            itemId: nil
         )
     }
 
