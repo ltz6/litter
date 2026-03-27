@@ -292,7 +292,10 @@ mod webrtc {
                 "aarch64-apple-ios-sim" | "x86_64-apple-ios" => {
                     format!("-mios-simulator-version-min={}", ios_deployment_target())
                 }
-                target => panic!("unsupported iOS target for webrtc-audio-processing: {target}"),
+                target => panic!(
+                    "unsupported iOS target for webrtc-audio-processing: {}",
+                    target
+                ),
             };
             std::fs::write(
                 &cross_file,
