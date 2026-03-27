@@ -9,6 +9,8 @@ enum WallpaperType: String, Codable {
     case theme
     case customImage = "custom_image"
     case solidColor = "solid_color"
+    case customVideo = "custom_video"
+    case videoUrl = "video_url"
 }
 
 enum WallpaperScope: Equatable {
@@ -32,6 +34,8 @@ struct WallpaperConfig: Codable, Equatable {
     var blur: Double = 0.0
     var brightness: Double = 1.0
     var motionEnabled: Bool = false
+    var videoURL: String?
+    var videoDuration: Double?
 }
 
 // MARK: - JSON Storage
@@ -51,6 +55,7 @@ final class WallpaperManager {
     var activeThreadKey: ThreadKey?
     private(set) var resolvedWallpaperImage: UIImage?
     private(set) var resolvedConfig: WallpaperConfig?
+    private(set) var version: Int = 0
 
     @ObservationIgnored
     private var prefs = WallpaperPrefsFile()
@@ -97,6 +102,13 @@ final class WallpaperManager {
             return cfg
         }
 
+        return nil
+    }
+
+    func resolveConfigForServer(_ serverId: String) -> WallpaperConfig? {
+        if let cfg = prefs.servers[serverId], cfg.type != .none {
+            return cfg
+        }
         return nil
     }
 
@@ -152,12 +164,14 @@ final class WallpaperManager {
         for key in prefs.threads.keys {
             if !knownThreadKeys.contains(key) {
                 prefs.threads.removeValue(forKey: key)
-                // Remove orphaned image file
+                // Remove orphaned image and video files
                 let parts = key.split(separator: ":")
                 if parts.count == 2 {
-                    let fileName = "wallpaper_thread_\(parts[0])_\(parts[1]).jpg"
-                    let fileURL = Self.documentsDir.appendingPathComponent(fileName)
-                    try? FileManager.default.removeItem(at: fileURL)
+                    for ext in ["jpg", "mp4"] {
+                        let fileName = "wallpaper_thread_\(parts[0])_\(parts[1]).\(ext)"
+                        let fileURL = Self.documentsDir.appendingPathComponent(fileName)
+                        try? FileManager.default.removeItem(at: fileURL)
+                    }
                 }
                 changed = true
             }
@@ -166,9 +180,11 @@ final class WallpaperManager {
         for serverId in prefs.servers.keys {
             if !knownServerIds.contains(serverId) {
                 prefs.servers.removeValue(forKey: serverId)
-                let fileName = "wallpaper_server_\(serverId).jpg"
-                let fileURL = Self.documentsDir.appendingPathComponent(fileName)
-                try? FileManager.default.removeItem(at: fileURL)
+                for ext in ["jpg", "mp4"] {
+                    let fileName = "wallpaper_server_\(serverId).\(ext)"
+                    let fileURL = Self.documentsDir.appendingPathComponent(fileName)
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
                 changed = true
             }
         }
@@ -279,6 +295,8 @@ final class WallpaperManager {
         case .solidColor:
             guard let hex = config.colorHex else { return nil }
             return generateSolidColor(hex: hex)
+        case .customVideo, .videoUrl:
+            return nil
         }
     }
 
@@ -294,6 +312,7 @@ final class WallpaperManager {
     }
 
     private func refreshResolved() {
+        version += 1
         resolvedConfig = resolveConfig(for: activeThreadKey)
         // Image resolution is deferred to view layer which has themeManager access
         if resolvedConfig == nil || resolvedConfig?.type == .none {
@@ -303,6 +322,17 @@ final class WallpaperManager {
 
     func updateResolvedImage(_ image: UIImage?) {
         resolvedWallpaperImage = image
+    }
+
+    func videoFileURL(for scope: WallpaperScope) -> URL {
+        let fileName: String
+        switch scope {
+        case .thread(let key):
+            fileName = "wallpaper_thread_\(key.serverId)_\(key.threadId).mp4"
+        case .server(let serverId):
+            fileName = "wallpaper_server_\(serverId).mp4"
+        }
+        return Self.documentsDir.appendingPathComponent(fileName)
     }
 
     private func loadCustomImage(for scope: WallpaperScope?) -> UIImage? {

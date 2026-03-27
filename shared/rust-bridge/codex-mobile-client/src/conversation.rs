@@ -856,7 +856,7 @@ mod tests {
         )];
         let items = hydrate_turns(&turns, &HydrationOptions::default());
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "t1-0");
+        assert_eq!(items[0].id, "u1");
         assert!(items[0].is_from_user_turn_boundary);
         match &items[0].content {
             ConversationItemContent::User(data) => {

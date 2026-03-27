@@ -29,7 +29,7 @@ private const val MAX_WALLPAPER_DIMENSION = 2048
 private const val PATTERN_SIZE = 1080
 
 enum class WallpaperType {
-    NONE, THEME, CUSTOM_IMAGE, SOLID_COLOR
+    NONE, THEME, CUSTOM_IMAGE, SOLID_COLOR, CUSTOM_VIDEO, VIDEO_URL
 }
 
 enum class PatternType {
@@ -43,6 +43,8 @@ data class WallpaperConfig(
     val blur: Float = 0f,
     val brightness: Float = 1f,
     val motionEnabled: Boolean = false,
+    val videoURL: String? = null,
+    val videoDuration: Float? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("type", type.name.lowercase())
@@ -51,6 +53,8 @@ data class WallpaperConfig(
         put("blur", blur.toDouble())
         put("brightness", brightness.toDouble())
         put("motionEnabled", motionEnabled)
+        videoURL?.let { put("videoURL", it) }
+        videoDuration?.let { put("videoDuration", it.toDouble()) }
     }
 
     companion object {
@@ -59,6 +63,8 @@ data class WallpaperConfig(
                 "theme" -> WallpaperType.THEME
                 "custom_image" -> WallpaperType.CUSTOM_IMAGE
                 "solid_color" -> WallpaperType.SOLID_COLOR
+                "custom_video" -> WallpaperType.CUSTOM_VIDEO
+                "video_url" -> WallpaperType.VIDEO_URL
                 else -> WallpaperType.NONE
             },
             themeSlug = json.optString("themeSlug", null),
@@ -66,6 +72,8 @@ data class WallpaperConfig(
             blur = json.optDouble("blur", 0.0).toFloat(),
             brightness = json.optDouble("brightness", 1.0).toFloat(),
             motionEnabled = json.optBoolean("motionEnabled", false),
+            videoURL = json.optString("videoURL", null),
+            videoDuration = if (json.has("videoDuration")) json.optDouble("videoDuration").toFloat() else null,
         )
     }
 }
@@ -83,11 +91,21 @@ object WallpaperManager {
 
     var activeThreadKey by mutableStateOf<ThreadKey?>(null)
 
+    // Transient config set by selection screen, consumed by adjust screen
+    var pendingConfig by mutableStateOf<WallpaperConfig?>(null)
+
+    // Incremented on every setWallpaper/clear to trigger recomposition in observers
+    var version by mutableStateOf(0)
+        private set
+
     var resolvedBitmap by mutableStateOf<Bitmap?>(null)
         private set
 
     var resolvedConfig by mutableStateOf<WallpaperConfig?>(null)
         private set
+
+    val isWallpaperSet: Boolean
+        get() = resolvedConfig?.type?.let { it != WallpaperType.NONE } == true
 
     fun initialize(context: Context) {
         if (initialized) return
@@ -108,6 +126,13 @@ object WallpaperManager {
         return null
     }
 
+    fun resolvedConfigForServer(serverId: String): WallpaperConfig? {
+        val servers = prefsData.optJSONObject("servers")
+        val serverConfig = servers?.optJSONObject(serverId)
+        if (serverConfig != null) return WallpaperConfig.fromJson(serverConfig)
+        return null
+    }
+
     fun setWallpaper(config: WallpaperConfig, scope: WallpaperScope) {
         when (scope) {
             is WallpaperScope.Thread -> {
@@ -124,6 +149,7 @@ object WallpaperManager {
         }
         savePrefs()
         refreshResolved()
+        version++
     }
 
     fun clearWallpaper(scope: WallpaperScope) {
@@ -131,21 +157,34 @@ object WallpaperManager {
             is WallpaperScope.Thread -> {
                 val key = "${scope.key.serverId}::${scope.key.threadId}"
                 prefsData.optJSONObject("threads")?.remove(key)
-                // Also remove custom image file
+                // Also remove custom image and video files
                 customImageFile(key)?.delete()
+                videoFileForScope(scope)?.delete()
             }
             is WallpaperScope.Server -> {
                 prefsData.optJSONObject("servers")?.remove(scope.serverId)
                 customImageFile("server_${scope.serverId}")?.delete()
+                videoFileForScope(scope)?.delete()
             }
         }
         savePrefs()
         refreshResolved()
+        version++
     }
 
     fun setActiveThread(key: ThreadKey?) {
         activeThreadKey = key
         refreshResolved()
+    }
+
+    suspend fun setCustomFromUri(uri: Uri): Boolean {
+        val scope = activeScope() ?: return false
+        return setCustomImageFromUri(uri, scope)
+    }
+
+    fun clear() {
+        val scope = activeScope() ?: return
+        clearWallpaper(scope)
     }
 
     suspend fun setCustomImageFromUri(uri: Uri, scope: WallpaperScope): Boolean {
@@ -284,9 +323,47 @@ object WallpaperManager {
         return types[index % types.size]
     }
 
+    fun videoFilePath(scope: WallpaperScope): String? {
+        val context = appContext ?: return null
+        val fileKey = when (scope) {
+            is WallpaperScope.Thread -> "${scope.key.serverId}_${scope.key.threadId}"
+            is WallpaperScope.Server -> "server_${scope.serverId}"
+        }
+        val file = File(context.filesDir, "wallpaper_$fileKey.mp4")
+        return if (file.exists()) file.absolutePath else null
+    }
+
+    fun videoFilePathForServer(serverId: String): String? {
+        return videoFilePath(WallpaperScope.Server(serverId))
+    }
+
+    fun videoFilePath(threadKey: ThreadKey?): String? {
+        if (threadKey == null) return null
+        // Try thread-scoped first
+        val threadPath = videoFilePath(WallpaperScope.Thread(threadKey))
+        if (threadPath != null) return threadPath
+        // Fall back to server-scoped
+        return videoFilePath(WallpaperScope.Server(threadKey.serverId))
+    }
+
+    fun videoFileForScope(scope: WallpaperScope): File? {
+        val context = appContext ?: return null
+        val fileKey = when (scope) {
+            is WallpaperScope.Thread -> "${scope.key.serverId}_${scope.key.threadId}"
+            is WallpaperScope.Server -> "server_${scope.serverId}"
+        }
+        return File(context.filesDir, "wallpaper_$fileKey.mp4")
+    }
+
     fun resolvedBitmapForConfig(config: WallpaperConfig, threadKey: ThreadKey?): Bitmap? {
+        return resolvedBitmapForConfig(config, threadKey = threadKey, serverId = threadKey?.serverId)
+    }
+
+    fun resolvedBitmapForConfig(config: WallpaperConfig, threadKey: ThreadKey? = null, serverId: String? = null): Bitmap? {
+        val resolvedServerId = threadKey?.serverId ?: serverId
         return when (config.type) {
             WallpaperType.NONE -> null
+            WallpaperType.CUSTOM_VIDEO, WallpaperType.VIDEO_URL -> null // Video handled by player
             WallpaperType.THEME -> {
                 val slug = config.themeSlug ?: return null
                 val entry = LitterThemeManager.themeIndex.find { it.slug == slug } ?: return null
@@ -297,20 +374,25 @@ object WallpaperManager {
             }
             WallpaperType.CUSTOM_IMAGE -> {
                 val context = appContext ?: return null
-                val fileKey = if (threadKey != null) {
-                    "${threadKey.serverId}_${threadKey.threadId}"
-                } else {
-                    return null
-                }
-                val file = File(context.filesDir, "wallpaper_$fileKey.jpg")
-                if (!file.exists()) {
-                    // Try server-scoped
-                    val serverFile = File(context.filesDir, "wallpaper_server_${threadKey.serverId}.jpg")
+                if (threadKey != null) {
+                    val fileKey = "${threadKey.serverId}_${threadKey.threadId}"
+                    val file = File(context.filesDir, "wallpaper_$fileKey.jpg")
+                    if (!file.exists()) {
+                        // Try server-scoped
+                        val serverFile = File(context.filesDir, "wallpaper_server_${threadKey.serverId}.jpg")
+                        if (serverFile.exists()) {
+                            BitmapFactory.decodeFile(serverFile.absolutePath)
+                        } else null
+                    } else {
+                        BitmapFactory.decodeFile(file.absolutePath)
+                    }
+                } else if (resolvedServerId != null) {
+                    val serverFile = File(context.filesDir, "wallpaper_server_${resolvedServerId}.jpg")
                     if (serverFile.exists()) {
                         BitmapFactory.decodeFile(serverFile.absolutePath)
                     } else null
                 } else {
-                    BitmapFactory.decodeFile(file.absolutePath)
+                    null
                 }
             }
             WallpaperType.SOLID_COLOR -> null // Solid color is handled via Compose background
@@ -339,10 +421,10 @@ object WallpaperManager {
             keysToRemove.forEach { servers.remove(it) }
         }
         savePrefs()
-        // Clean orphaned image files
+        // Clean orphaned image and video files
         val context = appContext ?: return
         context.filesDir.listFiles()?.filter {
-            it.name.startsWith("wallpaper_") && it.name.endsWith(".jpg")
+            it.name.startsWith("wallpaper_") && (it.name.endsWith(".jpg") || it.name.endsWith(".mp4"))
         }?.forEach { file ->
             val name = file.nameWithoutExtension.removePrefix("wallpaper_")
             val isThreadFile = knownThreadKeys.any { key ->
@@ -387,6 +469,11 @@ object WallpaperManager {
     private fun customImageFile(key: String): File? {
         val context = appContext ?: return null
         return File(context.filesDir, "wallpaper_$key.jpg")
+    }
+
+    private fun activeScope(): WallpaperScope? {
+        val key = activeThreadKey ?: return null
+        return WallpaperScope.Thread(key)
     }
 
     private fun drawHexagon(canvas: Canvas, cx: Float, cy: Float, size: Float, paint: Paint) {

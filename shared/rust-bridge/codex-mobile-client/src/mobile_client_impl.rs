@@ -1,10 +1,12 @@
 use futures::FutureExt;
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(target_os = "android")]
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::discovery::{DiscoveredServer, DiscoveryConfig, DiscoveryService, MdnsSeed};
 use crate::session::connection::InProcessConfig;
@@ -12,7 +14,7 @@ use crate::session::connection::{
     RemoteSessionResources, ServerConfig, ServerEvent, ServerSession,
 };
 use crate::session::events::{EventProcessor, UiEvent};
-use crate::ssh::{SshClient, SshCredentials};
+use crate::ssh::{SshBootstrapResult, SshClient, SshCredentials};
 use crate::store::{AppSnapshot, AppStoreReducer, AppUpdate, ServerHealthSnapshot, ThreadSnapshot};
 use crate::transport::{RpcError, TransportError};
 use crate::types::{
@@ -22,9 +24,10 @@ use crate::types::{
 use codex_app_server_protocol as upstream;
 use codex_ipc::{
     ClientStatus, CommandExecutionApprovalDecision, ExternalResumeThreadParams,
-    FileChangeApprovalDecision, IpcClient, IpcClientConfig,
+    FileChangeApprovalDecision, IpcClient, IpcClientConfig, StreamChange,
     ThreadFollowerCommandApprovalDecisionParams, ThreadFollowerFileApprovalDecisionParams,
-    ThreadFollowerStartTurnParams, ThreadFollowerSubmitUserInputParams, TypedBroadcast,
+    ThreadFollowerStartTurnParams, ThreadFollowerSubmitUserInputParams,
+    ThreadStreamStateChangedParams, TypedBroadcast,
 };
 
 /// Top-level entry point for platform code (iOS / Android).
@@ -37,6 +40,13 @@ pub struct MobileClient {
     pub(crate) event_processor: Arc<EventProcessor>,
     pub(crate) app_store: Arc<AppStoreReducer>,
     pub(crate) discovery: RwLock<DiscoveryService>,
+    oauth_callback_tunnels: Arc<Mutex<HashMap<String, OAuthCallbackTunnel>>>,
+}
+
+#[derive(Debug, Clone)]
+struct OAuthCallbackTunnel {
+    login_id: String,
+    local_port: u16,
 }
 
 impl MobileClient {
@@ -50,6 +60,7 @@ impl MobileClient {
             event_processor,
             app_store,
             discovery: RwLock::new(DiscoveryService::new(DiscoveryConfig::default())),
+            oauth_callback_tunnels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,6 +106,37 @@ impl MobileClient {
         }
     }
 
+    async fn clear_oauth_callback_tunnel(&self, server_id: &str) {
+        let tunnel = {
+            let mut tunnels = self.oauth_callback_tunnels.lock().await;
+            tunnels.remove(server_id)
+        };
+        let session = self.sessions_read().get(server_id).cloned();
+        if let Some(tunnel) = tunnel
+            && let Some(session) = session
+            && let Some(ssh_client) = session.ssh_client()
+        {
+            ssh_client.abort_forward_port(tunnel.local_port).await;
+        }
+    }
+
+    async fn replace_oauth_callback_tunnel(
+        &self,
+        server_id: &str,
+        login_id: &str,
+        local_port: u16,
+    ) {
+        self.clear_oauth_callback_tunnel(server_id).await;
+        let mut tunnels = self.oauth_callback_tunnels.lock().await;
+        tunnels.insert(
+            server_id.to_string(),
+            OAuthCallbackTunnel {
+                login_id: login_id.to_string(),
+                local_port,
+            },
+        );
+    }
+
     fn existing_active_session(&self, server_id: &str) -> Option<Arc<ServerSession>> {
         let session = self.sessions_read().get(server_id).cloned()?;
         let health_rx = session.health();
@@ -105,6 +147,7 @@ impl MobileClient {
     }
 
     async fn replace_existing_session(&self, server_id: &str) {
+        self.clear_oauth_callback_tunnel(server_id).await;
         let existing = self.sessions_write().remove(server_id);
         if let Some(session) = existing {
             info!("MobileClient: replacing existing server session {server_id}");
@@ -174,13 +217,21 @@ impl MobileClient {
 
     pub async fn connect_remote_over_ssh(
         &self,
-        mut config: ServerConfig,
+        config: ServerConfig,
         ssh_credentials: SshCredentials,
         accept_unknown_host: bool,
         working_dir: Option<String>,
         ipc_socket_path_override: Option<String>,
     ) -> Result<String, TransportError> {
         let server_id = config.server_id.clone();
+        info!(
+            "MobileClient: connect_remote_over_ssh start server_id={} host={} ssh_port={} accept_unknown_host={} working_dir={}",
+            server_id,
+            ssh_credentials.host,
+            ssh_credentials.port,
+            accept_unknown_host,
+            working_dir.as_deref().unwrap_or("<none>")
+        );
         if self.existing_active_session(server_id.as_str()).is_some() {
             info!("MobileClient: reusing existing remote SSH server session {server_id}");
             return Ok(server_id);
@@ -195,6 +246,10 @@ impl MobileClient {
             .await
             .map_err(map_ssh_transport_error)?,
         );
+        info!(
+            "MobileClient: SSH transport established server_id={} host={} ssh_port={}",
+            config.server_id, ssh_credentials.host, ssh_credentials.port
+        );
 
         let use_ipv6 = config.host.contains(':');
         let bootstrap = match ssh_client
@@ -203,30 +258,49 @@ impl MobileClient {
         {
             Ok(result) => result,
             Err(error) => {
-                eprintln!(
-                    "[codex-mobile-client] remote ssh bootstrap failed server={} error={}",
+                warn!(
+                    "remote ssh bootstrap failed server={} error={}",
                     config.server_id, error
+                );
+                warn!(
+                    "MobileClient: remote ssh bootstrap failed server_id={} host={} error={}",
+                    config.server_id, ssh_credentials.host, error
                 );
                 ssh_client.disconnect().await;
                 return Err(map_ssh_transport_error(error));
             }
         };
+        info!(
+            "MobileClient: remote ssh bootstrap succeeded server_id={} host={} remote_port={} local_tunnel_port={} pid={:?}",
+            config.server_id,
+            ssh_credentials.host,
+            bootstrap.server_port,
+            bootstrap.tunnel_local_port,
+            bootstrap.pid
+        );
+
+        self.finish_connect_remote_over_ssh(
+            config,
+            ssh_credentials,
+            ssh_client,
+            bootstrap,
+            ipc_socket_path_override,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_connect_remote_over_ssh(
+        &self,
+        mut config: ServerConfig,
+        ssh_credentials: SshCredentials,
+        ssh_client: Arc<SshClient>,
+        bootstrap: SshBootstrapResult,
+        ipc_socket_path_override: Option<String>,
+    ) -> Result<String, TransportError> {
+        let server_id = config.server_id.clone();
 
         config.port = bootstrap.server_port;
-        #[cfg(target_os = "android")]
-        {
-            // Keep Android's app-server websocket off the SSH transport.
-            // SSH remains responsible for bootstrap, remote process cleanup,
-            // and desktop IPC attachment.
-            config.websocket_url = Some(websocket_url_for_host(
-                ssh_credentials.host.as_str(),
-                bootstrap.server_port,
-            ));
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            config.websocket_url = Some(format!("ws://127.0.0.1:{}", bootstrap.tunnel_local_port));
-        }
+        config.websocket_url = Some(format!("ws://127.0.0.1:{}", bootstrap.tunnel_local_port));
         config.is_local = false;
         config.tls = false;
 
@@ -274,9 +348,13 @@ impl MobileClient {
         {
             Ok(session) => Arc::new(session),
             Err(error) => {
-                eprintln!(
-                    "[codex-mobile-client] remote ssh session connect failed server={} error={}",
+                warn!(
+                    "remote ssh session connect failed server={} error={}",
                     server_id, error
+                );
+                warn!(
+                    "MobileClient: remote ssh session connect failed server_id={} host={} error={}",
+                    server_id, ssh_credentials.host, error
                 );
                 ssh_client.disconnect().await;
                 return Err(error);
@@ -321,7 +399,10 @@ impl MobileClient {
         if let Some(session) = session {
             // Swift/Kotlin can call this from outside any Tokio runtime.
             self.app_store.remove_server(server_id);
+            let inner = Arc::clone(&self.oauth_callback_tunnels);
+            let server_id_owned = server_id.to_string();
             Self::spawn_detached(async move {
+                inner.lock().await.remove(&server_id_owned);
                 session.disconnect().await;
             });
             info!("MobileClient: disconnected server {server_id}");
@@ -385,6 +466,57 @@ impl MobileClient {
         Ok(())
     }
 
+    pub async fn start_remote_ssh_oauth_login(&self, server_id: &str) -> Result<String, RpcError> {
+        let session = self.get_session(server_id)?;
+        if session.config().is_local {
+            return Err(RpcError::Transport(TransportError::ConnectionFailed(
+                "remote SSH OAuth is only available for remote servers".to_string(),
+            )));
+        }
+        let ssh_client = session.ssh_client().ok_or_else(|| {
+            RpcError::Transport(TransportError::ConnectionFailed(
+                "remote ChatGPT login requires an SSH-backed connection".to_string(),
+            ))
+        })?;
+
+        let params = generated::LoginAccountParams::Chatgpt;
+        let response = self
+            .generated_login_account(server_id, params.clone())
+            .await
+            .map_err(map_rpc_client_error)?;
+        self.reconcile_public_rpc("account/login/start", server_id, Some(&params), &response)
+            .await?;
+
+        let generated::LoginAccountResponse::Chatgpt { login_id, auth_url } = response else {
+            return Err(RpcError::Deserialization(
+                "expected ChatGPT login response for remote SSH OAuth".to_string(),
+            ));
+        };
+
+        let callback_port = remote_oauth_callback_port(&auth_url)?;
+        self.clear_oauth_callback_tunnel(server_id).await;
+        if let Err(error) = ssh_client
+            .ensure_forward_port_to(callback_port, "127.0.0.1", callback_port)
+            .await
+        {
+            let _ = self
+                .request_typed_for_server::<generated::CancelLoginAccountResponse>(
+                    server_id,
+                    upstream::ClientRequest::CancelLoginAccount {
+                        request_id: upstream::RequestId::Integer(crate::rpc::next_request_id()),
+                        params: upstream::CancelLoginAccountParams { login_id: login_id.clone() },
+                    },
+                )
+                .await;
+            return Err(RpcError::Transport(TransportError::ConnectionFailed(
+                format!("failed to open localhost callback tunnel on port {callback_port}: {error}"),
+            )));
+        }
+        self.replace_oauth_callback_tunnel(server_id, &login_id, callback_port)
+            .await;
+        Ok(auth_url)
+    }
+
     pub async fn external_resume_thread(
         &self,
         server_id: &str,
@@ -397,13 +529,17 @@ impl MobileClient {
                 "desktop IPC is not connected".to_string(),
             ))
         })?;
+        info!("IPC out: external_resume_thread server={} thread={}", server_id, thread_id);
         ipc_client
             .external_resume_thread(ExternalResumeThreadParams {
                 conversation_id: thread_id.to_string(),
                 host_id,
             })
             .await
-            .map_err(|error| RpcError::Deserialization(format!("IPC external resume: {error}")))?;
+            .map_err(|error| {
+                warn!("IPC out: external_resume_thread failed server={} error={}", server_id, error);
+                RpcError::Deserialization(format!("IPC external resume: {error}"))
+            })?;
         refresh_thread_snapshot_from_app_server(
             Arc::clone(&session),
             Arc::clone(&self.app_store),
@@ -427,6 +563,7 @@ impl MobileClient {
             let turn_start_params: upstream::TurnStartParams =
                 crate::rpc::convert_generated_field(params)
                     .map_err(|error| RpcError::Deserialization(error.to_string()))?;
+            info!("IPC out: start_turn server={} thread={}", server_id, thread_id);
             let ipc_result = ipc_client
                 .start_turn(ThreadFollowerStartTurnParams {
                     conversation_id: thread_id.clone(),
@@ -435,6 +572,7 @@ impl MobileClient {
                 .await;
             match ipc_result {
                 Ok(_) => {
+                    debug!("IPC out: start_turn ok server={} thread={}", server_id, thread_id);
                     refresh_thread_snapshot_from_app_server(
                         Arc::clone(&session),
                         Arc::clone(&self.app_store),
@@ -738,44 +876,52 @@ impl MobileClient {
     fn spawn_event_reader(&self, server_id: String, session: Arc<ServerSession>) {
         let mut events = session.events();
         let processor = Arc::clone(&self.event_processor);
+        let oauth_callback_tunnels = Arc::clone(&self.oauth_callback_tunnels);
+        let oauth_session = Arc::clone(&session);
         Self::spawn_detached(async move {
             loop {
                 match events.recv().await {
                     Ok(ServerEvent::Notification(notification)) => {
-                        eprintln!(
-                            "[codex-mobile-client] event reader server_id={} notification={:?}",
-                            server_id, notification
-                        );
+                        if let upstream::ServerNotification::AccountLoginCompleted(payload) =
+                            &notification
+                        {
+                            let maybe_tunnel = {
+                                let mut tunnels = oauth_callback_tunnels.lock().await;
+                                match payload.login_id.as_deref() {
+                                    Some(login_id)
+                                        if tunnels
+                                            .get(&server_id)
+                                            .map(|existing| existing.login_id.as_str())
+                                            == Some(login_id) =>
+                                    {
+                                        tunnels.remove(&server_id)
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if let Some(tunnel) = maybe_tunnel
+                                && let Some(ssh_client) = oauth_session.ssh_client()
+                            {
+                                ssh_client.abort_forward_port(tunnel.local_port).await;
+                            }
+                        }
+                        debug!("event reader server_id={} notification={:?}", server_id, notification);
                         processor.process_notification(&server_id, &notification);
                     }
                     Ok(ServerEvent::LegacyNotification { method, params }) => {
-                        eprintln!(
-                            "[codex-mobile-client] event reader server_id={} legacy_method={} params={}",
-                            server_id, method, params
-                        );
+                        debug!("event reader server_id={} legacy_method={} params={}", server_id, method, params);
                         processor.process_legacy_notification(&server_id, &method, &params);
                     }
                     Ok(ServerEvent::Request(request)) => {
-                        eprintln!(
-                            "[codex-mobile-client] event reader server_id={} request={:?}",
-                            server_id, request
-                        );
+                        debug!("event reader server_id={} request={:?}", server_id, request);
                         processor.process_server_request(&server_id, &request);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        debug!("MobileClient: event stream closed for {server_id}");
-                        eprintln!(
-                            "[codex-mobile-client] event reader closed server_id={}",
-                            server_id
-                        );
+                        info!("event stream closed for {server_id}");
                         break;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("MobileClient: lagged {skipped} events for {server_id}");
-                        eprintln!(
-                            "[codex-mobile-client] event reader lagged server_id={} skipped={}",
-                            server_id, skipped
-                        );
+                        warn!("event reader lagged server_id={} skipped={}", server_id, skipped);
                     }
                 }
             }
@@ -816,33 +962,87 @@ impl MobileClient {
         let app_store = Arc::clone(&self.app_store);
         let loop_server_id = server_id.clone();
         Self::spawn_detached(async move {
+            let mut stream_cache: HashMap<String, (u32, serde_json::Value)> = HashMap::new();
             loop {
                 match broadcasts.recv().await {
                     Ok(TypedBroadcast::ThreadStreamStateChanged(params)) => {
-                        if let Err(error) = refresh_thread_snapshot_from_app_server(
+                        let change_type = match &params.change {
+                            StreamChange::Snapshot { .. } => "snapshot",
+                            StreamChange::Patches { .. } => "patches",
+                        };
+                        debug!(
+                            "IPC in: ThreadStreamStateChanged server={} thread={} version={} change={}",
+                            loop_server_id, params.conversation_id, params.version, change_type
+                        );
+
+                        match handle_stream_state_change(
+                            &mut stream_cache,
+                            &app_store,
+                            &loop_server_id,
+                            &params,
+                        ) {
+                            Ok(()) => {}
+                            Err(StreamHandleError::VersionGap) => {
+                                debug!("IPC: version gap for thread={}, falling back to RPC", params.conversation_id);
+                                stream_cache.remove(&params.conversation_id);
+                                if let Err(e) = refresh_thread_snapshot_from_app_server(
+                                    Arc::clone(&session), Arc::clone(&app_store),
+                                    &loop_server_id, &params.conversation_id,
+                                ).await {
+                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                }
+                            }
+                            Err(StreamHandleError::NoCachedState) => {
+                                debug!("IPC: no cached state for thread={}, falling back to RPC", params.conversation_id);
+                                if let Err(e) = refresh_thread_snapshot_from_app_server(
+                                    Arc::clone(&session), Arc::clone(&app_store),
+                                    &loop_server_id, &params.conversation_id,
+                                ).await {
+                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                }
+                            }
+                            Err(StreamHandleError::DeserializeFailed(msg)) => {
+                                warn!("IPC: deserialize failed for thread={}: {}", params.conversation_id, msg);
+                                stream_cache.remove(&params.conversation_id);
+                                if let Err(e) = refresh_thread_snapshot_from_app_server(
+                                    Arc::clone(&session), Arc::clone(&app_store),
+                                    &loop_server_id, &params.conversation_id,
+                                ).await {
+                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                }
+                            }
+                            Err(StreamHandleError::PatchFailed(msg)) => {
+                                warn!("IPC: patch failed for thread={}: {}", params.conversation_id, msg);
+                                stream_cache.remove(&params.conversation_id);
+                                if let Err(e) = refresh_thread_snapshot_from_app_server(
+                                    Arc::clone(&session), Arc::clone(&app_store),
+                                    &loop_server_id, &params.conversation_id,
+                                ).await {
+                                    warn!("IPC: RPC fallback failed for thread {}: {}", params.conversation_id, e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(TypedBroadcast::ThreadArchived(ref params)) => {
+                        stream_cache.remove(&params.conversation_id);
+                        debug!("IPC in: ThreadArchived server={} thread={}", loop_server_id, params.conversation_id);
+                        if let Err(error) = refresh_thread_list_from_app_server(
                             Arc::clone(&session),
                             Arc::clone(&app_store),
                             &loop_server_id,
-                            &params.conversation_id,
                         )
                         .await
                         {
                             warn!(
-                                "MobileClient: failed to refresh IPC thread {} on {}: {}",
-                                params.conversation_id, loop_server_id, error
+                                "MobileClient: failed to refresh IPC thread list on {}: {}",
+                                loop_server_id, error
                             );
-                            let _ = refresh_thread_list_from_app_server(
-                                Arc::clone(&session),
-                                Arc::clone(&app_store),
-                                &loop_server_id,
-                            )
-                            .await;
                         }
                     }
-                    Ok(TypedBroadcast::ThreadArchived(_))
-                    | Ok(TypedBroadcast::ThreadUnarchived(_))
+                    Ok(TypedBroadcast::ThreadUnarchived(_))
                     | Ok(TypedBroadcast::ThreadQueuedFollowupsChanged(_))
                     | Ok(TypedBroadcast::QueryCacheInvalidate(_)) => {
+                        debug!("IPC in: thread list change broadcast server={}", loop_server_id);
                         if let Err(error) = refresh_thread_list_from_app_server(
                             Arc::clone(&session),
                             Arc::clone(&app_store),
@@ -857,6 +1057,7 @@ impl MobileClient {
                         }
                     }
                     Ok(TypedBroadcast::ClientStatusChanged(params)) => {
+                        debug!("IPC in: ClientStatusChanged server={} client_type={} status={:?}", loop_server_id, params.client_type, params.status);
                         if params.client_type != "mobile" {
                             match params.status {
                                 ClientStatus::Connected => {
@@ -875,11 +1076,13 @@ impl MobileClient {
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
+                        info!("IPC in: broadcast stream closed server={}", loop_server_id);
                         app_store.update_server_ipc_state(&loop_server_id, false);
                         break;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!("MobileClient: lagged {skipped} IPC events for {loop_server_id}");
+                        stream_cache.clear();
                     }
                 }
             }
@@ -1014,10 +1217,7 @@ async fn attach_ipc_client_via_ssh(
         .await
     {
         Ok(Some(socket_path)) => {
-            eprintln!(
-                "[codex-mobile-client] ssh ipc socket detected server={} path={}",
-                server_id, socket_path
-            );
+            info!("IPC socket detected server={} path={}", server_id, socket_path);
             let ipc_config = IpcClientConfig {
                 socket_path: std::path::PathBuf::from(&socket_path),
                 client_type: "mobile".to_string(),
@@ -1026,10 +1226,7 @@ async fn attach_ipc_client_via_ssh(
             match ssh_client.open_streamlocal(&socket_path).await {
                 Ok(stream) => match IpcClient::connect_with_stream(&ipc_config, stream).await {
                     Ok(client) => {
-                        eprintln!(
-                            "[codex-mobile-client] ssh ipc attached server={} path={}",
-                            server_id, socket_path
-                        );
+                        info!("IPC attached server={} path={}", server_id, socket_path);
                         Some(client)
                     }
                     Err(error) => {
@@ -1290,6 +1487,35 @@ pub fn copy_thread_runtime_fields(source: &ThreadSnapshot, target: &mut ThreadSn
     target.realtime_session_id = source.realtime_session_id.clone();
 }
 
+fn remote_oauth_callback_port(auth_url: &str) -> Result<u16, RpcError> {
+    let parsed = Url::parse(auth_url).map_err(|error| {
+        RpcError::Deserialization(format!("invalid auth URL for remote OAuth: {error}"))
+    })?;
+    let redirect_uri = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| {
+            RpcError::Deserialization(
+                "missing redirect_uri in remote OAuth auth URL".to_string(),
+            )
+        })?;
+    let redirect = Url::parse(&redirect_uri).map_err(|error| {
+        RpcError::Deserialization(format!("invalid redirect_uri in remote OAuth auth URL: {error}"))
+    })?;
+    let host = redirect.host_str().unwrap_or_default();
+    if host != "localhost" && host != "127.0.0.1" {
+        return Err(RpcError::Deserialization(format!(
+            "unsupported remote OAuth callback host: {host}"
+        )));
+    }
+    redirect.port_or_known_default().ok_or_else(|| {
+        RpcError::Deserialization(
+            "missing callback port in remote OAuth redirect_uri".to_string(),
+        )
+    })
+}
+
 fn ensure_thread_is_editable(snapshot: &ThreadSnapshot) -> Result<(), RpcError> {
     if snapshot.items.is_empty() {
         return Err(RpcError::Deserialization(
@@ -1455,12 +1681,98 @@ fn thread_snapshot_from_upstream_thread(
     snapshot
 }
 
+fn thread_snapshot_from_conversation_json(
+    server_id: &str,
+    conversation_state: &serde_json::Value,
+) -> Result<ThreadSnapshot, String> {
+    let thread: upstream::Thread = serde_json::from_value(conversation_state.clone())
+        .map_err(|e| format!("deserialize conversation_state: {e}"))?;
+    Ok(thread_snapshot_from_upstream_thread(server_id, thread))
+}
+
+// -- IPC stream state change handler --
+
+enum StreamHandleError {
+    VersionGap,
+    NoCachedState,
+    DeserializeFailed(String),
+    PatchFailed(String),
+}
+
+fn handle_stream_state_change(
+    cache: &mut HashMap<String, (u32, serde_json::Value)>,
+    app_store: &AppStoreReducer,
+    server_id: &str,
+    params: &ThreadStreamStateChangedParams,
+) -> Result<(), StreamHandleError> {
+    match &params.change {
+        StreamChange::Snapshot { conversation_state } => {
+            let mut snapshot =
+                thread_snapshot_from_conversation_json(server_id, conversation_state)
+                    .map_err(|e| {
+                        let preview: String = conversation_state
+                            .to_string()
+                            .chars()
+                            .take(500)
+                            .collect();
+                        StreamHandleError::DeserializeFailed(format!(
+                            "{e}; json preview: {preview}"
+                        ))
+                    })?;
+
+            let key = ThreadKey {
+                server_id: server_id.to_string(),
+                thread_id: params.conversation_id.clone(),
+            };
+            if let Some(existing) = app_store.snapshot().threads.get(&key) {
+                copy_thread_runtime_fields(existing, &mut snapshot);
+            }
+
+            app_store.upsert_thread_snapshot(snapshot);
+            cache.insert(
+                params.conversation_id.clone(),
+                (params.version, conversation_state.clone()),
+            );
+            Ok(())
+        }
+        StreamChange::Patches { patches } => {
+            let (cached_version, cached_json) = cache
+                .get_mut(&params.conversation_id)
+                .ok_or(StreamHandleError::NoCachedState)?;
+
+            if params.version != *cached_version + 1 {
+                return Err(StreamHandleError::VersionGap);
+            }
+
+            crate::immer_patch::apply_patches(cached_json, patches)
+                .map_err(|e| StreamHandleError::PatchFailed(e.to_string()))?;
+
+            let mut snapshot =
+                thread_snapshot_from_conversation_json(server_id, cached_json)
+                    .map_err(StreamHandleError::DeserializeFailed)?;
+
+            let key = ThreadKey {
+                server_id: server_id.to_string(),
+                thread_id: params.conversation_id.clone(),
+            };
+            if let Some(existing) = app_store.snapshot().threads.get(&key) {
+                copy_thread_runtime_fields(existing, &mut snapshot);
+            }
+
+            app_store.upsert_thread_snapshot(snapshot);
+            *cached_version = params.version;
+            Ok(())
+        }
+    }
+}
+
 async fn send_ipc_approval_response(
     ipc_client: &IpcClient,
     approval: &PendingApproval,
     thread_id: &str,
     decision: ApprovalDecisionValue,
 ) -> Result<bool, RpcError> {
+    tracing::info!("IPC out: approval_response thread={} request_id={} kind={:?} decision={:?}", thread_id, approval.id, approval.kind, decision);
     match approval.kind {
         crate::types::ApprovalKind::Command => {
             ipc_client
@@ -1533,6 +1845,7 @@ async fn send_ipc_user_input_response(
     let response = serde_json::from_value(response_json).map_err(|error| {
         RpcError::Deserialization(format!("deserialize IPC user input response: {error}"))
     })?;
+    tracing::info!("IPC out: submit_user_input thread={} request_id={}", thread_id, request_id);
     ipc_client
         .submit_user_input(ThreadFollowerSubmitUserInputParams {
             conversation_id: thread_id.to_string(),
@@ -1694,5 +2007,11 @@ mod mobile_client_tests {
             Some(20_000)
         );
         assert_eq!(target.realtime_session_id.as_deref(), Some("rt-1"));
+    }
+
+    #[test]
+    fn remote_oauth_callback_port_reads_localhost_redirect() {
+        let auth_url = "https://auth.openai.com/oauth/authorize?response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=abc";
+        assert_eq!(remote_oauth_callback_port(auth_url).unwrap(), 1455);
     }
 }

@@ -24,7 +24,7 @@ android {
         applicationId = "com.sigkitten.litter.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
+        versionCode = 7
         versionName = "0.1.0"
         buildConfigField("boolean", "ENABLE_ON_DEVICE_BRIDGE", "true")
         buildConfigField("String", "RUNTIME_STARTUP_MODE", "\"hybrid\"")
@@ -54,6 +54,9 @@ android {
             )
             if (hasUploadSigning) {
                 signingConfig = signingConfigs.getByName("upload")
+            }
+            ndk {
+                debugSymbolLevel = "NONE"
             }
         }
     }
@@ -85,12 +88,18 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    bundle {
+        storeArchive {
+            enable = false
+        }
+    }
 }
 
 play {
     defaultToAppBundles.set(true)
     track.set(projectPropOrEnv("LITTER_PLAY_TRACK") ?: "internal")
-    releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.DRAFT)
+    releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.COMPLETED)
     val serviceAccountPath = projectPropOrEnv("LITTER_PLAY_SERVICE_ACCOUNT_JSON")
     if (!serviceAccountPath.isNullOrBlank()) {
         serviceAccountCredentials.set(file(serviceAccountPath))
@@ -102,6 +111,7 @@ dependencies {
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.browser:browser:1.8.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.00"))
     implementation("androidx.activity:activity-compose:1.9.2")
@@ -123,6 +133,11 @@ dependencies {
     // See: core/bridge/.../RustSshBridge.kt and state/SshSessionManager.kt
     implementation("com.github.mwiede:jsch:0.2.22")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("com.android.billingclient:billing-ktx:7.0.0")
+
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-ui:1.4.1")
+    implementation("androidx.media3:media3-transformer:1.4.1")
 
     implementation(platform("com.google.firebase:firebase-bom:33.0.0"))
     implementation("com.google.firebase:firebase-messaging")

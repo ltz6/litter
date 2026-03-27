@@ -11,6 +11,7 @@ mod logs;
 mod parser;
 #[path = "rpc.generated.rs"]
 mod rpc;
+mod rpc_ext;
 pub(crate) mod shared;
 mod ssh;
 

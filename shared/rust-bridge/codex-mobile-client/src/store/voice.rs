@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn final_message_reuses_pending_transcript_row() {
+    fn final_message_prefers_upstream_item_id_when_available() {
         let state = VoiceRealtimeState::default();
         let key = ThreadKey {
             server_id: "local".into(),
@@ -440,13 +440,14 @@ mod tests {
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final message update");
         };
-        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(first.item_id, "voice-assistant-0");
+        assert_eq!(second.item_id, "item_123");
         assert_eq!(second.text, "Tool result");
         assert!(second.is_final);
     }
 
     #[test]
-    fn final_user_message_accepts_input_text_content() {
+    fn final_user_message_accepts_input_text_content_with_upstream_id() {
         let state = VoiceRealtimeState::default();
         let key = ThreadKey {
             server_id: "local".into(),
@@ -473,14 +474,15 @@ mod tests {
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final user message update");
         };
-        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(first.item_id, "voice-user-0");
+        assert_eq!(second.item_id, "item_user_123");
         assert_eq!(second.speaker, crate::uniffi_shared::AppVoiceSpeaker::User);
         assert_eq!(second.text, "Hello there");
         assert!(second.is_final);
     }
 
     #[test]
-    fn final_assistant_message_accepts_output_text_content() {
+    fn final_assistant_message_accepts_output_text_content_with_upstream_id() {
         let state = VoiceRealtimeState::default();
         let key = ThreadKey {
             server_id: "local".into(),
@@ -507,7 +509,8 @@ mod tests {
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final assistant message update");
         };
-        assert_eq!(first.item_id, second.item_id);
+        assert_eq!(first.item_id, "voice-assistant-0");
+        assert_eq!(second.item_id, "item_assistant_123");
         assert_eq!(
             second.speaker,
             crate::uniffi_shared::AppVoiceSpeaker::Assistant

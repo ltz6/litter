@@ -43,6 +43,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.litter.android.ui.LitterTheme
+import com.litter.android.ui.VideoWallpaperPlayer
 import com.litter.android.ui.WallpaperConfig
 import com.litter.android.ui.WallpaperManager
 import com.litter.android.ui.WallpaperScope
@@ -52,18 +53,22 @@ import uniffi.codex_mobile_client.ThreadKey
 
 @Composable
 fun WallpaperAdjustScreen(
-    threadKey: ThreadKey,
+    threadKey: ThreadKey? = null,
+    serverId: String? = null,
     onBack: () -> Unit,
     onApplied: () -> Unit,
 ) {
-    val currentConfig = WallpaperManager.resolvedConfig(threadKey)
+    val isServerOnly = threadKey == null
+    val resolvedServerId = threadKey?.serverId ?: serverId
+    val currentConfig = if (threadKey != null) WallpaperManager.resolvedConfig(threadKey)
+        else resolvedServerId?.let { WallpaperManager.resolvedConfigForServer(it) }
     var blur by remember { mutableFloatStateOf(currentConfig?.blur ?: 0f) }
     var brightness by remember { mutableFloatStateOf(currentConfig?.brightness ?: 1f) }
     var motionEnabled by remember { mutableStateOf(currentConfig?.motionEnabled ?: false) }
     val isBlurred = blur > 0.01f
 
     val previewBitmap = remember(currentConfig) {
-        currentConfig?.let { WallpaperManager.resolvedBitmapForConfig(it, threadKey) }
+        currentConfig?.let { WallpaperManager.resolvedBitmapForConfig(it, threadKey = threadKey, serverId = resolvedServerId) }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(LitterTheme.background)) {
@@ -71,14 +76,27 @@ fun WallpaperAdjustScreen(
         val blurRadius = (blur * 25f).dp
         val brightnessAlpha = brightness.coerceIn(0f, 1f)
 
-        if (previewBitmap != null) {
+        val isVideoType = currentConfig?.type == WallpaperType.CUSTOM_VIDEO || currentConfig?.type == WallpaperType.VIDEO_URL
+        if (isVideoType) {
+            val videoPath = if (threadKey != null) WallpaperManager.videoFilePath(threadKey)
+                else resolvedServerId?.let { WallpaperManager.videoFilePathForServer(it) }
+            if (videoPath != null) {
+                VideoWallpaperPlayer(
+                    filePath = videoPath,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blur(blurRadius)
+                        .graphicsLayer { alpha = brightnessAlpha },
+                )
+            }
+        } else if (previewBitmap != null) {
             Image(
                 bitmap = previewBitmap.asImageBitmap(),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .fillMaxSize()
-                    .then(if (blurRadius > 0.dp) Modifier.blur(blurRadius) else Modifier)
+                    .blur(blurRadius)
                     .graphicsLayer { alpha = brightnessAlpha },
             )
         } else if (currentConfig?.type == WallpaperType.SOLID_COLOR) {
@@ -197,46 +215,54 @@ fun WallpaperAdjustScreen(
             Spacer(Modifier.height(16.dp))
 
             // Apply buttons
-            Button(
-                onClick = {
-                    val config = currentConfig?.copy(
-                        blur = blur,
-                        brightness = brightness,
-                        motionEnabled = motionEnabled,
-                    ) ?: return@Button
-                    WallpaperManager.setWallpaper(config, WallpaperScope.Thread(threadKey))
-                    onApplied()
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = LitterTheme.accent,
-                    contentColor = LitterTheme.onAccentStrong,
-                ),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Apply for This Thread", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            if (!isServerOnly) {
+                Button(
+                    onClick = {
+                        val config = currentConfig?.copy(
+                            blur = blur,
+                            brightness = brightness,
+                            motionEnabled = motionEnabled,
+                        ) ?: return@Button
+                        WallpaperManager.setWallpaper(config, WallpaperScope.Thread(threadKey!!))
+                        onApplied()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = LitterTheme.accent,
+                        contentColor = LitterTheme.onAccentStrong,
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Apply for This Thread", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                }
+
+                Spacer(Modifier.height(8.dp))
             }
 
-            Spacer(Modifier.height(8.dp))
-
-            Button(
-                onClick = {
-                    val config = currentConfig?.copy(
-                        blur = blur,
-                        brightness = brightness,
-                        motionEnabled = motionEnabled,
-                    ) ?: return@Button
-                    WallpaperManager.setWallpaper(config, WallpaperScope.Server(threadKey.serverId))
-                    onApplied()
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = LitterTheme.surface,
-                    contentColor = LitterTheme.textPrimary,
-                ),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Apply for This Server", fontSize = 13.sp)
+            if (resolvedServerId != null) {
+                Button(
+                    onClick = {
+                        val config = currentConfig?.copy(
+                            blur = blur,
+                            brightness = brightness,
+                            motionEnabled = motionEnabled,
+                        ) ?: return@Button
+                        WallpaperManager.setWallpaper(config, WallpaperScope.Server(resolvedServerId))
+                        onApplied()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isServerOnly) LitterTheme.accent else LitterTheme.surface,
+                        contentColor = if (isServerOnly) LitterTheme.onAccentStrong else LitterTheme.textPrimary,
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "Apply for This Server",
+                        fontSize = 13.sp,
+                        fontWeight = if (isServerOnly) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                }
             }
         }
     }

@@ -249,33 +249,21 @@ impl EventProcessor {
                 });
             }
             ServerNotification::TurnStarted(n) => {
-                eprintln!(
-                    "[codex-mobile-client] process_notification TurnStarted server_id={} thread_id={} turn_id={}",
-                    server_id, n.thread_id, n.turn.id
-                );
-                let key = Self::make_key(server_id, &n.thread_id);
+let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnStarted {
                     key,
                     turn_id: n.turn.id.clone(),
                 });
             }
             ServerNotification::TurnCompleted(n) => {
-                eprintln!(
-                    "[codex-mobile-client] process_notification TurnCompleted server_id={} thread_id={} turn_id={}",
-                    server_id, n.thread_id, n.turn.id
-                );
-                let key = Self::make_key(server_id, &n.thread_id);
+let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnCompleted {
                     key,
                     turn_id: n.turn.id.clone(),
                 });
             }
             ServerNotification::TurnDiffUpdated(n) => {
-                eprintln!(
-                    "[codex-mobile-client] process_notification TurnDiffUpdated server_id={} thread_id={} turn_id={}",
-                    server_id, n.thread_id, n.turn_id
-                );
-                let key = Self::make_key(server_id, &n.thread_id);
+let key = Self::make_key(server_id, &n.thread_id);
                 self.emit(UiEvent::TurnDiffUpdated {
                     key,
                     notification: n.clone(),
@@ -378,11 +366,7 @@ impl EventProcessor {
             // ── Realtime / voice ────────────────────────────────────
             ServerNotification::ThreadRealtimeStarted(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-                eprintln!(
-                    "[codex-mobile-client] ThreadRealtimeStarted server_id={} thread_id={} session_id={:?}",
-                    server_id, n.thread_id, n.session_id
-                );
-                self.emit(UiEvent::RealtimeStarted {
+self.emit(UiEvent::RealtimeStarted {
                     key,
                     notification: n.clone(),
                 });
@@ -416,22 +400,14 @@ impl EventProcessor {
             }
             ServerNotification::ThreadRealtimeError(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-                eprintln!(
-                    "[codex-mobile-client] ThreadRealtimeError server_id={} thread_id={} message={}",
-                    server_id, n.thread_id, n.message
-                );
-                self.emit(UiEvent::RealtimeError {
+self.emit(UiEvent::RealtimeError {
                     key,
                     notification: n.clone(),
                 });
             }
             ServerNotification::ThreadRealtimeClosed(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
-                eprintln!(
-                    "[codex-mobile-client] ThreadRealtimeClosed server_id={} thread_id={} reason={:?}",
-                    server_id, n.thread_id, n.reason
-                );
-                self.emit(UiEvent::RealtimeClosed {
+self.emit(UiEvent::RealtimeClosed {
                     key,
                     notification: n.clone(),
                 });
@@ -779,7 +755,7 @@ mod tests {
                 updated_at: 2,
                 status: proto::ThreadStatus::Idle,
                 path: None,
-                cwd: codex_protocol::config_types::AbsolutePath(std::path::PathBuf::from("/tmp")),
+                cwd: std::path::PathBuf::from("/tmp"),
                 cli_version: "1.0.0".to_string(),
                 source: proto::SessionSource::Cli,
                 agent_nickname: Some("builder".to_string()),
@@ -809,14 +785,14 @@ mod tests {
         let notification =
             ServerNotification::ThreadStatusChanged(proto::ThreadStatusChangedNotification {
                 thread_id: "thr_1".to_string(),
-                status: proto::ThreadStatus::Active,
+                status: proto::ThreadStatus::Active { active_flags: vec![] },
             });
         let evt = process_and_recv("srv1", &notification).expect("should emit UiEvent");
         match evt {
             UiEvent::ThreadStatusChanged { key, notification } => {
                 assert_eq!(key.thread_id, "thr_1");
                 assert_eq!(notification.thread_id, "thr_1");
-                assert_eq!(notification.status, proto::ThreadStatus::Active);
+                assert_eq!(notification.status, proto::ThreadStatus::Active { active_flags: vec![] });
             }
             other => panic!("expected ThreadStatusChanged, got {other:?}"),
         }
@@ -1323,9 +1299,7 @@ mod tests {
                     updated_at: 1,
                     status: proto::ThreadStatus::Idle,
                     path: None,
-                    cwd: codex_protocol::config_types::AbsolutePath(std::path::PathBuf::from(
-                        "/tmp",
-                    )),
+                    cwd: std::path::PathBuf::from("/tmp"),
                     cli_version: "1.0.0".to_string(),
                     source: proto::SessionSource::Cli,
                     agent_nickname: None,
@@ -1517,12 +1491,12 @@ mod tests {
                     id: "q1".to_string(),
                     header: "Mode".to_string(),
                     question: "Pick one".to_string(),
-                    is_other_allowed: false,
+                    is_other: false,
                     is_secret: false,
-                    options: vec![proto::ToolRequestUserInputOption {
+                    options: Some(vec![proto::ToolRequestUserInputOption {
                         label: "Yes".to_string(),
-                        description: Some("Allow it".to_string()),
-                    }],
+                        description: "Allow it".to_string(),
+                    }]),
                 }],
             },
         };
@@ -1551,9 +1525,8 @@ mod tests {
             params: proto::DynamicToolCallParams {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
-                item_id: "item_1".to_string(),
                 call_id: "call_1".to_string(),
-                tool_name: "show_widget".to_string(),
+                tool: "show_widget".to_string(),
                 arguments: json!({"title": "Hello"}),
             },
         };
@@ -1568,7 +1541,7 @@ mod tests {
                 let payload: serde_json::Value =
                     serde_json::from_str(&params_json).expect("decode raw request payload");
                 assert_eq!(payload["requestId"], json!("14"));
-                assert_eq!(payload["params"]["toolName"], json!("show_widget"));
+                assert_eq!(payload["params"]["tool"], json!("show_widget"));
             }
             other => panic!("expected RawNotification, got {other:?}"),
         }

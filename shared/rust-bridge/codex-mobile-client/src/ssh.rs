@@ -3,11 +3,13 @@
 //! Pure Rust SSH2 client (via `russh`) that replaces platform-specific
 //! SSH libraries (Citadel on iOS, JSch on Android).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use russh::ChannelMsg;
 use russh::ChannelStream;
 use russh::client::{self, Handle, Msg};
@@ -19,16 +21,19 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tracing::{debug, error, info, warn};
 
+use base64::Engine;
 use crate::logging::{LogLevelName, log_rust};
 
+fn append_bridge_log(level: LogLevelName, line: &str) {
+    log_rust(level, "ssh", "bridge", line.to_string(), None);
+}
+
 fn append_android_debug_log(line: &str) {
-    log_rust(
-        LogLevelName::Debug,
-        "ssh",
-        "bridge",
-        line.to_string(),
-        None,
-    );
+    append_bridge_log(LogLevelName::Debug, line);
+}
+
+fn append_bridge_info_log(line: &str) {
+    append_bridge_log(LogLevelName::Info, line);
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +66,37 @@ pub struct SshBootstrapResult {
     pub tunnel_local_port: u16,
     pub server_version: Option<String>,
     pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCodexRelease {
+    pub tag_name: String,
+    pub asset_name: String,
+    pub binary_name: String,
+    pub download_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemotePlatform {
+    MacosArm64,
+    MacosX64,
+    LinuxArm64,
+    LinuxX64,
+    WindowsX64,
+    WindowsArm64,
+}
+
+/// The remote host's shell type, detected after SSH connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteShell {
+    Posix,
+    PowerShell,
+}
+
+impl RemotePlatform {
+    pub(crate) fn is_windows(self) -> bool {
+        matches!(self, Self::WindowsX64 | Self::WindowsArm64)
+    }
 }
 
 /// Outcome of running a remote command.
@@ -131,7 +167,13 @@ pub struct SshClient {
     /// background tasks can open channels.
     handle: Arc<Mutex<Handle<ClientHandler>>>,
     /// Tracks forwarding background tasks so we can abort on disconnect.
-    forward_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    forward_tasks: Mutex<HashMap<u16, ForwardTask>>,
+}
+
+struct ForwardTask {
+    remote_host: String,
+    remote_port: u16,
+    task: tokio::task::JoinHandle<()>,
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -152,6 +194,10 @@ impl SshClient {
         credentials: SshCredentials,
         host_key_callback: Box<dyn Fn(&str) -> BoxFuture<'static, bool> + Send + Sync>,
     ) -> Result<Self, SshError> {
+        let auth_kind = match &credentials.auth {
+            SshAuth::Password(_) => "password",
+            SshAuth::PrivateKey { .. } => "key",
+        };
         let rejected_fp = Arc::new(Mutex::new(None));
 
         let handler = ClientHandler {
@@ -167,17 +213,44 @@ impl SshClient {
         };
 
         let addr = format!("{}:{}", normalize_host(&credentials.host), credentials.port);
+        info!(
+            "SSH connect start addr={} username={} auth={}",
+            addr, credentials.username, auth_kind
+        );
+        append_bridge_info_log(&format!(
+            "ssh_connect_start addr={} username={} auth={}",
+            addr, credentials.username, auth_kind
+        ));
 
-        let mut handle = tokio::time::timeout(
+        let connect_result = tokio::time::timeout(
             CONNECT_TIMEOUT,
             client::connect(Arc::new(config), &*addr, handler),
         )
-        .await
-        .map_err(|_| SshError::Timeout)?
-        .map_err(|e| SshError::ConnectionFailed(format!("{e}")))?;
+        .await;
+        let mut handle = match connect_result {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => {
+                error!("SSH connect failed addr={} error={:?}", addr, error);
+                append_bridge_info_log(&format!(
+                    "ssh_connect_failed addr={} error_display={} error_debug={:?}",
+                    addr, error, error
+                ));
+                return Err(SshError::ConnectionFailed(format!("{error}")));
+            }
+            Err(_) => {
+                warn!("SSH connect timed out addr={}", addr);
+                append_bridge_info_log(&format!("ssh_connect_timeout addr={}", addr));
+                return Err(SshError::Timeout);
+            }
+        };
 
         // If the handler rejected the key, surface a specific error.
         if let Some(fp) = rejected_fp.lock().await.take() {
+            warn!("SSH host key rejected addr={} fingerprint={}", addr, fp);
+            append_bridge_info_log(&format!(
+                "ssh_host_key_rejected addr={} fingerprint={}",
+                addr, fp
+            ));
             return Err(SshError::HostKeyVerification { fingerprint: fp });
         }
 
@@ -186,7 +259,14 @@ impl SshClient {
             SshAuth::Password(pw) => handle
                 .authenticate_password(&credentials.username, pw)
                 .await
-                .map_err(|e| SshError::AuthFailed(format!("{e}")))?,
+                .map_err(|e| {
+                    warn!("SSH password auth failed addr={} error={:?}", addr, e);
+                    append_bridge_info_log(&format!(
+                        "ssh_auth_failed addr={} method=password error_display={} error_debug={:?}",
+                        addr, e, e
+                    ));
+                    SshError::AuthFailed(format!("{e}"))
+                })?,
             SshAuth::PrivateKey {
                 key_pem,
                 passphrase,
@@ -196,19 +276,35 @@ impl SshClient {
                 handle
                     .authenticate_publickey(&credentials.username, Arc::new(key))
                     .await
-                    .map_err(|e| SshError::AuthFailed(format!("{e}")))?
+                    .map_err(|e| {
+                        warn!("SSH key auth failed addr={} error={:?}", addr, e);
+                        append_bridge_info_log(&format!(
+                            "ssh_auth_failed addr={} method=key error_display={} error_debug={:?}",
+                            addr, e, e
+                        ));
+                        SshError::AuthFailed(format!("{e}"))
+                    })?
             }
         };
 
         if !auth_ok {
+            warn!("SSH auth rejected by server addr={} username={}", addr, credentials.username);
+            append_bridge_info_log(&format!(
+                "ssh_auth_rejected addr={} username={}",
+                addr, credentials.username
+            ));
             return Err(SshError::AuthFailed("server rejected credentials".into()));
         }
 
         info!("SSH connected and authenticated to {addr}");
+        append_bridge_info_log(&format!(
+            "ssh_connect_success addr={} username={}",
+            addr, credentials.username
+        ));
 
         Ok(Self {
             handle: Arc::new(Mutex::new(handle)),
-            forward_tasks: Mutex::new(Vec::new()),
+            forward_tasks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -354,8 +450,46 @@ impl SshClient {
         let (actual_port, task) = self
             .spawn_forward_port(local_port, remote_host, remote_port)
             .await?;
-        self.forward_tasks.lock().await.push(task);
+        self.forward_tasks.lock().await.insert(
+            actual_port,
+            ForwardTask {
+                remote_host: remote_host.to_string(),
+                remote_port,
+                task,
+            },
+        );
         Ok(actual_port)
+    }
+
+    pub async fn ensure_forward_port_to(
+        &self,
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Result<u16, SshError> {
+        {
+            let tasks = self.forward_tasks.lock().await;
+            if let Some(existing) = tasks.get(&local_port) {
+                if existing.remote_host == remote_host && existing.remote_port == remote_port {
+                    return Ok(local_port);
+                }
+                return Err(SshError::PortForwardFailed(format!(
+                    "port {local_port} already forwarded to {}:{}",
+                    existing.remote_host, existing.remote_port
+                )));
+            }
+        }
+        self.forward_port_to(local_port, remote_host, remote_port).await
+    }
+
+    pub async fn abort_forward_port(&self, local_port: u16) -> bool {
+        let mut tasks = self.forward_tasks.lock().await;
+        if let Some(existing) = tasks.remove(&local_port) {
+            existing.task.abort();
+            true
+        } else {
+            false
+        }
     }
 
     async fn spawn_forward_port(
@@ -512,72 +646,171 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
     // --------------------------------------------------------------------
 
     /// Bootstrap a remote Codex server and set up a local tunnel.
-    ///
-    /// 1. Locate the `codex` binary on the remote host.
-    /// 2. Start a server on a free port.
-    /// 3. Wait for it to begin listening.
-    /// 4. Set up local port forwarding.
-    /// 5. Return the [`SshBootstrapResult`].
     pub async fn bootstrap_codex_server(
         &self,
         working_dir: Option<&str>,
         prefer_ipv6: bool,
     ) -> Result<SshBootstrapResult, SshError> {
+        append_bridge_info_log(&format!(
+            "ssh_bootstrap_start prefer_ipv6={} working_dir={}",
+            prefer_ipv6,
+            working_dir.unwrap_or("<none>")
+        ));
         // --- 1. Locate codex binary -------------------------------------
         let codex_binary = self.resolve_codex_binary().await?;
         info!("remote codex binary: {}", codex_binary.path());
+        append_bridge_info_log(&format!(
+            "ssh_bootstrap_binary path={}",
+            codex_binary.path()
+        ));
+        self.bootstrap_codex_server_with_binary(&codex_binary, working_dir, prefer_ipv6)
+            .await
+    }
+
+    pub(crate) async fn bootstrap_codex_server_with_binary(
+        &self,
+        codex_binary: &RemoteCodexBinary,
+        working_dir: Option<&str>,
+        prefer_ipv6: bool,
+    ) -> Result<SshBootstrapResult, SshError> {
+        let shell = self.detect_remote_shell().await;
+        self.bootstrap_codex_server_with_binary_and_shell(
+            codex_binary, working_dir, prefer_ipv6, shell,
+        )
+        .await
+    }
+
+    pub(crate) async fn bootstrap_codex_server_with_binary_and_shell(
+        &self,
+        codex_binary: &RemoteCodexBinary,
+        working_dir: Option<&str>,
+        prefer_ipv6: bool,
+        shell: RemoteShell,
+    ) -> Result<SshBootstrapResult, SshError> {
 
         // --- 2. Try candidate ports until one works ---------------------
-        let cd_prefix = match working_dir {
-            Some(dir) => format!("cd {} && ", shell_quote(dir)),
-            None => String::new(),
+        let cd_prefix = match (shell, working_dir) {
+            (RemoteShell::Posix, Some(dir)) => format!("cd {} && ", shell_quote(dir)),
+            (RemoteShell::PowerShell, Some(dir)) => format!("Set-Location {}; ", ps_quote(dir)),
+            _ => String::new(),
         };
+
+        let remote_loopback = if prefer_ipv6 { "::1" } else { "127.0.0.1" };
 
         for offset in 0..PORT_CANDIDATES {
             let port = DEFAULT_REMOTE_PORT + offset;
+            append_bridge_info_log(&format!(
+                "ssh_bootstrap_candidate port={} attempt={}",
+                port,
+                offset + 1
+            ));
 
-            // Do not blindly reuse an already-listening port here. During SSH
-            // bootstrap we have no proof that the listener is actually a healthy
-            // Codex app-server, and reusing an unrelated or stale process can
-            // produce a tunnel that accepts TCP but immediately resets the
-            // WebSocket handshake. Skip occupied ports and launch a fresh
-            // server on the next free candidate instead.
-            if self.is_port_listening(port).await {
-                info!("port {port} already listening, skipping occupied candidate");
-                continue;
+            if self.is_port_listening_shell(port, shell).await {
+                info!("port {port} already listening, probing existing candidate");
+                append_bridge_info_log(&format!(
+                    "ssh_bootstrap_reuse_probe_start port={}",
+                    port
+                ));
+
+                let (probe_port, probe_task) =
+                    self.spawn_forward_port(0, remote_loopback, port).await?;
+                let null_path = match shell {
+                    RemoteShell::Posix => "/dev/null",
+                    RemoteShell::PowerShell => "NUL",
+                };
+                let websocket_ready = self
+                    .wait_for_forwarded_websocket_ready(probe_port, None, null_path)
+                    .await;
+                probe_task.abort();
+
+                match websocket_ready {
+                    Ok(()) => {
+                        let local_port = self.forward_port_to(0, remote_loopback, port).await?;
+                        let version = self.read_server_version_shell(codex_binary.path(), shell).await;
+                        append_bridge_info_log(&format!(
+                            "ssh_bootstrap_reuse_success port={} local_port={} version={}",
+                            port,
+                            local_port,
+                            version.clone().unwrap_or_else(|| "<unknown>".to_string())
+                        ));
+                        return Ok(SshBootstrapResult {
+                            server_port: port,
+                            tunnel_local_port: local_port,
+                            server_version: version,
+                            pid: None,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            "occupied port {port} did not respond like a healthy app-server: {error}"
+                        );
+                        append_bridge_info_log(&format!(
+                            "ssh_bootstrap_reuse_probe_failed port={} error={}",
+                            port, error
+                        ));
+                        continue;
+                    }
+                }
             }
 
             let listen_addr = if prefer_ipv6 {
-                format!("[::]:{port}")
+                format!("[::1]:{port}")
             } else {
-                format!("0.0.0.0:{port}")
+                format!("127.0.0.1:{port}")
             };
-            let log_path = format!("/tmp/codex-mobile-server-{port}.log");
+            let log_path = match shell {
+                RemoteShell::Posix => format!("/tmp/codex-mobile-server-{port}.log"),
+                // Resolved at command time via Join-Path, not in a quoted string.
+                RemoteShell::PowerShell => {
+                    format!("(Join-Path $env:TEMP 'codex-mobile-server-{port}.log')")
+                }
+            };
 
-            let launch_cmd = format!(
-                "{profile_init} {cd_prefix}nohup {launch} \
-                 </dev/null >{log} 2>&1 & echo $!",
-                profile_init = PROFILE_INIT,
-                cd_prefix = cd_prefix,
-                launch = server_launch_command(&codex_binary, &format!("ws://{listen_addr}")),
-                log = shell_quote(&log_path),
-            );
+            let launch_cmd = match shell {
+                RemoteShell::Posix => format!(
+                    "{profile_init} {cd_prefix}nohup {launch} \
+                     </dev/null >{log} 2>&1 & echo $!",
+                    profile_init = PROFILE_INIT,
+                    cd_prefix = cd_prefix,
+                    launch = server_launch_command(&codex_binary, &format!("ws://{listen_addr}"), shell),
+                    log = shell_quote(&log_path),
+                ),
+                RemoteShell::PowerShell => {
+                    let log_err = format!("(Join-Path $env:TEMP 'codex-mobile-server-{port}-err.log')");
+                    format!(
+                        r#"{cd_prefix}$logFile = {log}; $errFile = {log_err}; $proc = Start-Process -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errFile -FilePath {bin} -ArgumentList {args}; Write-Host $proc.Id"#,
+                        cd_prefix = cd_prefix,
+                        log = log_path,
+                        log_err = log_err,
+                        bin = ps_quote(codex_binary.path()),
+                        args = ps_quote(&format!("app-server --listen ws://{listen_addr}")),
+                    )
+                }
 
-            let launch_result = self.exec(&launch_cmd).await?;
+            };
+
+            let launch_result = self.exec_shell(&launch_cmd, shell).await?;
             let pid: Option<u32> = launch_result.stdout.trim().parse().ok();
+            append_bridge_info_log(&format!(
+                "ssh_bootstrap_launch_result port={} pid={:?} stdout={} stderr={}",
+                port,
+                pid,
+                launch_result.stdout.trim(),
+                launch_result.stderr.trim()
+            ));
 
             // --- 3. Wait for the server to start listening ---------------
             let mut started = false;
             for _attempt in 0..60 {
-                if self.is_port_listening(port).await {
+                if self.is_port_listening_shell(port, shell).await {
                     started = true;
                     break;
                 }
 
                 // If the process died, check logs for "address already in use".
                 if let Some(p) = pid {
-                    if !self.is_process_alive(p).await {
-                        let tail = self.fetch_log_tail(&log_path).await;
+                    if !self.is_process_alive_shell(p, shell).await {
+                        let tail = self.fetch_log_tail_shell(&log_path, shell).await;
                         if tail.to_ascii_lowercase().contains("address already in use") {
                             break; // try next port
                         }
@@ -596,7 +829,7 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             }
 
             if !started {
-                let tail = self.fetch_log_tail(&log_path).await;
+                let tail = self.fetch_log_tail_shell(&log_path, shell).await;
                 if tail.to_ascii_lowercase().contains("address already in use") {
                     continue; // try next port
                 }
@@ -614,7 +847,6 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             }
 
             // --- 4. Prove the websocket endpoint is actually ready -------
-            let remote_loopback = if prefer_ipv6 { "::1" } else { "127.0.0.1" };
             let (probe_port, probe_task) =
                 self.spawn_forward_port(0, remote_loopback, port).await?;
             let websocket_ready = self
@@ -624,8 +856,16 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
 
             if let Err(error) = websocket_ready {
                 warn!("remote websocket readiness probe failed on port {port}: {error}");
+                append_bridge_info_log(&format!(
+                    "ssh_bootstrap_probe_failed port={} error={}",
+                    port, error
+                ));
                 if let Some(p) = pid {
-                    let _ = self.exec(&format!("kill {p} 2>/dev/null")).await;
+                    let kill_cmd = match shell {
+                        RemoteShell::Posix => format!("kill {p} 2>/dev/null"),
+                        RemoteShell::PowerShell => format!("Stop-Process -Id {p} -Force -ErrorAction SilentlyContinue"),
+                    };
+                    let _ = self.exec_shell(&kill_cmd, shell).await;
                 }
                 if offset == PORT_CANDIDATES - 1 {
                     return Err(SshError::ExecFailed {
@@ -640,7 +880,14 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             let local_port = self.forward_port_to(0, remote_loopback, port).await?;
 
             // --- 6. Optionally read server version -----------------------
-            let version = self.read_server_version(codex_binary.path()).await;
+            let version = self.read_server_version_shell(codex_binary.path(), shell).await;
+            append_bridge_info_log(&format!(
+                "ssh_bootstrap_success port={} local_port={} pid={:?} version={}",
+                port,
+                local_port,
+                pid,
+                version.clone().unwrap_or_else(|| "<unknown>".to_string())
+            ));
 
             return Ok(SshBootstrapResult {
                 server_port: port,
@@ -668,8 +915,8 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
     pub async fn disconnect(&self) {
         // Abort all forwarding tasks.
         let mut tasks = self.forward_tasks.lock().await;
-        for task in tasks.drain(..) {
-            task.abort();
+        for (_, task) in tasks.drain() {
+            task.task.abort();
         }
         drop(tasks);
 
@@ -684,61 +931,61 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
     // --------------------------------------------------------------------
 
     /// Locate the `codex` (or `codex-app-server`) binary on the remote host.
-    async fn resolve_codex_binary(&self) -> Result<RemoteCodexBinary, SshError> {
-        let script = format!(
-            r#"{profile_init}
-codex_path="$(command -v codex 2>/dev/null || true)"
-if [ -n "$codex_path" ] && [ -f "$codex_path" ] && [ -x "$codex_path" ]; then
-  printf 'codex:%s' "$codex_path"
-elif [ -x "$HOME/.volta/bin/codex" ]; then
-  printf 'codex:%s' "$HOME/.volta/bin/codex"
-elif [ -x "$HOME/.cargo/bin/codex" ]; then
-  printf 'codex:%s' "$HOME/.cargo/bin/codex"
-elif [ -x "$HOME/.local/bin/codex" ]; then
-  printf 'codex:%s' "$HOME/.local/bin/codex"
-elif [ -x "/opt/homebrew/bin/codex" ]; then
-  printf 'codex:%s' "/opt/homebrew/bin/codex"
-elif [ -x "/usr/local/bin/codex" ]; then
-  printf 'codex:%s' "/usr/local/bin/codex"
-else
-  app_server_path="$(command -v codex-app-server 2>/dev/null || true)"
-  if [ -n "$app_server_path" ] && [ -f "$app_server_path" ] && [ -x "$app_server_path" ]; then
-    printf 'app-server:%s' "$app_server_path"
-  elif [ -x "/opt/homebrew/bin/codex-app-server" ]; then
-    printf 'app-server:%s' "/opt/homebrew/bin/codex-app-server"
-  elif [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
-    printf 'app-server:%s' "$HOME/.cargo/bin/codex-app-server"
-  fi
-fi"#,
-            profile_init = PROFILE_INIT
-        );
+    pub(crate) async fn resolve_codex_binary_optional(
+        &self,
+    ) -> Result<Option<RemoteCodexBinary>, SshError> {
+        self.resolve_codex_binary_optional_with_shell(None).await
+    }
 
-        let result = self.exec(&script).await?;
+    pub(crate) async fn resolve_codex_binary_optional_with_shell(
+        &self,
+        shell_hint: Option<RemoteShell>,
+    ) -> Result<Option<RemoteCodexBinary>, SshError> {
+        let shell = match shell_hint {
+            Some(s) => s,
+            None => self.detect_remote_shell().await,
+        };
+
+        let script = match shell {
+            RemoteShell::PowerShell => resolve_codex_binary_script_powershell(),
+            RemoteShell::Posix => resolve_codex_binary_script_posix(),
+        };
+
+        let result = self.exec_shell(&script, shell).await?;
         let raw = result.stdout.trim();
         if raw.is_empty() {
-            let diagnostics = self.fetch_codex_resolver_diagnostics().await;
-            return Err(SshError::ExecFailed {
-                exit_code: 1,
-                stderr: if diagnostics.is_empty() {
-                    "codex/codex-app-server not found on remote host".into()
-                } else {
-                    format!(
-                        "codex/codex-app-server not found on remote host\nresolver diagnostics:\n{}",
-                        diagnostics
-                    )
-                },
-            });
+            return Ok(None);
         }
         if let Some(path) = raw.strip_prefix("codex:") {
-            return Ok(RemoteCodexBinary::Codex(path.to_string()));
+            return Ok(Some(RemoteCodexBinary::Codex(path.to_string())));
         }
         if let Some(path) = raw.strip_prefix("app-server:") {
-            return Ok(RemoteCodexBinary::AppServer(path.to_string()));
+            return Ok(Some(RemoteCodexBinary::AppServer(path.to_string())));
         }
         Err(SshError::ExecFailed {
             exit_code: 1,
             stderr: format!("unexpected remote codex binary selector: {raw}"),
         })
+    }
+
+    async fn resolve_codex_binary(&self) -> Result<RemoteCodexBinary, SshError> {
+        match self.resolve_codex_binary_optional().await? {
+            Some(binary) => Ok(binary),
+            None => {
+                let diagnostics = self.fetch_codex_resolver_diagnostics().await;
+                Err(SshError::ExecFailed {
+                    exit_code: 1,
+                    stderr: if diagnostics.is_empty() {
+                        "codex/codex-app-server not found on remote host".into()
+                    } else {
+                        format!(
+                            "codex/codex-app-server not found on remote host\nresolver diagnostics:\n{}",
+                            diagnostics
+                        )
+                    },
+                })
+            }
+        }
     }
 
     async fn fetch_codex_resolver_diagnostics(&self) -> String {
@@ -755,6 +1002,7 @@ printf 'command -v codex-app-server='
 command -v codex-app-server 2>/dev/null || printf '<missing>'
 printf '\n'
 for candidate in \
+  "$HOME/.litter/bin/codex" \
   "$HOME/.volta/bin/codex" \
   "$HOME/.cargo/bin/codex" \
   "$HOME/.local/bin/codex" \
@@ -783,17 +1031,26 @@ done"#,
 
     /// Check if a TCP port is currently listening on the remote host.
     async fn is_port_listening(&self, port: u16) -> bool {
-        let cmd = format!(
-            r#"if command -v lsof >/dev/null 2>&1; then
+        self.is_port_listening_shell(port, RemoteShell::Posix).await
+    }
+
+    async fn is_port_listening_shell(&self, port: u16, shell: RemoteShell) -> bool {
+        let cmd = match shell {
+            RemoteShell::Posix => format!(
+                r#"if command -v lsof >/dev/null 2>&1; then
   lsof -nP -iTCP:{port} -sTCP:LISTEN -t 2>/dev/null | head -n 1
 elif command -v ss >/dev/null 2>&1; then
   ss -ltn "sport = :{port}" 2>/dev/null | tail -n +2 | head -n 1
 elif command -v netstat >/dev/null 2>&1; then
   netstat -ltn 2>/dev/null | awk '{{print $4}}' | grep -E '[:\.]{port}$' | head -n 1
 fi"#
-        );
+            ),
+            RemoteShell::PowerShell => format!(
+                r#"Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty LocalPort"#
+            ),
+        };
 
-        match self.exec(&cmd).await {
+        match self.exec_shell(&cmd, shell).await {
             Ok(r) => !r.stdout.trim().is_empty(),
             Err(_) => false,
         }
@@ -801,8 +1058,19 @@ fi"#
 
     /// Check if a process is alive on the remote host.
     async fn is_process_alive(&self, pid: u32) -> bool {
-        let cmd = format!("kill -0 {pid} >/dev/null 2>&1 && echo alive || echo dead");
-        match self.exec(&cmd).await {
+        self.is_process_alive_shell(pid, RemoteShell::Posix).await
+    }
+
+    async fn is_process_alive_shell(&self, pid: u32, shell: RemoteShell) -> bool {
+        let cmd = match shell {
+            RemoteShell::Posix => {
+                format!("kill -0 {pid} >/dev/null 2>&1 && echo alive || echo dead")
+            }
+            RemoteShell::PowerShell => format!(
+                r#"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Write-Host 'alive' }} else {{ Write-Host 'dead' }}"#
+            ),
+        };
+        match self.exec_shell(&cmd, shell).await {
             Ok(r) => r.stdout.trim() == "alive",
             Err(_) => false,
         }
@@ -810,10 +1078,24 @@ fi"#
 
     /// Read the last 25 lines of a remote log file.
     async fn fetch_log_tail(&self, log_path: &str) -> String {
-        match self
-            .exec(&format!("tail -n 25 {} 2>/dev/null", shell_quote(log_path)))
-            .await
-        {
+        self.fetch_log_tail_shell(log_path, RemoteShell::Posix).await
+    }
+
+    async fn fetch_log_tail_shell(&self, log_path: &str, shell: RemoteShell) -> String {
+        let cmd = match shell {
+            RemoteShell::Posix => {
+                format!("tail -n 25 {} 2>/dev/null", shell_quote(log_path))
+            }
+            RemoteShell::PowerShell => {
+                // log_path may be a PS expression like (Join-Path $env:TEMP '...'),
+                // so resolve it into $p first.
+                format!(
+                    "$p = {lp}; if (Test-Path $p) {{ Get-Content -Path $p -Tail 25 }}",
+                    lp = log_path
+                )
+            }
+        };
+        match self.exec_shell(&cmd, shell).await {
             Ok(r) => r.stdout.trim().to_string(),
             Err(_) => String::new(),
         }
@@ -828,14 +1110,27 @@ fi"#
         let websocket_url = format!("ws://127.0.0.1:{local_port}");
         let mut last_error = String::new();
 
-        for _ in 0..20 {
+        for attempt in 0..20 {
             match connect_async(&websocket_url).await {
                 Ok((mut websocket, _)) => {
                     let _ = websocket.close(None).await;
+                    append_bridge_info_log(&format!(
+                        "ssh_bootstrap_probe_success url={} attempt={}",
+                        websocket_url,
+                        attempt + 1
+                    ));
                     return Ok(());
                 }
                 Err(error) => {
                     last_error = error.to_string();
+                    if attempt == 0 || attempt == 19 {
+                        append_bridge_info_log(&format!(
+                            "ssh_bootstrap_probe_retry url={} attempt={} error={}",
+                            websocket_url,
+                            attempt + 1,
+                            last_error
+                        ));
+                    }
                 }
             }
 
@@ -861,17 +1156,278 @@ fi"#
 
     /// Attempt to read the server version from `codex --version`.
     async fn read_server_version(&self, codex_path: &str) -> Option<String> {
-        let cmd = format!(
-            "{} {} --version 2>/dev/null",
-            PROFILE_INIT,
-            shell_quote(codex_path)
-        );
-        match self.exec(&cmd).await {
+        self.read_server_version_shell(codex_path, RemoteShell::Posix).await
+    }
+
+    async fn read_server_version_shell(
+        &self,
+        codex_path: &str,
+        shell: RemoteShell,
+    ) -> Option<String> {
+        let cmd = match shell {
+            RemoteShell::Posix => format!(
+                "{} {} --version 2>/dev/null",
+                PROFILE_INIT,
+                shell_quote(codex_path)
+            ),
+            RemoteShell::PowerShell => format!(
+                "& {} --version 2>$null",
+                ps_quote(codex_path)
+            ),
+        };
+        match self.exec_shell(&cmd, shell).await {
             Ok(r) if r.exit_code == 0 => {
                 let v = r.stdout.trim().to_string();
                 if v.is_empty() { None } else { Some(v) }
             }
             _ => None,
+        }
+    }
+
+    pub(crate) async fn detect_remote_shell(&self) -> RemoteShell {
+        // cmd.exe: `echo %OS%` → "Windows_NT"
+        // PowerShell: `echo %OS%` → "%OS%" (literal)
+        // bash: `echo %OS%` → "%OS%" (literal)
+        if let Ok(result) = self.exec("echo %OS%").await {
+            let out = result.stdout.trim();
+            append_bridge_info_log(&format!(
+                "ssh_detect_shell cmd_probe out={:?} exit={}",
+                out, result.exit_code
+            ));
+            if out == "Windows_NT" {
+                return RemoteShell::PowerShell;
+            }
+        }
+        // Also try PowerShell syntax in case the default shell IS PowerShell.
+        if let Ok(result) = self.exec("echo $env:OS").await {
+            let out = result.stdout.trim();
+            append_bridge_info_log(&format!(
+                "ssh_detect_shell ps_probe out={:?} exit={}",
+                out, result.exit_code
+            ));
+            if out.contains("Windows") {
+                return RemoteShell::PowerShell;
+            }
+        }
+        append_bridge_info_log("ssh_detect_shell result=Posix");
+        RemoteShell::Posix
+    }
+
+    /// Execute a command using the appropriate shell. For PowerShell commands,
+    /// wraps in `powershell -NoProfile -Command "..."` since Windows OpenSSH
+    /// defaults to cmd.exe.
+    pub(crate) async fn exec_shell(&self, command: &str, shell: RemoteShell) -> Result<ExecResult, SshError> {
+        match shell {
+            RemoteShell::Posix => self.exec(command).await,
+            RemoteShell::PowerShell => {
+                // Use -EncodedCommand to avoid all escaping issues between
+                // cmd.exe and PowerShell. The encoded command is a UTF-16LE
+                // base64 string that PowerShell decodes directly.
+                let utf16: Vec<u8> = command
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16);
+                self.exec(&format!(
+                    "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+                    encoded
+                ))
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn detect_remote_platform(&self) -> Result<RemotePlatform, SshError> {
+        self.detect_remote_platform_with_shell(None).await
+    }
+
+    pub(crate) async fn detect_remote_platform_with_shell(
+        &self,
+        shell_hint: Option<RemoteShell>,
+    ) -> Result<RemotePlatform, SshError> {
+        let shell = match shell_hint {
+            Some(s) => s,
+            None => self.detect_remote_shell().await,
+        };
+
+        match shell {
+            RemoteShell::PowerShell => {
+                let result = self
+                    .exec_shell(r#"Write-Host "$env:OS`n$env:PROCESSOR_ARCHITECTURE""#, shell)
+                    .await?;
+                let mut lines = result.stdout.lines();
+                let os = lines.next().unwrap_or_default().trim();
+                let arch = lines.next().unwrap_or_default().trim();
+                match (os, arch) {
+                    ("Windows_NT", "AMD64") | ("Windows_NT", "x86_64") => {
+                        Ok(RemotePlatform::WindowsX64)
+                    }
+                    ("Windows_NT", "ARM64") | ("Windows_NT", "aarch64") => {
+                        Ok(RemotePlatform::WindowsArm64)
+                    }
+                    _ => Err(SshError::ExecFailed {
+                        exit_code: 1,
+                        stderr: format!("unsupported Windows platform: os={os} arch={arch}"),
+                    }),
+                }
+            }
+            RemoteShell::Posix => {
+                let result = self
+                    .exec(r#"uname_s="$(uname -s 2>/dev/null || true)"; uname_m="$(uname -m 2>/dev/null || true)"; printf '%s\n%s' "$uname_s" "$uname_m""#)
+                    .await?;
+                let mut lines = result.stdout.lines();
+                let os = lines.next().unwrap_or_default().trim();
+                let arch = lines.next().unwrap_or_default().trim();
+                match (os, arch) {
+                    ("Darwin", "arm64") | ("Darwin", "aarch64") => Ok(RemotePlatform::MacosArm64),
+                    ("Darwin", "x86_64") | ("Darwin", "amd64") => Ok(RemotePlatform::MacosX64),
+                    ("Linux", "aarch64") | ("Linux", "arm64") => Ok(RemotePlatform::LinuxArm64),
+                    ("Linux", "x86_64") | ("Linux", "amd64") => Ok(RemotePlatform::LinuxX64),
+                    _ => Err(SshError::ExecFailed {
+                        exit_code: 1,
+                        stderr: format!("unsupported remote platform: os={os} arch={arch}"),
+                    }),
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn install_latest_stable_codex(
+        &self,
+        platform: RemotePlatform,
+    ) -> Result<RemoteCodexBinary, SshError> {
+        if platform.is_windows() {
+            return self.install_codex_via_npm(RemoteShell::PowerShell).await;
+        }
+        let release = fetch_latest_stable_codex_release(platform).await?;
+        let install_script = format!(
+            r#"set -e
+tag={tag}
+asset_name={asset_name}
+binary_name={binary_name}
+download_url={download_url}
+dest_dir="$HOME/.litter/codex/$tag"
+dest_bin="$dest_dir/codex"
+stable_bin="$HOME/.litter/bin/codex"
+tmpdir="$(mktemp -d "${{TMPDIR:-/tmp}}/litter-codex.XXXXXX")"
+cleanup() {{
+  rm -rf "$tmpdir"
+}}
+trap cleanup EXIT
+mkdir -p "$dest_dir" "$HOME/.litter/bin"
+if [ ! -x "$dest_bin" ]; then
+  archive_path="$tmpdir/$asset_name"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$download_url" -o "$archive_path"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$archive_path" "$download_url"
+  else
+    echo "curl or wget is required to install Codex" >&2
+    exit 1
+  fi
+  tar -xzf "$archive_path" -C "$tmpdir"
+  extracted="$tmpdir/$binary_name"
+  if [ ! -f "$extracted" ]; then
+    echo "expected binary '$binary_name' not found in release archive" >&2
+    exit 1
+  fi
+  if command -v install >/dev/null 2>&1; then
+    install -m 0755 "$extracted" "$dest_bin"
+  else
+    cp "$extracted" "$dest_bin"
+    chmod 0755 "$dest_bin"
+  fi
+fi
+ln -sf "$dest_bin" "$stable_bin"
+printf '%s' "$stable_bin""#,
+            tag = shell_quote(&release.tag_name),
+            asset_name = shell_quote(&release.asset_name),
+            binary_name = shell_quote(&release.binary_name),
+            download_url = shell_quote(&release.download_url),
+        );
+        let result = self.exec(&install_script).await?;
+        if result.exit_code != 0 {
+            return Err(SshError::ExecFailed {
+                exit_code: result.exit_code,
+                stderr: if result.stderr.trim().is_empty() {
+                    "failed to install Codex".to_string()
+                } else {
+                    result.stderr
+                },
+            });
+        }
+        let installed_path = result.stdout.trim();
+        Ok(RemoteCodexBinary::Codex(if installed_path.is_empty() {
+            "$HOME/.litter/bin/codex".to_string()
+        } else {
+            installed_path.to_string()
+        }))
+    }
+
+    /// Install Codex via npm into `~/.litter/codex/` (works on Windows and
+    /// as a POSIX fallback when no binary release is available).
+    pub(crate) async fn install_codex_via_npm(
+        &self,
+        shell: RemoteShell,
+    ) -> Result<RemoteCodexBinary, SshError> {
+        let script = match shell {
+            RemoteShell::PowerShell => {
+                r#"$ErrorActionPreference = 'Stop'
+$litterDir = Join-Path $env:USERPROFILE '.litter\codex'
+if (-not (Test-Path $litterDir)) { New-Item -ItemType Directory -Path $litterDir -Force | Out-Null }
+Set-Location $litterDir
+if (-not (Test-Path 'package.json')) { npm init -y 2>$null | Out-Null }
+npm install @openai/codex 2>$null | Out-Null
+$bin = Join-Path $litterDir 'node_modules\.bin\codex.cmd'
+if (Test-Path $bin) { Write-Output "CODEX_PATH:$bin" } else { Write-Error 'codex.cmd not found after install'; exit 1 }"#.to_string()
+            }
+            RemoteShell::Posix => {
+                format!(
+                    r#"{profile_init}
+set -e
+litter_dir="$HOME/.litter/codex"
+mkdir -p "$litter_dir"
+cd "$litter_dir"
+[ -f package.json ] || npm init -y >/dev/null 2>&1
+npm install @openai/codex >/dev/null 2>&1
+bin="$litter_dir/node_modules/.bin/codex"
+if [ -x "$bin" ]; then printf 'CODEX_PATH:%s' "$bin"; else echo "codex not found after install" >&2; exit 1; fi"#,
+                    profile_init = PROFILE_INIT
+                )
+            }
+        };
+
+        let result = self.exec_shell(&script, shell).await?;
+        if result.exit_code != 0 {
+            return Err(SshError::ExecFailed {
+                exit_code: result.exit_code,
+                stderr: if result.stderr.trim().is_empty() {
+                    "npm install @openai/codex failed".to_string()
+                } else {
+                    result.stderr
+                },
+            });
+        }
+        let installed_path = result
+            .stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("CODEX_PATH:"))
+            .map(|p| p.trim().to_string());
+        match installed_path {
+            Some(path) if !path.is_empty() => Ok(RemoteCodexBinary::Codex(path)),
+            _ => {
+                append_bridge_info_log(&format!(
+                    "ssh_npm_install_no_path stdout={:?} stderr={:?}",
+                    result.stdout, result.stderr
+                ));
+                Err(SshError::ExecFailed {
+                    exit_code: 1,
+                    stderr: format!(
+                        "codex binary path not returned after npm install. stdout: {}",
+                        result.stdout.chars().take(200).collect::<String>()
+                    ),
+                })
+            }
         }
     }
 }
@@ -980,30 +1536,97 @@ async fn proxy_connection(
 /// Shell snippet that sources common profile files to pick up PATH additions.
 const PROFILE_INIT: &str = r#"for f in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do [ -f "$f" ] && . "$f" 2>/dev/null; done;"#;
 
+fn resolve_codex_binary_script_posix() -> String {
+    format!(
+        r#"{profile_init}
+if [ -x "$HOME/.litter/bin/codex" ]; then
+  printf 'codex:%s' "$HOME/.litter/bin/codex"
+  exit 0
+fi
+litter_npm="$HOME/.litter/codex/node_modules/.bin/codex"
+if [ -x "$litter_npm" ]; then
+  printf 'codex:%s' "$litter_npm"
+  exit 0
+fi
+codex_path="$(command -v codex 2>/dev/null || true)"
+if [ -n "$codex_path" ] && [ -f "$codex_path" ] && [ -x "$codex_path" ]; then
+  printf 'codex:%s' "$codex_path"
+elif [ -x "$HOME/.volta/bin/codex" ]; then
+  printf 'codex:%s' "$HOME/.volta/bin/codex"
+elif [ -x "$HOME/.cargo/bin/codex" ]; then
+  printf 'codex:%s' "$HOME/.cargo/bin/codex"
+elif [ -x "$HOME/.local/bin/codex" ]; then
+  printf 'codex:%s' "$HOME/.local/bin/codex"
+elif [ -x "/opt/homebrew/bin/codex" ]; then
+  printf 'codex:%s' "/opt/homebrew/bin/codex"
+elif [ -x "/usr/local/bin/codex" ]; then
+  printf 'codex:%s' "/usr/local/bin/codex"
+else
+  app_server_path="$(command -v codex-app-server 2>/dev/null || true)"
+  if [ -n "$app_server_path" ] && [ -f "$app_server_path" ] && [ -x "$app_server_path" ]; then
+    printf 'app-server:%s' "$app_server_path"
+  elif [ -x "/opt/homebrew/bin/codex-app-server" ]; then
+    printf 'app-server:%s' "/opt/homebrew/bin/codex-app-server"
+  elif [ -x "$HOME/.cargo/bin/codex-app-server" ]; then
+    printf 'app-server:%s' "$HOME/.cargo/bin/codex-app-server"
+  fi
+fi"#,
+        profile_init = PROFILE_INIT
+    )
+}
+
+fn resolve_codex_binary_script_powershell() -> String {
+    r#"$litterBin = Join-Path $env:USERPROFILE '.litter\bin\codex.cmd'
+if (Test-Path $litterBin) { Write-Host "codex:$litterBin"; exit 0 }
+$litterNpm = Join-Path $env:USERPROFILE '.litter\codex\node_modules\.bin\codex.cmd'
+if (Test-Path $litterNpm) { Write-Host "codex:$litterNpm"; exit 0 }
+$found = Get-Command codex -ErrorAction SilentlyContinue
+if ($found) { Write-Host "codex:$($found.Source)"; exit 0 }
+$found = Get-Command codex-app-server -ErrorAction SilentlyContinue
+if ($found) { Write-Host "app-server:$($found.Source)"; exit 0 }"#
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
-enum RemoteCodexBinary {
+pub(crate) enum RemoteCodexBinary {
     Codex(String),
     AppServer(String),
 }
 
 impl RemoteCodexBinary {
-    fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         match self {
             Self::Codex(path) | Self::AppServer(path) => path,
         }
     }
 }
 
-fn server_launch_command(binary: &RemoteCodexBinary, listen_url: &str) -> String {
-    match binary {
-        RemoteCodexBinary::Codex(path) => format!(
-            "{} app-server --listen {}",
-            shell_quote(path),
-            shell_quote(listen_url)
-        ),
-        RemoteCodexBinary::AppServer(path) => {
-            format!("{} --listen {}", shell_quote(path), shell_quote(listen_url))
-        }
+fn server_launch_command(
+    binary: &RemoteCodexBinary,
+    listen_url: &str,
+    shell: RemoteShell,
+) -> String {
+    match shell {
+        RemoteShell::Posix => match binary {
+            RemoteCodexBinary::Codex(path) => format!(
+                "{} app-server --listen {}",
+                shell_quote(path),
+                shell_quote(listen_url)
+            ),
+            RemoteCodexBinary::AppServer(path) => {
+                format!("{} --listen {}", shell_quote(path), shell_quote(listen_url))
+            }
+        },
+        RemoteShell::PowerShell => match binary {
+            RemoteCodexBinary::Codex(path) => format!(
+                "{} app-server --listen {}",
+                ps_quote(path),
+                ps_quote(listen_url)
+            ),
+            RemoteCodexBinary::AppServer(path) => {
+                format!("{} --listen {}", ps_quote(path), ps_quote(listen_url))
+            }
+        },
     }
 }
 
@@ -1020,6 +1643,111 @@ fn normalize_host(host: &str) -> String {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Quote a string for PowerShell (single-quoted, no variable expansion).
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+fn platform_asset_name(platform: RemotePlatform) -> Option<&'static str> {
+    match platform {
+        RemotePlatform::MacosArm64 => Some("codex-aarch64-apple-darwin.tar.gz"),
+        RemotePlatform::MacosX64 => Some("codex-x86_64-apple-darwin.tar.gz"),
+        RemotePlatform::LinuxArm64 => Some("codex-aarch64-unknown-linux-musl.tar.gz"),
+        RemotePlatform::LinuxX64 => Some("codex-x86_64-unknown-linux-musl.tar.gz"),
+        // Windows uses npm install, not binary release assets.
+        RemotePlatform::WindowsX64 | RemotePlatform::WindowsArm64 => None,
+    }
+}
+
+fn platform_binary_name(platform: RemotePlatform) -> Option<&'static str> {
+    match platform {
+        RemotePlatform::MacosArm64 => Some("codex-aarch64-apple-darwin"),
+        RemotePlatform::MacosX64 => Some("codex-x86_64-apple-darwin"),
+        RemotePlatform::LinuxArm64 => Some("codex-aarch64-unknown-linux-musl"),
+        RemotePlatform::LinuxX64 => Some("codex-x86_64-unknown-linux-musl"),
+        RemotePlatform::WindowsX64 | RemotePlatform::WindowsArm64 => None,
+    }
+}
+
+fn resolve_release_from_listing(
+    releases: &[GithubRelease],
+    platform: RemotePlatform,
+) -> Result<ResolvedCodexRelease, SshError> {
+    let asset_name = platform_asset_name(platform).ok_or_else(|| SshError::ExecFailed {
+        exit_code: 1,
+        stderr: "no binary release asset for this platform (use npm install)".to_string(),
+    })?;
+    let binary_name = platform_binary_name(platform).ok_or_else(|| SshError::ExecFailed {
+        exit_code: 1,
+        stderr: "no binary name for this platform (use npm install)".to_string(),
+    })?;
+    let release = releases
+        .iter()
+        .find(|release| !release.draft && !release.prerelease)
+        .ok_or_else(|| SshError::ExecFailed {
+            exit_code: 1,
+            stderr: "no stable Codex release available".to_string(),
+        })?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| SshError::ExecFailed {
+            exit_code: 1,
+            stderr: format!(
+                "stable Codex release {} is missing asset {}",
+                release.tag_name, asset_name
+            ),
+        })?;
+    Ok(ResolvedCodexRelease {
+        tag_name: release.tag_name.clone(),
+        asset_name: asset.name.clone(),
+        binary_name: binary_name.to_string(),
+        download_url: asset.browser_download_url.clone(),
+    })
+}
+
+async fn fetch_latest_stable_codex_release(
+    platform: RemotePlatform,
+) -> Result<ResolvedCodexRelease, SshError> {
+    let releases = reqwest::Client::new()
+        .get("https://api.github.com/repos/openai/codex/releases?per_page=30")
+        .header(reqwest::header::USER_AGENT, "litter-codex-mobile")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| SshError::ExecFailed {
+            exit_code: 1,
+            stderr: format!("failed to query Codex releases: {error}"),
+        })?
+        .error_for_status()
+        .map_err(|error| SshError::ExecFailed {
+            exit_code: 1,
+            stderr: format!("Codex releases API returned error: {error}"),
+        })?
+        .json::<Vec<GithubRelease>>()
+        .await
+        .map_err(|error| SshError::ExecFailed {
+            exit_code: 1,
+            stderr: format!("failed to parse Codex releases response: {error}"),
+        })?;
+    resolve_release_from_listing(&releases, platform)
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1794,7 @@ mod tests {
         let command = server_launch_command(
             &RemoteCodexBinary::Codex("/usr/local/bin/codex".into()),
             "ws://0.0.0.0:8390",
+            RemoteShell::Posix,
         );
         assert_eq!(
             command,
@@ -1078,6 +1807,7 @@ mod tests {
         let command = server_launch_command(
             &RemoteCodexBinary::AppServer("/usr/local/bin/codex-app-server".into()),
             "ws://[::]:8390",
+            RemoteShell::Posix,
         );
         assert_eq!(
             command,

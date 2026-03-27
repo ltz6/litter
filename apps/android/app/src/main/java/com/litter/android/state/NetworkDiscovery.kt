@@ -36,6 +36,12 @@ class NetworkDiscovery(private val discovery: DiscoveryBridge) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
+    private val _scanProgress = MutableStateFlow(0f)
+    val scanProgress: StateFlow<Float> = _scanProgress.asStateFlow()
+
+    private val _scanProgressLabel = MutableStateFlow<String?>(null)
+    val scanProgressLabel: StateFlow<String?> = _scanProgressLabel.asStateFlow()
+
     private val scope = CoroutineScope(Dispatchers.IO)
     private var scanJob: Job? = null
 
@@ -43,6 +49,8 @@ class NetworkDiscovery(private val discovery: DiscoveryBridge) {
         if (scanJob?.isActive == true) return
         scanJob = scope.launch {
             _isScanning.value = true
+            _scanProgress.value = 0f
+            _scanProgressLabel.value = "Discovering services…"
             try {
                 // 1. Discover mDNS seeds via Android NSD
                 val seeds = discoverMdnsSeeds(context)
@@ -50,11 +58,16 @@ class NetworkDiscovery(private val discovery: DiscoveryBridge) {
                 // 2. Get local IPv4
                 val localIp = localIpv4Address()
 
+                _scanProgress.value = 0.02f
+                _scanProgressLabel.value = "Scanning network…"
+
                 // 3. Consume progressive Rust discovery batches as each source completes.
                 val subscription = discovery.scanServersWithMdnsContextProgressive(seeds, localIp)
                 while (true) {
                     val update = subscription.nextEvent()
                     _servers.value = update.servers
+                    _scanProgress.value = update.progress
+                    update.progressLabel?.let { _scanProgressLabel.value = it }
                     if (update.kind == FfiProgressiveDiscoveryUpdateKind.SCAN_COMPLETE) {
                         break
                     }

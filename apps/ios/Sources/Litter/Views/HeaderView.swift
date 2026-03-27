@@ -1,14 +1,15 @@
+import SafariServices
 import SwiftUI
 
 struct HeaderView: View {
     @Environment(AppState.self) private var appState
     @Environment(AppModel.self) private var appModel
-    @Environment(\.openURL) private var openURL
     let thread: AppThreadSnapshot
     let onBack: () -> Void
     var onInfo: (() -> Void)?
     @State private var isReloading = false
     @State private var pulsing = false
+    @State private var remoteAuthSession: RemoteAuthSession?
     @AppStorage("fastMode") private var fastMode = false
 
     var topInset: CGFloat = 0
@@ -132,6 +133,15 @@ struct HeaderView: View {
         )
         .task(id: thread.key) {
             await loadModelsIfNeeded()
+        }
+        .sheet(item: $remoteAuthSession) { session in
+            InAppSafariView(url: session.url)
+                .ignoresSafeArea()
+        }
+        .onChange(of: server?.account != nil) { _, isLoggedIn in
+            if isLoggedIn {
+                remoteAuthSession = nil
+            }
         }
     }
 
@@ -305,14 +315,12 @@ struct HeaderView: View {
             return false
         }
         do {
-            let response = try await appModel.rpc.loginAccount(
-                serverId: server.serverId,
-                params: .chatgpt
+            let authURL = try await appModel.rpc.startRemoteSshOauthLogin(
+                serverId: server.serverId
             )
-            if case .chatgpt(_, let authURL) = response,
-               let url = URL(string: authURL) {
+            if let url = URL(string: authURL) {
                 await MainActor.run {
-                    openURL(url)
+                    remoteAuthSession = RemoteAuthSession(url: url)
                 }
             }
         } catch {}
@@ -331,6 +339,11 @@ struct HeaderView: View {
         )
     }
 
+}
+
+private struct RemoteAuthSession: Identifiable {
+    let id = UUID()
+    let url: URL
 }
 
 struct InlineModelSelectorView: View {
@@ -444,6 +457,18 @@ struct InlineModelSelectorView: View {
         .fixedSize(horizontal: false, vertical: true)
         .modifier(GlassRectModifier(cornerRadius: 16))
     }
+}
+
+private struct InAppSafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let controller = SFSafariViewController(url: url)
+        controller.dismissButtonStyle = .close
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
 }
 
 struct ModelSelectorSheet: View {

@@ -11,7 +11,15 @@ enum SavedServerStore {
 
     static func load() -> [SavedServer] {
         guard let data = UserDefaults.standard.data(forKey: savedServersKey) else { return [] }
-        return (try? JSONDecoder().decode([SavedServer].self, from: data)) ?? []
+        let decoded = (try? JSONDecoder().decode([SavedServer].self, from: data)) ?? []
+        let migrated = decoded.map { saved -> SavedServer in
+            let server = saved.toDiscoveredServer()
+            return SavedServer.from(server)
+        }
+        if migrated != decoded {
+            save(migrated)
+        }
+        return migrated
     }
 
     static func upsert(_ server: DiscoveredServer) {
@@ -26,6 +34,28 @@ enum SavedServerStore {
     static func remove(serverId: String) {
         var saved = load()
         saved.removeAll { $0.id == serverId }
+        save(saved)
+    }
+
+    static func rename(serverId: String, newName: String) {
+        var saved = load()
+        guard let index = saved.firstIndex(where: { $0.id == serverId }) else { return }
+        let old = saved[index]
+        saved[index] = SavedServer(
+            id: old.id,
+            name: newName,
+            hostname: old.hostname,
+            port: old.port,
+            codexPorts: old.codexPorts,
+            sshPort: old.sshPort,
+            source: old.source,
+            hasCodexServer: old.hasCodexServer,
+            wakeMAC: old.wakeMAC,
+            preferredConnectionMode: old.preferredConnectionMode,
+            preferredCodexPort: old.preferredCodexPort,
+            sshPortForwardingEnabled: old.sshPortForwardingEnabled,
+            websocketURL: old.websocketURL
+        )
         save(saved)
     }
 }

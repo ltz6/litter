@@ -29,6 +29,17 @@ ANDROID_RELEASE_ABIS ?= arm64-v8a,x86_64
 HOST_ARCH := $(shell uname -m)
 ANDROID_EMULATOR_ABIS ?= $(if $(filter arm64 aarch64,$(HOST_ARCH)),arm64-v8a,x86_64)
 
+# Auto-detect Android SDK/NDK/JDK paths (macOS defaults, overridable via env)
+ANDROID_SDK_ROOT ?= $(or $(ANDROID_HOME),$(wildcard $(HOME)/Library/Android/sdk))
+ANDROID_NDK_HOME ?= $(shell ls -d $(ANDROID_SDK_ROOT)/ndk/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/*$$::')
+JAVA_HOME ?= $(or $(shell /usr/libexec/java_home 2>/dev/null),$(shell test -d '/Applications/Android Studio.app/Contents/jbr/Contents/Home' && echo '/Applications/Android Studio.app/Contents/jbr/Contents/Home'))
+ANDROID_ENV := JAVA_HOME='$(JAVA_HOME)' ANDROID_SDK_ROOT='$(ANDROID_SDK_ROOT)' ANDROID_NDK_HOME='$(ANDROID_NDK_HOME)'
+
+# Android app metadata
+ANDROID_APK := $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk
+ANDROID_PACKAGE := com.sigkitten.litter.android
+ANDROID_ACTIVITY := com.litter.android.MainActivity
+
 SCCACHE := $(shell command -v sccache 2>/dev/null)
 ifneq ($(SCCACHE),)
   export RUSTC_WRAPPER := $(SCCACHE)
@@ -73,8 +84,8 @@ ANDROID_RUST_SOURCES := $(shell find $(RUST_DIR) \
 
 $(shell mkdir -p $(STAMPS))
 
-.PHONY: all ios ios-sim ios-sim-fast ios-device ios-device-fast ios-run \
-	android android-fast android-emulator-fast android-release android-debug android-install android-emulator-install \
+.PHONY: all ios ios-sim ios-sim-fast ios-sim-run ios-device ios-device-fast ios-device-run ios-run verify-ios-project \
+	android android-fast android-emulator-fast android-emulator-run android-device-run android-release android-debug android-install android-emulator-install \
 	rust-ios rust-ios-package rust-ios-device-fast rust-ios-sim-fast rust-android rust-check rust-test rust-host-dev \
 	bindings bindings-swift bindings-kotlin \
 	sync patch unpatch xcgen ios-frameworks \
@@ -100,6 +111,24 @@ ios-sim: ios-build-sim
 ios-sim-fast: ios-build-sim-fast
 ios-device: ios-build-device
 ios-device-fast: ios-build-device-fast
+ios-sim-run: ios-sim-fast
+	@echo "==> Installing and launching on booted simulator..."
+	@APP_PATH=$$(/bin/ls -dt $(HOME)/Library/Developer/Xcode/DerivedData/Litter-*/Build/Products/Debug-iphonesimulator/Litter.app 2>/dev/null | head -1) && \
+	if [ -z "$$APP_PATH" ]; then echo "ERROR: Litter.app not found in DerivedData"; exit 1; fi && \
+	xcrun simctl install booted "$$APP_PATH" && \
+	xcrun simctl launch booted com.sigkitten.litter
+
+ios-device-run: ios-device-fast
+	@echo "==> Installing and launching on connected device..."
+	@APP_PATH=$$(/bin/ls -dt $(HOME)/Library/Developer/Xcode/DerivedData/Litter-*/Build/Products/Debug-iphoneos/Litter.app 2>/dev/null | head -1) && \
+	if [ -z "$$APP_PATH" ]; then echo "ERROR: Litter.app not found in DerivedData"; exit 1; fi && \
+	DEVICE_ID=$$(xcrun devicectl list devices 2>/dev/null | grep 'connected' | grep -v 'Simulator' | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' | head -1) && \
+	if [ -z "$$DEVICE_ID" ]; then echo "ERROR: no connected device found"; exit 1; fi && \
+	echo "==> Installing on device $$DEVICE_ID..." && \
+	xcrun devicectl device install app --device "$$DEVICE_ID" "$$APP_PATH" && \
+	echo "==> Launching..." && \
+	xcrun devicectl device process launch --device "$$DEVICE_ID" com.sigkitten.litter
+
 ios-run: ios
 	@open $(IOS_DIR)/Litter.xcodeproj
 
@@ -107,6 +136,17 @@ android: android-fast
 android-fast: rust-android android-debug
 android-emulator-fast:
 	@$(MAKE) android-fast ANDROID_ABIS="$(ANDROID_EMULATOR_ABIS)"
+android-emulator-run: android-emulator-fast
+	@echo "==> Installing and launching on emulator..."
+	@EMU=$$(adb devices | grep '^emulator-' | head -1 | cut -f1) && \
+	if [ -z "$$EMU" ]; then echo "ERROR: no emulator found (run one first)"; exit 1; fi && \
+	adb -s "$$EMU" install -r $(ANDROID_APK) && \
+	adb -s "$$EMU" shell am start -n $(ANDROID_PACKAGE)/$(ANDROID_ACTIVITY)
+android-device-run: android-fast
+	@echo "==> Installing and launching on connected device..."
+	@adb -d install -r $(ANDROID_APK) && \
+	adb -d shell am start -n $(ANDROID_PACKAGE)/$(ANDROID_ACTIVITY)
+
 android-release:
 	@$(MAKE) android-fast ANDROID_RUST_PROFILE=release ANDROID_ABIS="$(ANDROID_RELEASE_ABIS)"
 
@@ -137,13 +177,14 @@ rust-host-dev: rust-check rust-test
 rust-android: $(STAMP_RUST_ANDROID)
 $(STAMP_RUST_ANDROID): $(STAMP_SYNC) $(STAMP_BINDINGS_K) $(ANDROID_RUST_SOURCES) tools/scripts/build-android-rust.sh Makefile
 	@echo "==> Building Rust for Android..."
-	@cd $(ROOT) && ANDROID_ABIS="$(ANDROID_ABIS)" ANDROID_RUST_PROFILE="$(ANDROID_RUST_PROFILE)" $(DEV_CARGO_ENV) ./tools/scripts/build-android-rust.sh
+	@cd $(ROOT) && $(ANDROID_ENV) ANDROID_ABIS="$(ANDROID_ABIS)" ANDROID_RUST_PROFILE="$(ANDROID_RUST_PROFILE)" $(DEV_CARGO_ENV) ./tools/scripts/build-android-rust.sh
 	@touch $@
 
 help:
 	@printf '%s\n' \
 		'make ios                full iOS package lane + simulator build' \
 		'make ios-sim-fast       fast simulator lane using raw staticlib outputs' \
+		'make ios-sim-run        fast sim build + install + launch on booted simulator' \
 		'make ios-device         full iOS package lane + device build' \
 		'make ios-device-fast    fast device lane using raw staticlib outputs' \
 		'make rust-ios-package   full Rust iOS package lane (bindings + xcframework)' \
@@ -151,6 +192,7 @@ help:
 		'make rust-ios-device-fast fast Rust iOS device lane (raw staticlib only)' \
 		'make android            fast Android dev build (default ABI/profile: arm64-v8a/android-dev)' \
 		'make android-emulator-fast fast Android dev build using emulator ABI ($(ANDROID_EMULATOR_ABIS))' \
+		'make android-emulator-run  fast emulator build + install + launch on emulator' \
 		'make android-release    Android build using release Rust profile and multi-ABI output' \
 		'make rust-check         host cargo check for shared crates' \
 		'make rust-test          host cargo test for shared crates'
@@ -212,46 +254,49 @@ $(STAMP_IOS_SYSTEM):
 xcgen: $(STAMP_XCGEN)
 $(STAMP_XCGEN): $(IOS_DIR)/project.yml
 	@echo "==> Regenerating Xcode project..."
-	@xcodegen generate --spec $(IOS_DIR)/project.yml --project $(IOS_DIR)/Litter.xcodeproj
+	@$(IOS_SCRIPTS)/regenerate-project.sh
 	@touch $@
 
-ios-build-sim:
+verify-ios-project:
+	@$(IOS_SCRIPTS)/regenerate-project.sh --repair-only
+
+ios-build-sim: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), simulator)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
-		build | tail -20
+		build
 
-ios-build-sim-fast:
+ios-build-sim-fast: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), fast simulator)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
-		build | tail -20
+		build
 
-ios-build-device:
+ios-build-device: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), device)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'generic/platform=iOS' \
-		build | tail -20
+		build
 
-ios-build-device-fast:
+ios-build-device-fast: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), fast device)..."
 	@xcodebuild -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'generic/platform=iOS' \
-		build | tail -20
+		build
 
 ios-build: ios-build-sim
 
 android-debug:
 	@echo "==> Building Android debug..."
-	@cd $(ANDROID_DIR) && ./gradlew :app:assembleDebug
+	@cd $(ANDROID_DIR) && $(ANDROID_ENV) ./gradlew :app:assembleDebug
 
 android-install: android-debug
 	@echo "==> Installing APK to device..."
@@ -259,7 +304,9 @@ android-install: android-debug
 
 android-emulator-install: android-emulator-fast
 	@echo "==> Installing APK to emulator..."
-	@adb -e install -r $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk
+	@EMU=$$(adb devices | grep '^emulator-' | head -1 | cut -f1) && \
+	if [ -z "$$EMU" ]; then echo "ERROR: no emulator found"; exit 1; fi && \
+	adb -s "$$EMU" install -r $(ANDROID_APK)
 
 test: test-rust test-ios test-android
 
@@ -272,7 +319,7 @@ test-ios: xcgen
 	@xcodebuild test -project $(IOS_DIR)/Litter.xcodeproj \
 		-scheme $(IOS_SCHEME) \
 		-configuration Debug \
-		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' | tail -30
+		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)'
 
 test-android:
 	@echo "==> Running Android tests..."

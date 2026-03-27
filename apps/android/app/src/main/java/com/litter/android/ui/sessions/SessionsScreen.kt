@@ -23,18 +23,25 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -53,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.litter.android.state.AppThreadLaunchConfig
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.home.HomeDashboardSupport
@@ -61,12 +69,14 @@ import uniffi.codex_mobile_client.ThreadArchiveParams
 import uniffi.codex_mobile_client.ThreadKey
 import uniffi.codex_mobile_client.ThreadSetNameParams
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun SessionsScreen(
     serverId: String?,
     title: String,
     onOpenConversation: (ThreadKey) -> Unit,
     onBack: () -> Unit,
+    onInfo: (() -> Unit)? = null,
 ) {
     val appModel = LocalAppModel.current
     val snapshot by appModel.snapshot.collectAsState()
@@ -76,6 +86,8 @@ fun SessionsScreen(
     var sortMode by remember { mutableStateOf(WorkspaceSortMode.RECENT) }
     var collapsedGroups by remember { mutableStateOf(setOf<String>()) }
     var forkOnly by remember { mutableStateOf(false) }
+    var showDirectoryPicker by remember { mutableStateOf(false) }
+    var isCreating by remember { mutableStateOf(false) }
 
     val derived = remember(snapshot, searchQuery, serverId, sortMode, forkOnly) {
         val summaries = snapshot?.sessionSummaries ?: emptyList()
@@ -136,6 +148,48 @@ fun SessionsScreen(
                 color = LitterTheme.textMuted,
                 fontSize = 12.sp,
             )
+            if (onInfo != null) {
+                IconButton(onClick = onInfo, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Outlined.Info,
+                        contentDescription = "Server Info",
+                        tint = LitterTheme.accent,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+
+        if (serverId != null) {
+            Button(
+                onClick = { showDirectoryPicker = true },
+                enabled = !isCreating,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = LitterTheme.accent,
+                    contentColor = Color.Black,
+                    disabledContainerColor = LitterTheme.accent.copy(alpha = 0.55f),
+                    disabledContentColor = Color.Black,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+            ) {
+                if (isCreating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.Black,
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                Spacer(Modifier.width(6.dp))
+                Text("New Session")
+            }
         }
 
         // Search bar + filter chips
@@ -237,6 +291,42 @@ fun SessionsScreen(
             }
 
             item { Spacer(Modifier.height(32.dp)) }
+        }
+    }
+
+    if (showDirectoryPicker && serverId != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showDirectoryPicker = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = LitterTheme.background,
+        ) {
+            DirectoryPickerSheet(
+                serverId = serverId,
+                onSelect = { cwd ->
+                    showDirectoryPicker = false
+                    scope.launch {
+                        isCreating = true
+                        try {
+                            val config = AppThreadLaunchConfig()
+                            val resp = appModel.rpc.threadStart(
+                                serverId,
+                                config.toThreadStartParams(cwd),
+                            )
+                            val key = ThreadKey(
+                                serverId = serverId,
+                                threadId = resp.thread.id,
+                            )
+                            appModel.store.setActiveThread(key)
+                            appModel.refreshSnapshot()
+                            onOpenConversation(key)
+                        } catch (_: Exception) {
+                        } finally {
+                            isCreating = false
+                        }
+                    }
+                },
+                onDismiss = { showDirectoryPicker = false },
+            )
         }
     }
 }

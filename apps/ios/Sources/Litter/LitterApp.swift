@@ -312,6 +312,8 @@ private struct HomeNavigationView: View {
     @State private var isStartingVoice = false
     @State private var actionErrorMessage: String?
     @State private var hasSeededInitialConversationRoute = false
+    @State private var pendingWallpaperConfig: WallpaperConfig?
+    @State private var pendingWallpaperImage: UIImage?
     let topInset: CGFloat
     let bottomInset: CGFloat
 
@@ -322,6 +324,9 @@ private struct HomeNavigationView: View {
         case conversationInfo(ThreadKey)
         case wallpaperSelection(ThreadKey)
         case wallpaperAdjust(ThreadKey)
+        case serverInfo(serverId: String)
+        case serverWallpaperSelection(serverId: String)
+        case serverWallpaperAdjust(serverId: String)
     }
 
     private var connectedServerOptions: [DirectoryPickerServerOption] {
@@ -363,6 +368,9 @@ private struct HomeNavigationView: View {
                             SavedServerStore.remove(serverId: serverId)
                             Task { await SshSessionStore.shared.close(serverId: serverId, ssh: appModel.ssh) }
                             appModel.serverBridge.disconnectServer(serverId: serverId)
+                        },
+                        onRenameServer: { serverId, newName in
+                            SavedServerStore.rename(serverId: serverId, newName: newName)
                         }
                     )
                 } else {
@@ -380,6 +388,9 @@ private struct HomeNavigationView: View {
                     SessionsScreen(
                         onOpenConversation: { key in
                             openConversation(key)
+                        },
+                        onInfo: {
+                            navigationPath.append(.serverInfo(serverId: serverId))
                         }
                     )
                         .navigationTitle(title)
@@ -416,22 +427,70 @@ private struct HomeNavigationView: View {
                 case let .conversationInfo(threadKey):
                     ConversationInfoView(
                         threadKey: threadKey,
+                        serverId: nil,
                         onOpenWallpaper: { navigationPath.append(.wallpaperSelection(threadKey)) },
                         onOpenConversation: { replaceTopConversation(with: $0) }
                     )
-                    .toolbar(.hidden, for: .navigationBar)
-                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
                 case let .wallpaperSelection(threadKey):
                     WallpaperSelectionView(
                         threadKey: threadKey,
-                        onSelectWallpaper: { navigationPath.append(.wallpaperAdjust(threadKey)) }
+                        onSelectWallpaper: { config, image in
+                            pendingWallpaperConfig = config
+                            pendingWallpaperImage = image
+                            navigationPath.append(.wallpaperAdjust(threadKey))
+                        },
+                        onClose: {
+                            // Pop back to conversation info
+                            popToConversationInfo()
+                        }
                     )
                     .toolbar(.hidden, for: .navigationBar)
                     .background(LitterTheme.backgroundGradient.ignoresSafeArea())
                 case let .wallpaperAdjust(threadKey):
-                    WallpaperAdjustView(threadKey: threadKey)
-                        .toolbar(.hidden, for: .navigationBar)
-                        .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                    WallpaperAdjustView(
+                        threadKey: threadKey,
+                        initialConfig: pendingWallpaperConfig ?? WallpaperConfig(),
+                        customImage: pendingWallpaperImage,
+                        onDone: {
+                            // Pop back to conversation info
+                            popToConversationInfo()
+                        }
+                    )
+                    .toolbar(.hidden, for: .navigationBar)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                case let .serverInfo(serverId):
+                    ConversationInfoView(
+                        threadKey: nil,
+                        serverId: serverId,
+                        onOpenWallpaper: { navigationPath.append(.serverWallpaperSelection(serverId: serverId)) }
+                    )
+                case let .serverWallpaperSelection(serverId):
+                    WallpaperSelectionView(
+                        threadKey: nil,
+                        serverId: serverId,
+                        onSelectWallpaper: { config, image in
+                            pendingWallpaperConfig = config
+                            pendingWallpaperImage = image
+                            navigationPath.append(.serverWallpaperAdjust(serverId: serverId))
+                        },
+                        onClose: {
+                            popToServerInfo()
+                        }
+                    )
+                    .toolbar(.hidden, for: .navigationBar)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
+                case let .serverWallpaperAdjust(serverId):
+                    WallpaperAdjustView(
+                        threadKey: nil,
+                        serverId: serverId,
+                        initialConfig: pendingWallpaperConfig ?? WallpaperConfig(),
+                        customImage: pendingWallpaperImage,
+                        onDone: {
+                            popToServerInfo()
+                        }
+                    )
+                    .toolbar(.hidden, for: .navigationBar)
+                    .background(LitterTheme.backgroundGradient.ignoresSafeArea())
                 }
             }
         }
@@ -707,6 +766,21 @@ private struct HomeNavigationView: View {
         appState.showModelSelector = false
         guard navigationPath.last != .realtimeVoice(key) else { return }
         navigationPath.append(.realtimeVoice(key))
+    }
+
+    private func popToConversationInfo() {
+        // Pop wallpaper selection and/or adjust screens, back to conversation info
+        while let last = navigationPath.last {
+            if case .conversationInfo = last { break }
+            navigationPath.removeLast()
+        }
+    }
+
+    private func popToServerInfo() {
+        while let last = navigationPath.last {
+            if case .serverInfo = last { break }
+            navigationPath.removeLast()
+        }
     }
 
     private func replaceTopConversation(with key: ThreadKey) {

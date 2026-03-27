@@ -30,6 +30,7 @@ struct SessionsScreen: View {
     @State private var hasLoadedInitialSessions = false
     private let autoLoadSessions: Bool
     private let onOpenConversation: (ThreadKey) -> Void
+    private let onInfo: (() -> Void)?
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
@@ -38,10 +39,12 @@ struct SessionsScreen: View {
 
     init(
         autoLoadSessions: Bool = true,
-        onOpenConversation: @escaping (ThreadKey) -> Void
+        onOpenConversation: @escaping (ThreadKey) -> Void,
+        onInfo: (() -> Void)? = nil
     ) {
         self.autoLoadSessions = autoLoadSessions
         self.onOpenConversation = onOpenConversation
+        self.onInfo = onInfo
         _isLoading = State(initialValue: autoLoadSessions)
     }
 
@@ -55,7 +58,16 @@ struct SessionsScreen: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    refreshToolbarButton
+                    HStack(spacing: 4) {
+                        if let onInfo {
+                            Button(action: onInfo) {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(LitterTheme.accent)
+                            }
+                        }
+                        refreshToolbarButton
+                    }
                 }
             }
 

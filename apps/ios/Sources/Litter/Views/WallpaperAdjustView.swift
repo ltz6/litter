@@ -5,16 +5,19 @@ struct WallpaperAdjustView: View {
     @Environment(ThemeManager.self) private var themeManager
     @Environment(\.dismiss) private var dismiss
 
-    let threadKey: ThreadKey
+    let threadKey: ThreadKey?
+    var serverId: String? = nil
+    let initialConfig: WallpaperConfig
+    var customImage: UIImage?
+    var onDone: (() -> Void)?
+
+    private var isServerOnly: Bool { threadKey == nil }
+    private var resolvedServerId: String? { threadKey?.serverId ?? serverId }
 
     @State private var isBlurred: Bool = false
     @State private var motionEnabled: Bool = false
     @State private var brightness: Double = 1.0
     @State private var hasLoaded = false
-
-    private var currentConfig: WallpaperConfig? {
-        wallpaperManager.resolveConfig(for: threadKey)
-    }
 
     var body: some View {
         ZStack {
@@ -34,23 +37,34 @@ struct WallpaperAdjustView: View {
                 Spacer()
                 controlsCard
             }
-        }
-        .navigationBarBackButtonHidden(false)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Text("Adjust Wallpaper")
-                    .litterFont(size: 16, weight: .semibold)
-                    .foregroundStyle(LitterTheme.textPrimary)
+
+            // Cancel button (top-left)
+            VStack {
+                HStack {
+                    Button {
+                        onDone?()
+                    } label: {
+                        Text("Cancel")
+                            .litterFont(size: 15, weight: .medium)
+                            .foregroundStyle(LitterTheme.textPrimary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .modifier(GlassRectModifier(cornerRadius: 10))
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                Spacer()
             }
         }
+        .navigationBarBackButtonHidden(true)
         .onAppear {
             guard !hasLoaded else { return }
             hasLoaded = true
-            if let config = currentConfig {
-                isBlurred = config.blur > 0.01
-                motionEnabled = config.motionEnabled
-                brightness = config.brightness
-            }
+            isBlurred = initialConfig.blur > 0.01
+            motionEnabled = initialConfig.motionEnabled
+            brightness = initialConfig.brightness
         }
     }
 
@@ -58,35 +72,52 @@ struct WallpaperAdjustView: View {
 
     @ViewBuilder
     private var wallpaperPreview: some View {
-        if let config = currentConfig {
-            switch config.type {
-            case .theme:
-                if let slug = config.themeSlug,
-                   let image = wallpaperManager.generateWallpaper(themeSlug: slug, themeManager: themeManager) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    LitterTheme.backgroundGradient
-                }
-            case .customImage:
-                if let image = wallpaperManager.wallpaperImage(for: config, scope: .thread(threadKey), themeManager: themeManager) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    LitterTheme.backgroundGradient
-                }
-            case .solidColor:
-                if let hex = config.colorHex {
-                    Color(hex: hex)
-                } else {
-                    LitterTheme.backgroundGradient
-                }
-            case .none:
+        switch initialConfig.type {
+        case .theme:
+            if let slug = initialConfig.themeSlug,
+               let image = wallpaperManager.generateWallpaper(themeSlug: slug, themeManager: themeManager) {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
                 LitterTheme.backgroundGradient
             }
-        } else {
+        case .customImage:
+            if let image = customImage ?? {
+                if let threadKey {
+                    return wallpaperManager.wallpaperImage(for: initialConfig, scope: .thread(threadKey), themeManager: themeManager)
+                } else if let resolvedServerId {
+                    return wallpaperManager.wallpaperImage(for: initialConfig, scope: .server(resolvedServerId), themeManager: themeManager)
+                }
+                return nil
+            }() {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                LitterTheme.backgroundGradient
+            }
+        case .solidColor:
+            if let hex = initialConfig.colorHex {
+                Color(hex: hex)
+            } else {
+                LitterTheme.backgroundGradient
+            }
+        case .customVideo, .videoUrl:
+            let fileURL: URL = {
+                if let threadKey {
+                    return wallpaperManager.videoFileURL(for: .thread(threadKey))
+                } else if let resolvedServerId {
+                    return wallpaperManager.videoFileURL(for: .server(resolvedServerId))
+                }
+                return URL(fileURLWithPath: "/dev/null")
+            }()
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                VideoWallpaperPlayerView(fileURL: fileURL)
+            } else {
+                LitterTheme.backgroundGradient
+            }
+        case .none:
             LitterTheme.backgroundGradient
         }
     }
@@ -153,27 +184,31 @@ struct WallpaperAdjustView: View {
 
             // Apply buttons
             VStack(spacing: 10) {
-                Button {
-                    applyWallpaper(scope: .thread(threadKey))
-                } label: {
-                    Text("Apply for This Thread")
-                        .litterFont(size: 15, weight: .semibold)
-                        .foregroundStyle(LitterTheme.textOnAccent)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .background(LitterTheme.accent)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                if let threadKey {
+                    Button {
+                        applyWallpaper(scope: .thread(threadKey))
+                    } label: {
+                        Text("Apply for This Thread")
+                            .litterFont(size: 15, weight: .semibold)
+                            .foregroundStyle(LitterTheme.textOnAccent)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(LitterTheme.accent)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
                 }
 
-                Button {
-                    applyWallpaper(scope: .server(threadKey.serverId))
-                } label: {
-                    Text("Apply for This Server")
-                        .litterFont(size: 15, weight: .medium)
-                        .foregroundStyle(LitterTheme.textPrimary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .modifier(GlassRectModifier(cornerRadius: 12))
+                if let resolvedServerId {
+                    Button {
+                        applyWallpaper(scope: .server(resolvedServerId))
+                    } label: {
+                        Text("Apply for This Server")
+                            .litterFont(size: 15, weight: .medium)
+                            .foregroundStyle(LitterTheme.textPrimary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .modifier(GlassRectModifier(cornerRadius: 12))
+                    }
                 }
             }
             .padding(.horizontal, 16)
@@ -204,11 +239,11 @@ struct WallpaperAdjustView: View {
     // MARK: - Apply
 
     private func applyWallpaper(scope: WallpaperScope) {
-        guard var config = currentConfig else { return }
+        var config = initialConfig
         config.blur = isBlurred ? 0.5 : 0.0
         config.brightness = brightness
         config.motionEnabled = motionEnabled
         wallpaperManager.setWallpaper(config, scope: scope)
-        dismiss()
+        onDone?()
     }
 }

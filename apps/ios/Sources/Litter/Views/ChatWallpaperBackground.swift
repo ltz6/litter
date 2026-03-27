@@ -8,6 +8,7 @@ struct ChatWallpaperBackground: View {
     var threadKey: ThreadKey?
 
     var body: some View {
+        let _ = wallpaperManager.version // trigger recomposition on wallpaper changes
         let config = wallpaperManager.resolveConfig(for: threadKey)
 
         if let config, config.type != .none {
@@ -44,6 +45,13 @@ struct ChatWallpaperBackground: View {
         case .solidColor:
             if let hex = config.colorHex {
                 Color(hex: hex)
+            } else {
+                LitterTheme.backgroundGradient
+            }
+        case .customVideo, .videoUrl:
+            if let scope = wallpaperScope,
+               FileManager.default.fileExists(atPath: wallpaperManager.videoFileURL(for: scope).path) {
+                VideoWallpaperPlayerView(fileURL: wallpaperManager.videoFileURL(for: scope))
             } else {
                 LitterTheme.backgroundGradient
             }

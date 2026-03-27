@@ -153,7 +153,7 @@ Incremental policy:
 - `./apps/ios/scripts/build-rust.sh` — cross-compile Rust for iOS; in fast mode it emits raw staticlibs + headers to `apps/ios/GeneratedRust/`, and in package mode it also creates `codex_mobile_client.xcframework`
 - `./apps/ios/scripts/download-ios-system.sh` — download `ios_system` XCFrameworks
 - `./apps/ios/scripts/sync-codex.sh` — sync codex submodule + apply patches
-- `./apps/ios/scripts/regenerate-project.sh` — regenerate Xcode project via xcodegen
+- `./apps/ios/scripts/regenerate-project.sh` — regenerate Xcode project via xcodegen; this is the safe path because it removes any accidental nested `apps/ios/Litter.xcodeproj/Litter.xcodeproj` before regenerating
 - `./apps/ios/scripts/testflight-upload.sh` — archive, export IPA, upload to TestFlight
 - `./shared/rust-bridge/generate-bindings.sh` — generate UniFFI Swift/Kotlin bindings
 - `./tools/scripts/build-android-rust.sh` — cross-compile Rust JNI libs for Android via `cargo-ndk`
@@ -167,6 +167,7 @@ Incremental policy:
 ## Autonomous Debugging Runbook
 - Prefer the fast lanes for local iteration before package/release lanes: `make ios-sim-fast`, `make ios-device-fast`, and `make android-emulator-fast`.
 - For iOS simulator debugging, install the latest built app directly from DerivedData instead of trusting an older installed simulator copy: `xcrun simctl install booted <.../Build/Products/Debug-iphonesimulator/Litter.app>` then `xcrun simctl launch booted com.sigkitten.litter`.
+- For Xcode project regeneration, use `make xcgen` or `./apps/ios/scripts/regenerate-project.sh`. Do not run `xcodegen generate --spec project.yml --project Litter.xcodeproj` from inside `apps/ios`; that produces a nested `apps/ios/Litter.xcodeproj/Litter.xcodeproj`.
 - For Android emulator debugging, build with `make android-emulator-fast`, install with `adb -e install -r apps/android/app/build/outputs/apk/debug/app-debug.apk`, then launch with `adb -e shell am start -n com.sigkitten.litter.android/com.litter.android.MainActivity`.
 - Keep both runtimes available when validating shared Rust changes: boot a simulator with `xcrun simctl boot <device>` or through Simulator.app, and verify an emulator is visible with `adb devices -l`.
 - Start the collector with `cargo run --manifest-path shared/rust-bridge/Cargo.toml -p mobile-log-collector -- serve --bind 0.0.0.0:8585 --token <token> --data-dir /tmp/mobile-log-collector-e2e`.

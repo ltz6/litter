@@ -34,10 +34,29 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+        env:
+          SCCACHE_BUCKET: rust-cache
+          SCCACHE_ENDPOINT: ${{ secrets.SCCACHE_R2_ENDPOINT }}
+          SCCACHE_REGION: auto
+          SCCACHE_S3_USE_SSL: "true"
+          SCCACHE_S3_KEY_PREFIX: ci/rust
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
-      - name: Cargo check
-        run: cargo check --manifest-path shared/rust-bridge/codex-bridge/Cargo.toml
+      - name: Cargo check (codex-bridge)
         env:
           RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
           CARGO_INCREMENTAL: "0"
+        run: cargo check --manifest-path shared/rust-bridge/codex-bridge/Cargo.toml
+
+      - name: Cargo check (codex-mobile-client)
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --manifest-path shared/rust-bridge/codex-mobile-client/Cargo.toml
+
+      - name: Cargo test
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+        run: make rust-test

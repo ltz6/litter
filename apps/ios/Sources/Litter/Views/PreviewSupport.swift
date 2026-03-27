@@ -11,10 +11,13 @@ enum LitterPreviewData {
         name: "Newspaper Solver",
         hostname: "192.168.1.228",
         port: 8390,
+        codexPorts: [8390, 9234],
         source: .manual,
         hasCodexServer: true,
         wakeMAC: "12:18:c7:14:74:e3",
-        sshPortForwardingEnabled: true
+        sshPortForwardingEnabled: true,
+        preferredConnectionMode: .directCodex,
+        preferredCodexPort: 8390
     )
 
     static let sampleSSHServer = DiscoveredServer(
@@ -26,7 +29,8 @@ enum LitterPreviewData {
         source: .ssh,
         hasCodexServer: false,
         wakeMAC: "aa:bb:cc:dd:ee:ff",
-        sshPortForwardingEnabled: true
+        sshPortForwardingEnabled: true,
+        preferredConnectionMode: .ssh
     )
 
     static let sampleBonjourServer = DiscoveredServer(
@@ -34,6 +38,7 @@ enum LitterPreviewData {
         name: "Kitchen iMac",
         hostname: "imac.local",
         port: 8390,
+        codexPorts: [8390],
         source: .bonjour,
         hasCodexServer: true
     )
@@ -342,7 +347,8 @@ enum LitterPreviewData {
             account: .chatgpt(email: "builder@example.com", planType: .plus),
             requiresOpenaiAuth: false,
             rateLimits: nil,
-            availableModels: sampleModels
+            availableModels: sampleModels,
+            connectionProgress: nil
         )
 
         let sessionSummaries = threads.map { thread in

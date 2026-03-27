@@ -5,6 +5,7 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -52,7 +53,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,6 +65,8 @@ import com.litter.android.state.isIpcConnected
 import com.litter.android.ui.ChatWallpaperBackground
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
+import com.litter.android.ui.WallpaperManager
+import com.litter.android.ui.WallpaperType
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.HydratedConversationItemContent
 import uniffi.codex_mobile_client.ThreadKey
@@ -169,20 +174,33 @@ fun ConversationScreen(
         }
     }
 
+    val wallpaperVersion = WallpaperManager.version
+    val hasWallpaper = remember(threadKey, wallpaperVersion) {
+        WallpaperManager.resolvedConfig(threadKey)?.type?.let { it != WallpaperType.NONE } == true
+    }
+    val headerScrimColor = if (hasWallpaper) LitterTheme.surface.copy(alpha = 0.75f) else LitterTheme.surface
+
     Box(modifier = Modifier.fillMaxSize()) {
+        // Wallpaper fills the entire screen edge-to-edge (behind status + nav bars)
         ChatWallpaperBackground(threadKey = threadKey)
 
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+            modifier = Modifier.fillMaxSize(),
         ) {
-            HeaderBar(
-                thread = thread,
-                onBack = onBack,
-                onInfo = onInfo,
-            )
+            // Header with status bar inset built-in — extends behind status bar with scrim
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(headerScrimColor),
+            ) {
+                Spacer(Modifier.statusBarsPadding())
+                HeaderBar(
+                    thread = thread,
+                    onBack = onBack,
+                    onInfo = onInfo,
+                    transparentBackground = hasWallpaper,
+                )
+            }
 
             // Message list with gradient fade and scroll FAB
             Box(modifier = Modifier.weight(1f)) {
@@ -191,22 +209,28 @@ fun ConversationScreen(
                         CircularProgressIndicator(color = LitterTheme.accent)
                     }
                 } else {
+                    // Use transparent gradient when wallpaper is set
+                    val fadeColor = if (hasWallpaper) Color.Transparent else LitterTheme.background
+
                     LazyColumn(
                         state = listState,
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(horizontal = 16.dp)
-                            .drawWithContent {
-                                drawContent()
-                                // Top gradient fade
-                                drawRect(
-                                    brush = Brush.verticalGradient(
-                                        colors = listOf(LitterTheme.background, Color.Transparent),
-                                        startY = 0f,
-                                        endY = 48f,
-                                    ),
-                                )
-                            },
+                            .then(
+                                if (!hasWallpaper) {
+                                    Modifier.drawWithContent {
+                                        drawContent()
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(LitterTheme.background, Color.Transparent),
+                                                startY = 0f,
+                                                endY = 48f,
+                                            ),
+                                        )
+                                    }
+                                } else Modifier.drawWithContent { drawContent() }
+                            ),
                     ) {
                         item { Spacer(Modifier.height(16.dp)) }
 
@@ -306,60 +330,96 @@ fun ConversationScreen(
                 }
             }
 
-            // Pinned context strip
-            if (pinnedContext != null) {
-                Row(
+            // Bottom area: gradient fade + pinned context + composer + nav bar inset
+            Column(modifier = Modifier.fillMaxWidth()) {
+                // Gradient fade from transparent to scrim
+                if (hasWallpaper) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(24.dp)
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(Color.Transparent, headerScrimColor),
+                                ),
+                            ),
+                    )
+                }
+
+                // Solid scrim area for controls
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(LitterTheme.codeBackground)
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                        .background(headerScrimColor),
                 ) {
-                    pinnedContext.first?.let { todo ->
-                        Text("Plan $todo", color = LitterTheme.accent, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    // Pinned context strip
+                    if (pinnedContext != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(LitterTheme.codeBackground.copy(alpha = if (hasWallpaper) 0.75f else 1f))
+                                .padding(horizontal = 16.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            pinnedContext.first?.let { todo ->
+                                Text("Plan $todo", color = LitterTheme.accent, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            }
+                            pinnedContext.second?.let { diff ->
+                                Text(diff, color = LitterTheme.toolCallFileChange, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            }
+                        }
                     }
-                    pinnedContext.second?.let { diff ->
-                        Text(diff, color = LitterTheme.toolCallFileChange, fontSize = 11.sp, fontWeight = FontWeight.Medium)
-                    }
+
+                    // Composer bar
+                    ComposerBar(
+                        threadKey = threadKey,
+                        contextPercent = thread?.contextPercent ?: 0,
+                        isThinking = isThinking,
+                        rateLimits = remember(snapshot, threadKey) {
+                            snapshot?.servers?.firstOrNull { it.serverId == threadKey.serverId }?.rateLimits
+                        },
+                        onToggleModelSelector = { showModelSelector = !showModelSelector },
+                        onNavigateToSessions = onNavigateToSessions,
+                        onShowDirectoryPicker = onShowDirectoryPicker,
+                        pendingUserInput = pendingInput,
+                    )
+
+                    Spacer(Modifier.navigationBarsPadding())
                 }
             }
-
-            // Composer bar
-            ComposerBar(
-                threadKey = threadKey,
-                contextPercent = thread?.contextPercent ?: 0,
-                isThinking = isThinking,
-                rateLimits = remember(snapshot, threadKey) {
-                    snapshot?.servers?.firstOrNull { it.serverId == threadKey.serverId }?.rateLimits
-                },
-                onToggleModelSelector = { showModelSelector = !showModelSelector },
-                onNavigateToSessions = onNavigateToSessions,
-                onShowDirectoryPicker = onShowDirectoryPicker,
-                pendingUserInput = pendingInput,
-            )
         }
     }
 }
 
 /**
- * Blinking cursor shown at the end of streaming assistant text.
+ * Shimmering "Thinking..." text shown while the assistant is working.
  */
 @Composable
 private fun StreamingCursor() {
-    val transition = rememberInfiniteTransition(label = "cursor")
-    val alpha by transition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0f,
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val shimmerOffset by transition.animateFloat(
+        initialValue = -1f,
+        targetValue = 2f,
         animationSpec = infiniteRepeatable(
-            animation = tween(500),
-            repeatMode = RepeatMode.Reverse,
+            animation = tween(durationMillis = 1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
         ),
-        label = "cursorAlpha",
+        label = "shimmerOffset",
+    )
+    val shimmerBrush = Brush.linearGradient(
+        colors = listOf(
+            LitterTheme.textSecondary.copy(alpha = 0.4f),
+            LitterTheme.accent,
+            LitterTheme.textSecondary.copy(alpha = 0.4f),
+        ),
+        start = Offset(shimmerOffset * 200f, 0f),
+        end = Offset((shimmerOffset + 0.6f) * 200f, 0f),
     )
     Text(
-        text = "▊",
-        color = LitterTheme.accent.copy(alpha = alpha),
+        text = "Thinking...",
         fontSize = 14.sp,
+        fontWeight = FontWeight.Medium,
+        style = TextStyle(brush = shimmerBrush),
     )
 }

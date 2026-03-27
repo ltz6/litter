@@ -22,7 +22,8 @@ use super::actions::{
     thread_info_from_upstream_status_change,
 };
 use super::snapshot::{
-    AppSnapshot, ServerHealthSnapshot, ServerSnapshot, ThreadSnapshot, VoiceSessionSnapshot,
+    AppSnapshot, ServerConnectionProgressSnapshot, ServerHealthSnapshot, ServerSnapshot,
+    ThreadSnapshot, VoiceSessionSnapshot,
 };
 use super::updates::AppUpdate;
 use super::voice::{VoiceDerivedUpdate, VoiceRealtimeState};
@@ -77,6 +78,10 @@ impl AppStoreReducer {
                 .servers
                 .get(&config.server_id)
                 .is_some_and(|existing| existing.has_ipc);
+            let existing_connection_progress = snapshot
+                .servers
+                .get(&config.server_id)
+                .and_then(|existing| existing.connection_progress.clone());
             snapshot.servers.insert(
                 config.server_id.clone(),
                 ServerSnapshot {
@@ -91,6 +96,7 @@ impl AppStoreReducer {
                     requires_openai_auth,
                     rate_limits: existing_rate_limits,
                     available_models: existing_available_models,
+                    connection_progress: existing_connection_progress,
                 },
             );
         }
@@ -354,6 +360,34 @@ impl AppStoreReducer {
         });
     }
 
+    pub fn update_server_health(&self, server_id: &str, health: ServerHealthSnapshot) {
+        {
+            let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
+            if let Some(server) = snapshot.servers.get_mut(server_id) {
+                server.health = health;
+            }
+        }
+        self.emit(AppUpdate::ServerChanged {
+            server_id: server_id.to_string(),
+        });
+    }
+
+    pub fn update_server_connection_progress(
+        &self,
+        server_id: &str,
+        connection_progress: Option<ServerConnectionProgressSnapshot>,
+    ) {
+        {
+            let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
+            if let Some(server) = snapshot.servers.get_mut(server_id) {
+                server.connection_progress = connection_progress;
+            }
+        }
+        self.emit(AppUpdate::ServerChanged {
+            server_id: server_id.to_string(),
+        });
+    }
+
     pub fn apply_ui_event(&self, event: &UiEvent) {
         match event {
             UiEvent::ThreadStarted { key, notification } => {
@@ -534,11 +568,7 @@ impl AppStoreReducer {
                 });
             }
             UiEvent::RealtimeStarted { key, notification } => {
-                eprintln!(
-                    "[codex-mobile-client] reducer RealtimeStarted server_id={} thread_id={} session_id={:?}",
-                    key.server_id, key.thread_id, notification.session_id
-                );
-                self.voice_state.reset_thread(key);
+self.voice_state.reset_thread(key);
                 {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
                     snapshot.voice_session.active_thread = Some(key.clone());
@@ -626,11 +656,7 @@ impl AppStoreReducer {
                 });
             }
             UiEvent::RealtimeError { key, notification } => {
-                eprintln!(
-                    "[codex-mobile-client] reducer RealtimeError server_id={} thread_id={} message={}",
-                    key.server_id, key.thread_id, notification.message
-                );
-                {
+{
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
                     snapshot.voice_session.phase = Some(AppVoiceSessionPhase::Error);
                     snapshot.voice_session.last_error = Some(notification.message.clone());
@@ -646,11 +672,7 @@ impl AppStoreReducer {
                 });
             }
             UiEvent::RealtimeClosed { key, notification } => {
-                eprintln!(
-                    "[codex-mobile-client] reducer RealtimeClosed server_id={} thread_id={} reason={:?}",
-                    key.server_id, key.thread_id, notification.reason
-                );
-                self.voice_state.clear_thread(key);
+self.voice_state.clear_thread(key);
                 {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
                     if let Some(thread) = snapshot.threads.get_mut(key) {
@@ -805,6 +827,24 @@ impl AppStoreReducer {
     }
 
     fn emit(&self, update: AppUpdate) {
+        match &update {
+            AppUpdate::FullResync => tracing::debug!(target: "store", "emit FullResync"),
+            AppUpdate::ServerChanged { server_id } => tracing::debug!(target: "store", server_id, "emit ServerChanged"),
+            AppUpdate::ServerRemoved { server_id } => tracing::debug!(target: "store", server_id, "emit ServerRemoved"),
+            AppUpdate::ThreadChanged { key } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit ThreadChanged"),
+            AppUpdate::ThreadRemoved { key } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit ThreadRemoved"),
+            AppUpdate::ActiveThreadChanged { key } => tracing::debug!(target: "store", thread_id = ?key.as_ref().map(|k| &k.thread_id), "emit ActiveThreadChanged"),
+            AppUpdate::PendingApprovalsChanged { approvals } => tracing::debug!(target: "store", count = approvals.len(), "emit PendingApprovalsChanged"),
+            AppUpdate::PendingUserInputsChanged { requests } => tracing::debug!(target: "store", count = requests.len(), "emit PendingUserInputsChanged"),
+            AppUpdate::VoiceSessionChanged => tracing::debug!(target: "store", "emit VoiceSessionChanged"),
+            AppUpdate::RealtimeTranscriptUpdated { key, .. } => tracing::trace!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeTranscriptUpdated"),
+            AppUpdate::RealtimeHandoffRequested { key, .. } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeHandoffRequested"),
+            AppUpdate::RealtimeSpeechStarted { key } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeSpeechStarted"),
+            AppUpdate::RealtimeStarted { key, .. } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeStarted"),
+            AppUpdate::RealtimeOutputAudioDelta { .. } => {} // too noisy even for trace
+            AppUpdate::RealtimeError { key, .. } => tracing::warn!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeError"),
+            AppUpdate::RealtimeClosed { key, .. } => tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit RealtimeClosed"),
+        }
         let _ = self.updates_tx.send(update);
     }
 }

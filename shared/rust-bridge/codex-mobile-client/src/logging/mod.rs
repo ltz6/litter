@@ -175,7 +175,11 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
         let target = metadata.target();
-        if !target.starts_with("codex") && !target.starts_with("app_server") {
+        if !target.starts_with("codex")
+            && !target.starts_with("app_server")
+            && !target.starts_with("rpc")
+            && !target.starts_with("store")
+        {
             return;
         }
 
@@ -269,6 +273,22 @@ impl LogPipeline {
         let config_path = spool_dir.join("config.json");
         let _ = std::fs::create_dir_all(&pending_dir);
         let config = load_config(&config_path);
+
+        // Debug: write spool init state to a file so we can verify bootstrap ran
+        let debug_path = spool_dir.join("_debug_init.txt");
+        let _ = std::fs::write(
+            &debug_path,
+            format!(
+                "bootstrap at {}\nbase_dir={}\nconfig_path={}\nenabled={}\ncollector_url={:?}\ndevice_id={}\n",
+                now_ms(),
+                base_dir.display(),
+                config_path.display(),
+                config.enabled,
+                config.collector_url,
+                config.device_id,
+            ),
+        );
+
         let (tx, rx) = mpsc::channel(options.queue_capacity);
 
         let pipeline = Arc::new(Self {
@@ -292,6 +312,43 @@ impl LogPipeline {
             let uploader = Arc::clone(&pipeline);
             rt.spawn(async move {
                 uploader.run_uploader().await;
+            });
+
+            // Periodically re-read config from disk so external edits are picked up
+            let config_reloader = Arc::clone(&pipeline);
+            let debug_spool_dir = spool_dir.clone();
+            rt.spawn(async move {
+                let mut tick = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tick += 1;
+                    let fresh = load_config(&config_reloader.config_path);
+                    let current = config_reloader.config.load_full();
+
+                    // Debug: write reload state every tick
+                    let _ = std::fs::write(
+                        debug_spool_dir.join("_debug_reload.txt"),
+                        format!(
+                            "tick={}\nconfig_path={}\nfresh.enabled={}\ncurrent.enabled={}\nfresh.collector_url={:?}\nfresh.device_id={}\n",
+                            tick,
+                            config_reloader.config_path.display(),
+                            fresh.enabled,
+                            current.enabled,
+                            fresh.collector_url,
+                            fresh.device_id,
+                        ),
+                    );
+
+                    if fresh.enabled != current.enabled
+                        || fresh.collector_url != current.collector_url
+                        || fresh.bearer_token != current.bearer_token
+                        || fresh.min_level != current.min_level
+                        || fresh.device_id != current.device_id
+                    {
+                        config_reloader.config.store(Arc::new(fresh));
+                        config_reloader.upload_notify.notify_waiters();
+                    }
+                }
             });
         }
 

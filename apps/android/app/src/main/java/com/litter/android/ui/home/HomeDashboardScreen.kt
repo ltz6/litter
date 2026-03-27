@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Pets
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -89,6 +90,7 @@ fun HomeDashboardScreen(
     var showDirectoryPicker by remember { mutableStateOf(false) }
     var pickerServerId by remember { mutableStateOf<String?>(null) }
     var isCreating by remember { mutableStateOf(false) }
+    var showTipJar by remember { mutableStateOf(false) }
 
     val snap = snapshot
     val servers = remember(snap) {
@@ -128,8 +130,15 @@ fun HomeDashboardScreen(
                 // Animated logo (center)
                 com.litter.android.ui.AnimatedLogo(size = 64.dp)
                 Spacer(Modifier.weight(1f))
-                // Placeholder for symmetry
-                Spacer(Modifier.width(32.dp))
+                // Tip jar badge
+                IconButton(onClick = { showTipJar = true }, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Default.Pets,
+                        contentDescription = "Tip the Kitty",
+                        tint = LitterTheme.textMuted,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
             Spacer(Modifier.height(16.dp))
         }
@@ -362,6 +371,16 @@ fun HomeDashboardScreen(
                 },
                 onDismiss = { showDirectoryPicker = false },
             )
+        }
+    }
+
+    if (showTipJar) {
+        ModalBottomSheet(
+            onDismissRequest = { showTipJar = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = LitterTheme.background,
+        ) {
+            com.litter.android.ui.settings.TipJarScreen(onBack = { showTipJar = false })
         }
     }
 }

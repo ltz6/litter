@@ -7,8 +7,45 @@ use crate::uniffi_shared::{
     AppVoiceTranscriptUpdate,
 };
 
-use super::snapshot::{AppSnapshot, ServerHealthSnapshot};
+use super::snapshot::{
+    AppSnapshot, ServerConnectionProgressSnapshot, ServerConnectionStepKind,
+    ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot,
+};
 use super::updates::AppUpdate;
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AppServerConnectionStepKind {
+    ConnectingToSsh,
+    FindingCodex,
+    InstallingCodex,
+    StartingAppServer,
+    OpeningTunnel,
+    Connected,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AppServerConnectionStepState {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    AwaitingUserInput,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AppServerConnectionStep {
+    pub kind: AppServerConnectionStepKind,
+    pub state: AppServerConnectionStepState,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AppServerConnectionProgress {
+    pub steps: Vec<AppServerConnectionStep>,
+    pub pending_install: bool,
+    pub terminal_message: Option<String>,
+}
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AppServerSnapshot {
@@ -23,6 +60,7 @@ pub struct AppServerSnapshot {
     pub requires_openai_auth: bool,
     pub rate_limits: Option<crate::types::generated::RateLimitSnapshot>,
     pub available_models: Option<Vec<crate::types::generated::Model>>,
+    pub connection_progress: Option<AppServerConnectionProgress>,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -216,6 +254,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
                 requires_openai_auth: server.requires_openai_auth,
                 rate_limits: server.rate_limits,
                 available_models: server.available_models,
+                connection_progress: server.connection_progress.map(Into::into),
             })
             .collect::<Vec<_>>();
         servers.sort_by(|lhs, rhs| lhs.server_id.cmp(&rhs.server_id));
@@ -255,6 +294,52 @@ impl From<ServerHealthSnapshot> for AppServerHealth {
             ServerHealthSnapshot::Connected => Self::Connected,
             ServerHealthSnapshot::Unresponsive => Self::Unresponsive,
             ServerHealthSnapshot::Unknown(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<ServerConnectionStepKind> for AppServerConnectionStepKind {
+    fn from(value: ServerConnectionStepKind) -> Self {
+        match value {
+            ServerConnectionStepKind::ConnectingToSsh => Self::ConnectingToSsh,
+            ServerConnectionStepKind::FindingCodex => Self::FindingCodex,
+            ServerConnectionStepKind::InstallingCodex => Self::InstallingCodex,
+            ServerConnectionStepKind::StartingAppServer => Self::StartingAppServer,
+            ServerConnectionStepKind::OpeningTunnel => Self::OpeningTunnel,
+            ServerConnectionStepKind::Connected => Self::Connected,
+        }
+    }
+}
+
+impl From<ServerConnectionStepState> for AppServerConnectionStepState {
+    fn from(value: ServerConnectionStepState) -> Self {
+        match value {
+            ServerConnectionStepState::Pending => Self::Pending,
+            ServerConnectionStepState::InProgress => Self::InProgress,
+            ServerConnectionStepState::Completed => Self::Completed,
+            ServerConnectionStepState::Failed => Self::Failed,
+            ServerConnectionStepState::AwaitingUserInput => Self::AwaitingUserInput,
+            ServerConnectionStepState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+impl From<ServerConnectionStepSnapshot> for AppServerConnectionStep {
+    fn from(value: ServerConnectionStepSnapshot) -> Self {
+        Self {
+            kind: value.kind.into(),
+            state: value.state.into(),
+            detail: value.detail,
+        }
+    }
+}
+
+impl From<ServerConnectionProgressSnapshot> for AppServerConnectionProgress {
+    fn from(value: ServerConnectionProgressSnapshot) -> Self {
+        Self {
+            steps: value.steps.into_iter().map(Into::into).collect(),
+            pending_install: value.pending_install,
+            terminal_message: value.terminal_message,
         }
     }
 }

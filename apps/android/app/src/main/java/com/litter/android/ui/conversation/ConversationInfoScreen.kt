@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,8 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -76,7 +75,8 @@ import java.util.Locale
 
 @Composable
 fun ConversationInfoScreen(
-    threadKey: ThreadKey,
+    threadKey: ThreadKey? = null,
+    serverId: String? = null,
     onBack: () -> Unit,
     onChangeWallpaper: () -> Unit,
 ) {
@@ -84,14 +84,18 @@ fun ConversationInfoScreen(
     val snapshot by appModel.snapshot.collectAsState()
     val scope = rememberCoroutineScope()
 
+    val isServerOnly = threadKey == null
+    val resolvedServerId = threadKey?.serverId ?: serverId
+
     val thread = remember(snapshot, threadKey) {
-        snapshot?.threads?.find { it.key == threadKey }
+        if (threadKey == null) null
+        else snapshot?.threads?.find { it.key == threadKey }
     }
-    val server = remember(snapshot, threadKey) {
-        snapshot?.servers?.find { it.serverId == threadKey.serverId }
+    val server = remember(snapshot, resolvedServerId) {
+        snapshot?.servers?.find { it.serverId == resolvedServerId }
     }
-    val serverThreads = remember(snapshot, threadKey) {
-        snapshot?.threads?.filter { it.key.serverId == threadKey.serverId } ?: emptyList()
+    val serverThreads = remember(snapshot, resolvedServerId) {
+        snapshot?.threads?.filter { it.key.serverId == resolvedServerId } ?: emptyList()
     }
 
     val stats = remember(thread) {
@@ -126,7 +130,7 @@ fun ConversationInfoScreen(
             }
             Spacer(Modifier.width(8.dp))
             Text(
-                text = "Conversation Info",
+                text = if (isServerOnly) "Server Info" else "Conversation Info",
                 color = LitterTheme.textPrimary,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -141,20 +145,63 @@ fun ConversationInfoScreen(
         ) {
             item { Spacer(Modifier.height(8.dp)) }
 
-            // Section A: Thread Details
-            item {
-                ThreadDetailsSection(thread = thread)
+            // Section A: Thread Details (thread mode only)
+            if (!isServerOnly) {
+                item {
+                    ThreadDetailsSection(thread = thread)
+                }
             }
 
-            // Context window bar
-            if (thread != null) {
+            // Action buttons row
+            if (!isServerOnly) {
+                item {
+                    ActionButtonsRow(
+                        onChangeWallpaper = onChangeWallpaper,
+                        onFork = {
+                            scope.launch {
+                                val t = thread ?: return@launch
+                                val tk = threadKey ?: return@launch
+                                val config = AppThreadLaunchConfig(model = t.model)
+                                val cwd = t.info.cwd ?: "~"
+                                try {
+                                    val newKey = appModel.store.forkThreadFromMessage(
+                                        tk, 0u, config.toThreadForkParams(tk.threadId, cwd),
+                                    )
+                                    appModel.store.setActiveThread(newKey)
+                                    appModel.refreshSnapshot()
+                                    onBack()
+                                } catch (_: Exception) {}
+                            }
+                        },
+                    )
+                }
+            }
+
+            // Server-only: show just the Wallpaper button
+            if (isServerOnly) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                    ) {
+                        ActionCircleButton(
+                            icon = Icons.Default.Image,
+                            label = "Wallpaper",
+                            onClick = onChangeWallpaper,
+                        )
+                    }
+                }
+            }
+
+            // Context window bar (thread mode only)
+            if (!isServerOnly && thread != null) {
                 item {
                     ContextWindowBar(thread = thread)
                 }
             }
 
-            // Per-conversation stats
-            if (stats != null) {
+            // Per-conversation stats (thread mode only)
+            if (!isServerOnly && stats != null) {
                 item {
                     StatsGrid(stats = stats)
                 }
@@ -196,30 +243,6 @@ fun ConversationInfoScreen(
                 item {
                     ServerInfoSection(server = server)
                 }
-            }
-
-            // Section D: Actions
-            item {
-                ActionsSection(
-                    thread = thread,
-                    threadKey = threadKey,
-                    onChangeWallpaper = onChangeWallpaper,
-                    onFork = {
-                        scope.launch {
-                            val t = thread ?: return@launch
-                            val config = AppThreadLaunchConfig(model = t.model)
-                            val cwd = t.info.cwd ?: "~"
-                            try {
-                                val newKey = appModel.store.forkThreadFromMessage(
-                                    threadKey, 0u, config.toThreadForkParams(threadKey.threadId, cwd),
-                                )
-                                appModel.store.setActiveThread(newKey)
-                                appModel.refreshSnapshot()
-                                onBack()
-                            } catch (_: Exception) {}
-                        }
-                    },
-                )
             }
 
             item { Spacer(Modifier.height(32.dp)) }
@@ -796,54 +819,57 @@ private fun InfoRow(label: String, value: String) {
 }
 
 @Composable
-private fun ActionsSection(
-    thread: AppThreadSnapshot?,
-    threadKey: ThreadKey,
+private fun ActionButtonsRow(
     onChangeWallpaper: () -> Unit,
     onFork: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(LitterTheme.surface, RoundedCornerShape(12.dp))
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
-        SectionHeader("Actions")
-        Spacer(Modifier.height(4.dp))
-
-        ActionButton(
-            text = "Change Wallpaper",
+        ActionCircleButton(
             icon = Icons.Default.Image,
+            label = "Wallpaper",
             onClick = onChangeWallpaper,
         )
-
-        ActionButton(
-            text = "Fork Conversation",
+        ActionCircleButton(
             icon = Icons.Default.ContentCopy,
+            label = "Fork",
             onClick = onFork,
         )
     }
 }
 
 @Composable
-private fun ActionButton(
-    text: String,
+private fun ActionCircleButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
     onClick: () -> Unit,
 ) {
-    Button(
-        onClick = onClick,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = LitterTheme.codeBackground,
-            contentColor = LitterTheme.textPrimary,
-        ),
-        shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.fillMaxWidth(),
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.clickable(onClick = onClick).padding(8.dp),
     ) {
-        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp))
-        Spacer(Modifier.width(8.dp))
-        Text(text = text, fontSize = 13.sp)
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(52.dp)
+                .background(LitterTheme.surface, RoundedCornerShape(14.dp)),
+        ) {
+            Icon(
+                icon,
+                contentDescription = label,
+                tint = LitterTheme.accent,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = label,
+            color = LitterTheme.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+        )
     }
 }
 

@@ -6,7 +6,7 @@ enum LLog {
     private static let subsystemRoot = Bundle.main.bundleIdentifier ?? "com.sigkitten.litter"
     private static let logs = Logs()
     private static let queue = DispatchQueue(label: "com.sigkitten.litter.logging", qos: .utility)
-    private static var bootstrapped = false
+    private nonisolated(unsafe) static var bootstrapped = false
 
     static func bootstrap() {
         guard !bootstrapped else { return }

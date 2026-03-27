@@ -7,9 +7,19 @@ struct ConversationInfoView: View {
     @Environment(ThemeManager.self) private var themeManager
     @Environment(\.dismiss) private var dismiss
 
-    let threadKey: ThreadKey
+    /// When nil, the screen shows server-only info (no session-specific sections).
+    let threadKey: ThreadKey?
+    /// Server ID used when threadKey is nil (server-only mode).
+    let serverId: String?
     var onOpenWallpaper: (() -> Void)?
     var onOpenConversation: ((ThreadKey) -> Void)?
+
+    /// Whether we're in server-only mode (no specific thread).
+    private var isServerOnly: Bool { threadKey == nil }
+
+    private var resolvedServerId: String? {
+        threadKey?.serverId ?? serverId
+    }
 
     @State private var renameText = ""
     @State private var isRenaming = false
@@ -17,116 +27,200 @@ struct ConversationInfoView: View {
     @State private var serverUsage: ServerUsageData = .init()
 
     private var thread: AppThreadSnapshot? {
-        appModel.snapshot?.threads.first { $0.key == threadKey }
+        guard let threadKey else { return nil }
+        return appModel.snapshot?.threads.first { $0.key == threadKey }
     }
 
     private var server: AppServerSnapshot? {
-        guard let serverId = thread?.key.serverId ?? Optional(threadKey.serverId) else { return nil }
-        return appModel.snapshot?.servers.first { $0.serverId == serverId }
+        guard let sid = resolvedServerId else { return nil }
+        return appModel.snapshot?.servers.first { $0.serverId == sid }
     }
 
     private var allServerThreads: [AppThreadSnapshot] {
-        guard let snapshot = appModel.snapshot else { return [] }
-        return snapshot.threads.filter { $0.key.serverId == threadKey.serverId }
+        guard let snapshot = appModel.snapshot, let sid = resolvedServerId else { return [] }
+        return snapshot.threads.filter { $0.key.serverId == sid }
     }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 24) {
-                threadDetailsSection
-                contextWindowSection
-                conversationStatsSection
-                serverChartsSection
-                serverInfoSection
-                actionsSection
+            VStack(spacing: 0) {
+                if !isServerOnly {
+                    // Hero header
+                    heroSection
+                        .padding(.bottom, 20)
+
+                    // Action buttons row (Telegram-style)
+                    actionButtonsRow
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 24)
+
+                    // Thin divider
+                    Rectangle()
+                        .fill(LitterTheme.separator.opacity(0.4))
+                        .frame(height: 0.5)
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 20)
+                }
+
+                // Content sections
+                VStack(spacing: 16) {
+                    if isServerOnly {
+                        // Server-only mode: just wallpaper button at top
+                        serverOnlyActionRow
+                            .padding(.top, 8)
+                    }
+                    if !isServerOnly {
+                        contextWindowSection
+                        conversationStatsSection
+                    }
+                    serverChartsSection
+                    serverInfoSection
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 40)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, 40)
         }
-        .background(LitterTheme.background)
+        .background(LitterTheme.backgroundGradient)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Text("Conversation Info")
+                Text(isServerOnly ? "Server Info" : "Info")
                     .litterFont(size: 16, weight: .semibold)
                     .foregroundStyle(LitterTheme.textPrimary)
             }
         }
         .onAppear { computeData() }
         .onChange(of: thread?.hydratedConversationItems.count) { computeData() }
+        .alert("Rename Thread", isPresented: $isRenaming) {
+            TextField("Thread name", text: $renameText)
+            Button("Save") { saveRename() }
+            Button("Cancel", role: .cancel) { }
+        }
     }
 
-    // MARK: - Section A: Thread Details
+    // MARK: - Server-Only Action Row
 
-    private var threadDetailsSection: some View {
+    private var serverOnlyActionRow: some View {
+        HStack(spacing: 0) {
+            actionCircle(icon: "photo.on.rectangle", label: "Wallpaper") {
+                onOpenWallpaper?()
+            }
+        }
+    }
+
+    // MARK: - Hero Section
+
+    private var heroSection: some View {
         VStack(spacing: 12) {
-            // Title
-            Text(thread?.info.title ?? "Untitled")
-                .litterFont(size: 24, weight: .bold)
-                .foregroundStyle(LitterTheme.textPrimary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // Status dot + title
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 10, height: 10)
+                Text(thread?.info.title ?? "Untitled")
+                    .litterFont(size: 22, weight: .bold)
+                    .foregroundStyle(LitterTheme.textPrimary)
+                    .lineLimit(2)
+            }
 
-            // Model + reasoning
+            // Model + reasoning badges
             HStack(spacing: 8) {
                 if let model = thread?.model ?? thread?.info.model {
                     Text(model)
                         .litterFont(size: 13, weight: .medium)
                         .foregroundStyle(LitterTheme.accent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .modifier(GlassRectModifier(cornerRadius: 6))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .modifier(GlassRectModifier(cornerRadius: 8))
                 }
                 if let effort = thread?.reasoningEffort {
-                    Text("reasoning: \(effort)")
+                    Text(effort)
                         .litterFont(size: 12, weight: .regular)
                         .foregroundStyle(LitterTheme.textSecondary)
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .modifier(GlassRectModifier(cornerRadius: 6))
+                        .padding(.vertical, 5)
+                        .modifier(GlassRectModifier(cornerRadius: 8))
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            // Working directory
-            if let cwd = thread?.info.cwd {
-                HStack(spacing: 6) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 12))
-                        .foregroundStyle(LitterTheme.textMuted)
-                    Text(cwd)
-                        .litterFont(size: 12)
-                        .foregroundStyle(LitterTheme.textSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+            // Metadata row: cwd + timestamps
+            VStack(spacing: 6) {
+                if let cwd = thread?.info.cwd {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(LitterTheme.textMuted)
+                        Text(abbreviatePath(cwd))
+                            .litterFont(size: 12)
+                            .foregroundStyle(LitterTheme.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 12) {
+                    if let created = thread?.info.createdAt {
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock")
+                                .font(.system(size: 9))
+                                .foregroundStyle(LitterTheme.textMuted)
+                            Text(relativeDate(created))
+                                .litterFont(size: 11)
+                                .foregroundStyle(LitterTheme.textMuted)
+                        }
+                    }
+                    if let updated = thread?.info.updatedAt {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9))
+                                .foregroundStyle(LitterTheme.textMuted)
+                            Text(relativeDate(updated))
+                                .litterFont(size: 11)
+                                .foregroundStyle(LitterTheme.textMuted)
+                        }
+                    }
+                }
             }
+        }
+        .padding(.top, 16)
+    }
 
-            // Timestamps
-            HStack(spacing: 16) {
-                if let created = thread?.info.createdAt {
-                    timestampLabel("Created", timestamp: created)
-                }
-                if let updated = thread?.info.updatedAt {
-                    timestampLabel("Updated", timestamp: updated)
-                }
+    private func abbreviatePath(_ path: String) -> String {
+        path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+    }
+
+    // MARK: - Action Buttons Row (Telegram-style)
+
+    private var actionButtonsRow: some View {
+        HStack(spacing: 0) {
+            actionCircle(icon: "photo.on.rectangle", label: "Wallpaper") {
+                onOpenWallpaper?()
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            actionCircle(icon: "arrow.branch", label: "Fork") {
+                Task { await forkConversation() }
+            }
+            actionCircle(icon: "pencil", label: "Rename") {
+                renameText = thread?.info.title ?? ""
+                isRenaming = true
+            }
+        }
+    }
 
-            // Status
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                Text(statusLabel)
-                    .litterFont(size: 12)
+    private func actionCircle(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(LitterTheme.accent)
+                    .frame(width: 52, height: 52)
+                    .modifier(GlassRectModifier(cornerRadius: 14))
+                Text(label)
+                    .litterFont(size: 11, weight: .medium)
                     .foregroundStyle(LitterTheme.textSecondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(16)
-        .modifier(GlassRectModifier(cornerRadius: 12))
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
     }
 
     private func timestampLabel(_ label: String, timestamp: Int64) -> some View {
@@ -134,7 +228,7 @@ struct ConversationInfoView: View {
             Text(label)
                 .litterFont(size: 10, weight: .medium)
                 .foregroundStyle(LitterTheme.textMuted)
-            Text(relativeTimestamp(timestamp))
+            Text(relativeDate(timestamp))
                 .litterFont(size: 12)
                 .foregroundStyle(LitterTheme.textSecondary)
         }
@@ -575,88 +669,12 @@ struct ConversationInfoView: View {
         }
     }
 
-    // MARK: - Section D: Actions
-
-    private var actionsSection: some View {
-        VStack(spacing: 0) {
-            actionButton(icon: "photo", title: "Change Wallpaper") {
-                onOpenWallpaper?()
-            }
-
-            Divider().overlay(LitterTheme.separator)
-
-            actionButton(icon: "arrow.branch", title: "Fork Conversation") {
-                Task { await forkConversation() }
-            }
-
-            Divider().overlay(LitterTheme.separator)
-
-            renameRow
-        }
-        .modifier(GlassRectModifier(cornerRadius: 12))
-    }
-
-    private func actionButton(icon: String, title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .font(.system(size: 14))
-                    .foregroundStyle(LitterTheme.accent)
-                    .frame(width: 24)
-                Text(title)
-                    .litterFont(size: 14)
-                    .foregroundStyle(LitterTheme.textPrimary)
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12))
-                    .foregroundStyle(LitterTheme.textMuted)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-        }
-    }
-
-    private var renameRow: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "pencil")
-                .font(.system(size: 14))
-                .foregroundStyle(LitterTheme.accent)
-                .frame(width: 24)
-
-            if isRenaming {
-                TextField("Thread name", text: $renameText)
-                    .litterFont(size: 14)
-                    .foregroundStyle(LitterTheme.textPrimary)
-                    .textFieldStyle(.plain)
-                    .onSubmit { saveRename() }
-
-                Button("Save") { saveRename() }
-                    .litterFont(size: 13, weight: .semibold)
-                    .foregroundStyle(LitterTheme.accent)
-            } else {
-                Button {
-                    renameText = thread?.info.title ?? ""
-                    isRenaming = true
-                } label: {
-                    HStack {
-                        Text("Rename Thread")
-                            .litterFont(size: 14)
-                            .foregroundStyle(LitterTheme.textPrimary)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 12))
-                            .foregroundStyle(LitterTheme.textMuted)
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-    }
+    // (Actions are now in the hero section's actionButtonsRow)
 
     // MARK: - Actions
 
     private func forkConversation() async {
+        guard let threadKey else { return }
         do {
             let response = try await appModel.rpc.threadFork(
                 serverId: threadKey.serverId,
@@ -687,6 +705,7 @@ struct ConversationInfoView: View {
     }
 
     private func saveRename() {
+        guard let threadKey else { return }
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
         isRenaming = false
@@ -704,9 +723,9 @@ struct ConversationInfoView: View {
     }
 
     private func computeData() {
-        guard let thread else { return }
-        stats = ConversationStatistics.compute(from: thread.hydratedConversationItems)
-
+        if let thread {
+            stats = ConversationStatistics.compute(from: thread.hydratedConversationItems)
+        }
         if let server {
             serverUsage = ServerUsageData.compute(from: allServerThreads, server: server)
         }

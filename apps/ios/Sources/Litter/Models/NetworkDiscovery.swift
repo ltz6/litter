@@ -97,6 +97,10 @@ final class NetworkDiscovery {
     var isScanning = false
     var isInitialLoad = false
     var tailscaleDiscoveryNotice: String?
+    /// Overall scan progress from 0.0 to 1.0.
+    var scanProgress: Float = 0
+    /// Human-readable label for the current scan phase.
+    var scanProgressLabel: String?
 
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
@@ -112,11 +116,16 @@ final class NetworkDiscovery {
         let name: String
         let hostname: String
         let port: UInt16?
+        let codexPorts: [UInt16]?
         let sshPort: UInt16?
         let source: ServerSource
         let hasCodexServer: Bool
         let wakeMAC: String?
+        let preferredConnectionMode: PreferredConnectionMode?
+        let preferredCodexPort: UInt16?
         let lastSeenAt: TimeInterval
+        let os: String?
+        let sshBanner: String?
     }
 
     func startScanning() {
@@ -131,6 +140,8 @@ final class NetworkDiscovery {
         servers = reconcileNetworkServers(cachedNetworkServers + savedNetworkServers + retainedNetworkServers)
         isScanning = true
         isInitialLoad = true
+        scanProgress = 0
+        scanProgressLabel = "Discovering services…"
         servers.append(DiscoveredServer(
             id: "local",
             name: UIDevice.current.name,
@@ -195,6 +206,12 @@ final class NetworkDiscovery {
         let localIPv4 = Self.localIPv4Address()?.0
         guard !Task.isCancelled else { return }
 
+        await MainActor.run { [weak self] in
+            guard let self, self.activeScanID == scanID else { return }
+            self.scanProgress = 0.02
+            self.scanProgressLabel = "Scanning network…"
+        }
+
         let subscription = store.scanServersWithMdnsContextProgressive(
             seeds: seeds.map {
                 FfiMdnsSeed(name: $0.name, host: $0.host, port: $0.port, serviceType: $0.serviceType)
@@ -210,6 +227,8 @@ final class NetworkDiscovery {
                     guard let self, self.activeScanID == scanID else { return }
                     self.isInitialLoad = false
                     self.applyRustDiscoveryResults(update.servers)
+                    self.scanProgress = update.progress
+                    self.scanProgressLabel = update.progressLabel
                 }
                 if update.kind == .scanComplete {
                     break
@@ -262,12 +281,17 @@ final class NetworkDiscovery {
             name: name.isEmpty ? host : name,
             hostname: host,
             port: rust.codexPort,
+            codexPorts: rust.codexPorts,
             sshPort: rust.sshPort,
             source: ServerSource(rust.source),
-            hasCodexServer: rust.codexPort != nil,
+            hasCodexServer: rust.codexPort != nil || !rust.codexPorts.isEmpty,
             wakeMAC: existing?.wakeMAC,
-            sshPortForwardingEnabled: existing?.sshPortForwardingEnabled ?? false,
-            websocketURL: existing?.websocketURL
+            sshPortForwardingEnabled: false,
+            websocketURL: existing?.websocketURL,
+            preferredConnectionMode: existing?.preferredConnectionMode,
+            preferredCodexPort: existing?.preferredCodexPort,
+            os: rust.sshBanner != nil ? rust.os : (rust.os ?? existing?.os),
+            sshBanner: rust.sshBanner ?? existing?.sshBanner
         )
     }
 
@@ -316,6 +340,7 @@ final class NetworkDiscovery {
             host: server.hostname,
             port: server.port ?? server.resolvedSSHPort,
             codexPort: server.port,
+            codexPorts: server.codexPorts,
             sshPort: server.sshPort,
             source: {
                 switch server.source {
@@ -331,7 +356,9 @@ final class NetworkDiscovery {
                     return .manual
                 }
             }(),
-            reachable: server.hasCodexServer || server.sshPort != nil
+            reachable: server.hasCodexServer || server.sshPort != nil,
+            os: server.os,
+            sshBanner: server.sshBanner
         )
     }
 
@@ -357,10 +384,15 @@ final class NetworkDiscovery {
                 name: entry.name,
                 hostname: entry.hostname,
                 port: entry.port,
+                codexPorts: entry.codexPorts ?? (entry.port.map { [ $0 ] } ?? []),
                 sshPort: entry.sshPort,
                 source: entry.source,
                 hasCodexServer: entry.hasCodexServer,
-                wakeMAC: entry.wakeMAC
+                wakeMAC: entry.wakeMAC,
+                preferredConnectionMode: entry.preferredConnectionMode,
+                preferredCodexPort: entry.preferredCodexPort,
+                os: entry.os,
+                sshBanner: entry.sshBanner
             )
             loaded.append(server)
             pruned.append(entry)
@@ -385,11 +417,16 @@ final class NetworkDiscovery {
                     name: server.name,
                     hostname: server.hostname,
                     port: server.port,
+                    codexPorts: server.codexPorts,
                     sshPort: server.sshPort,
                     source: server.source,
                     hasCodexServer: server.hasCodexServer,
                     wakeMAC: server.wakeMAC,
-                    lastSeenAt: lastSeen.timeIntervalSince1970
+                    preferredConnectionMode: server.preferredConnectionMode,
+                    preferredCodexPort: server.preferredCodexPort,
+                    lastSeenAt: lastSeen.timeIntervalSince1970,
+                    os: server.os,
+                    sshBanner: server.sshBanner
                 )
             }
         persistCachedNetworkServers(cached)

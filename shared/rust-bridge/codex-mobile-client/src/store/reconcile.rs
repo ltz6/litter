@@ -27,11 +27,7 @@ impl MobileClient {
                 wire_method,
                 server_id
             );
-            eprintln!(
-                "[codex-mobile-client] reconcile_public_rpc wire_method={} server_id={}",
-                wire_method, server_id
-            );
-        }
+}
         match wire_method {
             "thread/start" => {
                 let response = downcast_public_rpc_response::<generated::ThreadStartResponse>(
@@ -367,7 +363,9 @@ mod tests {
                 display_name: "Server".to_string(),
                 host: "localhost".to_string(),
                 port: 8390,
+                websocket_url: None,
                 is_local: true,
+                tls: false,
             },
             ServerHealthSnapshot::Connected,
         );
@@ -419,7 +417,9 @@ mod tests {
                 display_name: "Server".to_string(),
                 host: "localhost".to_string(),
                 port: 8390,
+                websocket_url: None,
                 is_local: true,
+                tls: false,
             },
             ServerHealthSnapshot::Connected,
         );

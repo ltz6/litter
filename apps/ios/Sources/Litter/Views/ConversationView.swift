@@ -2403,25 +2403,28 @@ struct PendingUserInputPromptView: View {
 }
 
 struct TypingIndicator: View {
-    @State private var phase = 0
+    @State private var shimmerOffset: CGFloat = -1
+
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(Array(0..<3), id: \.self) { i in
-                Circle()
-                    .fill(LitterTheme.accent)
-                    .frame(width: 6, height: 6)
-                    .opacity(phase == i ? 1 : 0.3)
-            }
-        }
-        .padding(.leading, 12)
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(400))
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    phase = (phase + 1) % 3
+        Text("Thinking...")
+            .litterFont(.body, weight: .medium)
+            .foregroundStyle(
+                LinearGradient(
+                    colors: [
+                        LitterTheme.textSecondary.opacity(0.4),
+                        LitterTheme.accent,
+                        LitterTheme.textSecondary.opacity(0.4),
+                    ],
+                    startPoint: UnitPoint(x: shimmerOffset - 0.3, y: 0.5),
+                    endPoint: UnitPoint(x: shimmerOffset + 0.3, y: 0.5)
+                )
+            )
+            .padding(.leading, 12)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false)) {
+                    shimmerOffset = 2
                 }
             }
-        }
     }
 }
 

@@ -68,37 +68,53 @@ pub struct FfiDiscoveredServer {
     pub host: String,
     pub port: u16,
     pub codex_port: Option<u16>,
+    pub codex_ports: Vec<u16>,
     pub ssh_port: Option<u16>,
     pub source: FfiDiscoverySource,
     pub reachable: bool,
+    pub os: Option<String>,
+    pub ssh_banner: Option<String>,
 }
 
 impl From<DiscoveredServer> for FfiDiscoveredServer {
     fn from(value: DiscoveredServer) -> Self {
+        let os = value.metadata.get("os").cloned();
+        let ssh_banner = value.metadata.get("ssh_banner").cloned();
         Self {
             id: value.id,
             display_name: value.display_name,
             host: value.host,
             port: value.port,
             codex_port: value.codex_port,
+            codex_ports: value.codex_ports,
             ssh_port: value.ssh_port,
             source: value.source.into(),
             reachable: value.reachable,
+            os,
+            ssh_banner,
         }
     }
 }
 
 impl From<FfiDiscoveredServer> for DiscoveredServer {
     fn from(value: FfiDiscoveredServer) -> Self {
+        let mut metadata = HashMap::new();
+        if let Some(os) = value.os {
+            metadata.insert("os".to_string(), os);
+        }
+        if let Some(banner) = value.ssh_banner {
+            metadata.insert("ssh_banner".to_string(), banner);
+        }
         Self {
             id: value.id,
             display_name: value.display_name,
             host: value.host,
             port: value.port,
             codex_port: value.codex_port,
+            codex_ports: value.codex_ports,
             ssh_port: value.ssh_port,
             source: value.source.into(),
-            metadata: HashMap::new(),
+            metadata,
             last_seen: Instant::now(),
             reachable: value.reachable,
         }
@@ -125,6 +141,10 @@ pub struct FfiProgressiveDiscoveryUpdate {
     pub kind: FfiProgressiveDiscoveryUpdateKind,
     pub source: Option<FfiDiscoverySource>,
     pub servers: Vec<FfiDiscoveredServer>,
+    /// Overall scan progress from 0.0 to 1.0.
+    pub progress: f32,
+    /// Human-readable label for the phase that just completed.
+    pub progress_label: Option<String>,
 }
 
 impl From<ProgressiveDiscoveryUpdate> for FfiProgressiveDiscoveryUpdate {
@@ -133,6 +153,8 @@ impl From<ProgressiveDiscoveryUpdate> for FfiProgressiveDiscoveryUpdate {
             kind: value.kind.into(),
             source: value.source.map(Into::into),
             servers: value.servers.into_iter().map(Into::into).collect(),
+            progress: value.progress,
+            progress_label: value.progress_label,
         }
     }
 }

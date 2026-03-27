@@ -56,6 +56,18 @@ import androidx.compose.ui.unit.sp
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.LitterThemeIndexEntry
 import com.litter.android.ui.LitterThemeManager
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import com.litter.android.ui.VideoWallpaperProcessor
 import com.litter.android.ui.WallpaperConfig
 import com.litter.android.ui.WallpaperManager
 import com.litter.android.ui.WallpaperScope
@@ -66,20 +78,35 @@ import uniffi.codex_mobile_client.ThreadKey
 
 @Composable
 fun WallpaperSelectionScreen(
-    threadKey: ThreadKey,
+    threadKey: ThreadKey? = null,
+    serverId: String? = null,
     onBack: () -> Unit,
     onAdjust: () -> Unit,
 ) {
+    val resolvedServerId = threadKey?.serverId ?: serverId
+    val wallpaperScope: WallpaperScope? = if (threadKey != null) WallpaperScope.Thread(threadKey)
+        else resolvedServerId?.let { WallpaperScope.Server(it) }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val themes = LitterThemeManager.themeIndex
-    var previewConfig by remember { mutableStateOf(WallpaperManager.resolvedConfig(threadKey)) }
+    var previewConfig by remember {
+        mutableStateOf(
+            if (threadKey != null) WallpaperManager.resolvedConfig(threadKey)
+            else resolvedServerId?.let { WallpaperManager.resolvedConfigForServer(it) }
+        )
+    }
+    var isProcessingVideo by remember { mutableStateOf(false) }
+    var videoUrlText by remember { mutableStateOf("") }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
     ) { uri: Uri? ->
         if (uri != null) {
+            val ws = wallpaperScope ?: return@rememberLauncherForActivityResult
             scope.launch {
-                val success = WallpaperManager.setCustomImageFromUri(uri, WallpaperScope.Thread(threadKey))
+                val success = WallpaperManager.setCustomImageFromUri(
+                    uri, ws,
+                )
                 if (success) {
                     previewConfig = WallpaperConfig(type = WallpaperType.CUSTOM_IMAGE)
                     onAdjust()
@@ -88,10 +115,31 @@ fun WallpaperSelectionScreen(
         }
     }
 
+    val videoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val ws = wallpaperScope ?: return@rememberLauncherForActivityResult
+            isProcessingVideo = true
+            scope.launch {
+                val result = VideoWallpaperProcessor.processLocalVideo(context, uri, ws)
+                if (result != null) {
+                    val config = WallpaperConfig(type = WallpaperType.CUSTOM_VIDEO, videoDuration = result.durationSeconds)
+                    WallpaperManager.setWallpaper(config, ws)
+                    previewConfig = config
+                    isProcessingVideo = false
+                    onAdjust()
+                } else {
+                    isProcessingVideo = false
+                }
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(LitterTheme.background)) {
         // Full-screen preview
         val previewBitmap = remember(previewConfig) {
-            previewConfig?.let { WallpaperManager.resolvedBitmapForConfig(it, threadKey) }
+            previewConfig?.let { WallpaperManager.resolvedBitmapForConfig(it, threadKey = threadKey, serverId = resolvedServerId) }
         }
         if (previewBitmap != null) {
             Image(
@@ -186,7 +234,7 @@ fun WallpaperSelectionScreen(
                         isNone = true,
                         onClick = {
                             previewConfig = null
-                            WallpaperManager.clearWallpaper(WallpaperScope.Thread(threadKey))
+                            wallpaperScope?.let { WallpaperManager.clearWallpaper(it) }
                         },
                     )
                 }
@@ -206,7 +254,7 @@ fun WallpaperSelectionScreen(
                             )
                             previewConfig = config
                             // Temporarily set so preview updates
-                            WallpaperManager.setWallpaper(config, WallpaperScope.Thread(threadKey))
+                            wallpaperScope?.let { WallpaperManager.setWallpaper(config, it) }
                             onAdjust()
                         },
                     )
@@ -244,14 +292,13 @@ fun WallpaperSelectionScreen(
 
                 TextButton(
                     onClick = {
-                        // Set a solid color wallpaper with the current theme accent
                         val hex = String.format("#%06X", 0xFFFFFF and LitterTheme.accent.toArgb())
                         val config = WallpaperConfig(
                             type = WallpaperType.SOLID_COLOR,
                             colorHex = hex,
                         )
                         previewConfig = config
-                        WallpaperManager.setWallpaper(config, WallpaperScope.Thread(threadKey))
+                        wallpaperScope?.let { WallpaperManager.setWallpaper(config, it) }
                         onAdjust()
                     },
                     modifier = Modifier.weight(1f),
@@ -268,6 +315,90 @@ fun WallpaperSelectionScreen(
                         color = LitterTheme.accent,
                         fontSize = 13.sp,
                     )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider(color = LitterTheme.border.copy(alpha = 0.3f))
+            Spacer(Modifier.height(8.dp))
+
+            // Video picker
+            TextButton(
+                onClick = {
+                    videoPicker.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly),
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(
+                    Icons.Default.PlayCircle,
+                    contentDescription = null,
+                    tint = LitterTheme.accent,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("Choose Video", color = LitterTheme.accent, fontSize = 13.sp)
+            }
+
+            // Video URL input
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Default.Link,
+                    contentDescription = null,
+                    tint = LitterTheme.textMuted,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                OutlinedTextField(
+                    value = videoUrlText,
+                    onValueChange = { videoUrlText = it },
+                    placeholder = { Text("Paste video URL", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f).heightIn(max = 44.dp),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp, color = LitterTheme.textPrimary),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = LitterTheme.accent,
+                        unfocusedBorderColor = LitterTheme.border,
+                        cursorColor = LitterTheme.accent,
+                    ),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = {
+                        val url = videoUrlText.trim()
+                        val ws = wallpaperScope
+                        if (url.isNotEmpty() && ws != null) {
+                            isProcessingVideo = true
+                            scope.launch {
+                                val result = VideoWallpaperProcessor.processRemoteUrl(context, url, ws)
+                                if (result != null) {
+                                    val config = WallpaperConfig(type = WallpaperType.VIDEO_URL, videoURL = url, videoDuration = result.durationSeconds)
+                                    WallpaperManager.setWallpaper(config, ws)
+                                    previewConfig = config
+                                    isProcessingVideo = false
+                                    onAdjust()
+                                } else {
+                                    isProcessingVideo = false
+                                }
+                            }
+                        }
+                    }),
+                )
+            }
+        }
+
+        // Processing overlay
+        if (isProcessingVideo) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(LitterTheme.background.copy(alpha = 0.6f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = LitterTheme.accent)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Processing video...", color = LitterTheme.textPrimary, fontSize = 13.sp)
                 }
             }
         }

@@ -5,14 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 ANDROID_DIR="$REPO_DIR/apps/android"
 
-VARIANT="${VARIANT:-OnDeviceRelease}"
+VARIANT="${VARIANT:-Release}"
 UPLOAD="${UPLOAD:-1}"
 TRACK="${LITTER_PLAY_TRACK:-internal}"
+
+# Source credentials from env file if present and vars are not already set
+ENV_FILE="${HOME}/.config/litter/play-upload.env"
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
 
 require_env() {
     local name="$1"
     if [[ -z "${!name:-}" ]]; then
         echo "Missing required env var: $name" >&2
+        echo "Hint: create $ENV_FILE with exports, or set vars directly." >&2
         exit 1
     fi
 }

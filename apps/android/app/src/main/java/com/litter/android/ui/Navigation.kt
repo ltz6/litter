@@ -13,4 +13,7 @@ sealed class Route {
     data class ConversationInfo(val key: ThreadKey) : Route()
     data class WallpaperSelection(val key: ThreadKey) : Route()
     data class WallpaperAdjust(val key: ThreadKey) : Route()
+    data class ServerInfo(val serverId: String) : Route()
+    data class ServerWallpaperSelection(val serverId: String) : Route()
+    data class ServerWallpaperAdjust(val serverId: String) : Route()
 }

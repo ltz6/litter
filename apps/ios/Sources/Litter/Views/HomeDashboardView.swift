@@ -12,8 +12,11 @@ struct HomeDashboardView: View {
     let onShowSettings: () -> Void
     var onDeleteThread: ((ThreadKey) async -> Void)? = nil
     var onDisconnectServer: ((String) -> Void)? = nil
+    var onRenameServer: ((String, String) -> Void)? = nil
     @State private var deleteTargetThread: HomeDashboardRecentSession?
     @State private var disconnectTargetServer: HomeDashboardServer?
+    @State private var renameTargetServer: HomeDashboardServer?
+    @State private var renameText = ""
 
     var body: some View {
         ScrollView {
@@ -55,6 +58,24 @@ struct HomeDashboardView: View {
         } message: {
             Text("Disconnect from \"\(disconnectTargetServer?.displayName ?? "this server")\"?")
         }
+        .alert("Rename Server", isPresented: Binding(
+            get: { renameTargetServer != nil },
+            set: { if !$0 { renameTargetServer = nil } }
+        )) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameTargetServer = nil }
+            Button("Save") {
+                if let server = renameTargetServer {
+                    let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        onRenameServer?(server.id, trimmed)
+                    }
+                }
+                renameTargetServer = nil
+            }
+        } message: {
+            Text("Enter a new name for this server.")
+        }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -67,6 +88,9 @@ struct HomeDashboardView: View {
             }
             ToolbarItem(placement: .principal) {
                 AnimatedLogo(size: 64)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                SupporterBadge()
             }
         }
     }
@@ -130,6 +154,14 @@ struct HomeDashboardView: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            if !server.isLocal {
+                                Button {
+                                    renameText = server.displayName
+                                    renameTargetServer = server
+                                } label: {
+                                    Label("Rename", systemImage: "pencil")
+                                }
+                            }
                             Button(role: .destructive) {
                                 disconnectTargetServer = server
                             } label: {

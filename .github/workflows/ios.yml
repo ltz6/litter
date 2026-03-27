@@ -4,32 +4,57 @@ on:
   pull_request:
     paths:
       - 'apps/ios/**'
-      - 'Package.swift'
+      - 'shared/rust-bridge/**'
       - '.github/workflows/ios.yml'
   push:
     branches: [ main ]
     paths:
       - 'apps/ios/**'
-      - 'Package.swift'
+      - 'shared/rust-bridge/**'
       - '.github/workflows/ios.yml'
 
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Install xcodegen
+      - name: Install build dependencies
         run: brew install xcodegen
 
-      - name: Generate project
-        run: xcodegen generate --spec apps/ios/project.yml --project apps/ios/Litter.xcodeproj
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        env:
+          SCCACHE_BUCKET: rust-cache
+          SCCACHE_ENDPOINT: ${{ secrets.SCCACHE_R2_ENDPOINT }}
+          SCCACHE_REGION: auto
+          SCCACHE_S3_USE_SSL: "true"
+          SCCACHE_S3_KEY_PREFIX: ci/ios
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+
+      - name: Build Rust for iOS simulator
+        env:
+          RUSTC_WRAPPER: sccache
+        run: make rust-ios-sim-fast
 
       - name: Download ios_system frameworks
         run: ./apps/ios/scripts/download-ios-system.sh
+
+      - name: Generate Xcode project
+        run: ./apps/ios/scripts/regenerate-project.sh
 
       - name: Build (Litter)
         run: |

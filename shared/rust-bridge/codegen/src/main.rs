@@ -1520,7 +1520,8 @@ fn generate_public_rpc_methods(
         "use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};\n",
     );
     out.push_str("use crate::types::generated;\n");
-    out.push_str("use std::sync::Arc;\n\n");
+    out.push_str("use std::sync::Arc;\n");
+    out.push_str("use std::time::Instant;\n\n");
     out.push_str("#[derive(uniffi::Object)]\n");
     out.push_str("pub struct AppServerRpc {\n");
     out.push_str("    pub(crate) inner: Arc<MobileClient>,\n");
@@ -1581,18 +1582,38 @@ fn generate_public_rpc_methods(
             response_type
         ));
         out.push_str("        blocking_async!(self.rt, self.inner, |c| {\n");
+        out.push_str(&format!(
+            "            tracing::info!(target: \"rpc\", method = \"{}\", server_id = %server_id, \"rpc call\");\n",
+            method.wire_method
+        ));
+        out.push_str("            let _rpc_start = Instant::now();\n");
         if has_params {
             out.push_str("            let reconcile_params = params.clone();\n");
             out.push_str(&format!(
-                "            let response = c.generated_{}(&server_id, params).await?;\n",
+                "            let response = match c.generated_{}(&server_id, params).await {{\n",
                 method_name
             ));
         } else {
             out.push_str(&format!(
-                "            let response = c.generated_{}(&server_id).await?;\n",
+                "            let response = match c.generated_{}(&server_id).await {{\n",
                 method_name
             ));
         }
+        out.push_str("                Ok(r) => {\n");
+        out.push_str(&format!(
+            "                    tracing::debug!(target: \"rpc\", method = \"{}\", server_id = %server_id, elapsed_ms = _rpc_start.elapsed().as_millis() as u64, \"rpc ok\");\n",
+            method.wire_method
+        ));
+        out.push_str("                    r\n");
+        out.push_str("                }\n");
+        out.push_str("                Err(e) => {\n");
+        out.push_str(&format!(
+            "                    tracing::warn!(target: \"rpc\", method = \"{}\", server_id = %server_id, error = %e, elapsed_ms = _rpc_start.elapsed().as_millis() as u64, \"rpc error\");\n",
+            method.wire_method
+        ));
+        out.push_str("                    return Err(e.into());\n");
+        out.push_str("                }\n");
+        out.push_str("            };\n");
         if has_params {
             out.push_str(&format!(
                 "            c.reconcile_public_rpc(\"{}\", &server_id, Some(&reconcile_params), &response)\n",

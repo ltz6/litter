@@ -22,10 +22,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.outlined.DesktopWindows
+import androidx.compose.material.icons.outlined.DeveloperBoard
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Lan
+import androidx.compose.material.icons.outlined.Laptop
+import androidx.compose.material.icons.outlined.PhoneAndroid
+import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -52,8 +62,11 @@ import com.litter.android.state.SavedServerStore
 import com.litter.android.state.SavedSshCredential
 import com.litter.android.state.SshAuthMethod
 import com.litter.android.state.SshCredentialStore
+import com.litter.android.state.connectionProgressDetail
 import com.litter.android.state.isIpcConnected
 import com.litter.android.state.isConnected
+import com.litter.android.state.statusColor
+import com.litter.android.state.statusLabel
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
@@ -68,6 +81,8 @@ import uniffi.codex_mobile_client.FfiDiscoveredServer
 fun DiscoveryScreen(
     discoveredServers: List<FfiDiscoveredServer>,
     isScanning: Boolean,
+    scanProgress: Float = 0f,
+    scanProgressLabel: String? = null,
     onRefresh: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -80,11 +95,29 @@ fun DiscoveryScreen(
     var showManualEntry by remember { mutableStateOf(false) }
     var sshServer by remember { mutableStateOf<SavedServer?>(null) }
     var connectionChoiceServer by remember { mutableStateOf<SavedServer?>(null) }
+    var pendingAutoNavigateServerId by remember { mutableStateOf<String?>(null) }
+    var pendingAutoNavigateServer by remember { mutableStateOf<SavedServer?>(null) }
     var connectError by remember { mutableStateOf<String?>(null) }
 
     var savedServers by remember { mutableStateOf(SavedServerStore.load(context)) }
     LaunchedEffect(Unit) {
         savedServers = SavedServerStore.load(context)
+    }
+
+    LaunchedEffect(snapshot, pendingAutoNavigateServerId) {
+        val pendingServerId = pendingAutoNavigateServerId ?: return@LaunchedEffect
+        val serverSnapshot = snapshot?.servers?.firstOrNull { it.serverId == pendingServerId } ?: return@LaunchedEffect
+        if (serverSnapshot.isConnected) {
+            pendingAutoNavigateServerId = null
+            pendingAutoNavigateServer = null
+            onDismiss()
+        } else if (serverSnapshot.health == uniffi.codex_mobile_client.AppServerHealth.DISCONNECTED) {
+            serverSnapshot.connectionProgress?.terminalMessage?.let { message ->
+                pendingAutoNavigateServerId = null
+                pendingAutoNavigateServer = null
+                connectError = message
+            }
+        }
     }
 
     // Merge discovered with saved
@@ -125,6 +158,32 @@ fun DiscoveryScreen(
             }
         }
 
+        if (isScanning) {
+            if (scanProgressLabel != null) {
+                Spacer(Modifier.height(4.dp))
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = scanProgressLabel,
+                        color = LitterTheme.textMuted,
+                        fontSize = 10.sp,
+                    )
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            val animatedProgress by animateFloatAsState(
+                targetValue = scanProgress,
+                animationSpec = tween(durationMillis = 250),
+                label = "scanProgress",
+            )
+            LinearProgressIndicator(
+                progress = { animatedProgress },
+                modifier = Modifier.fillMaxWidth().height(3.dp),
+                color = LitterTheme.accent,
+                trackColor = LitterTheme.surface,
+            )
+        }
+
         Spacer(Modifier.height(12.dp))
 
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -146,18 +205,20 @@ fun DiscoveryScreen(
                                         appModel.serverBridge.connectLocalServer(
                                             entry.id, entry.name, entry.hostname, entry.port.toUShort(),
                                         )
+                                        SavedServerStore.upsert(context, entry.normalizedForPersistence())
                                     }
                                     entry.websocketURL != null -> {
                                         appModel.serverBridge.connectRemoteUrlServer(
                                             entry.id, entry.name, entry.websocketURL!!,
                                         )
+                                        SavedServerStore.upsert(context, entry.normalizedForPersistence())
                                     }
-                                    entry.directCodexPort != null && entry.canConnectViaSsh && !entry.prefersSshConnection -> {
+                                    entry.requiresConnectionChoice -> {
                                         connectionChoiceServer = entry
                                         return@launch
                                     }
-                                    entry.prefersSshConnection -> {
-                                        sshServer = entry
+                                    entry.prefersSshConnection || (!entry.hasCodexServer && entry.canConnectViaSsh) -> {
+                                        sshServer = entry.withPreferredConnection("ssh")
                                         return@launch
                                     }
                                     entry.directCodexPort != null -> {
@@ -167,13 +228,16 @@ fun DiscoveryScreen(
                                             entry.hostname,
                                             entry.directCodexPort!!.toUShort(),
                                         )
+                                        SavedServerStore.upsert(
+                                            context,
+                                            entry.withPreferredConnection("directCodex", entry.directCodexPort),
+                                        )
                                     }
                                     else -> {
                                         connectError = "No Codex server port was discovered for ${entry.hostname}."
                                         return@launch
                                     }
                                 }
-                                SavedServerStore.upsert(context, entry)
                                 savedServers = SavedServerStore.load(context)
                                 appModel.refreshSnapshot()
                                 onDismiss()
@@ -239,68 +303,69 @@ fun DiscoveryScreen(
     }
 
     connectionChoiceServer?.let { server ->
-        val directCodexPort = server.directCodexPort
         AlertDialog(
             onDismissRequest = { connectionChoiceServer = null },
             title = { Text("Connect ${server.name.ifBlank { server.hostname }}") },
             text = {
-                Text(
-                    "This server supports both direct Codex and SSH. Choose how to connect.",
-                    color = LitterTheme.textSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        connectionChoiceServer = null
-                        scope.launch {
-                            try {
-                                appModel.serverBridge.connectRemoteServer(
-                                    server.id,
-                                    server.name,
-                                    server.hostname,
-                                    directCodexPort!!.toUShort(),
-                                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Choose how to connect.",
+                        color = LitterTheme.textSecondary,
+                    )
+                    server.availableDirectCodexPorts.forEach { port ->
+                        TextButton(
+                            onClick = {
+                                connectionChoiceServer = null
+                                scope.launch {
+                                    try {
+                                        appModel.serverBridge.connectRemoteServer(
+                                            server.id,
+                                            server.name,
+                                            server.hostname,
+                                            port.toUShort(),
+                                        )
+                                        SavedServerStore.upsert(
+                                            context,
+                                            server.withPreferredConnection("directCodex", port),
+                                        )
+                                        savedServers = SavedServerStore.load(context)
+                                        appModel.refreshSnapshot()
+                                        onDismiss()
+                                    } catch (e: Exception) {
+                                        Log.e(logTag, "direct codex connect failed for ${server.id}", e)
+                                        connectError = e.message ?: "Unable to connect."
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Use Codex ($port)")
+                        }
+                    }
+                    if (server.canConnectViaSsh) {
+                        TextButton(
+                            onClick = {
                                 SavedServerStore.upsert(
                                     context,
-                                    server.copy(
-                                        port = directCodexPort,
-                                        hasCodexServer = true,
-                                        sshPortForwardingEnabled = false,
-                                    ),
+                                    server.withPreferredConnection("ssh"),
                                 )
                                 savedServers = SavedServerStore.load(context)
-                                appModel.refreshSnapshot()
-                                onDismiss()
-                            } catch (e: Exception) {
-                                Log.e(logTag, "direct codex connect failed for ${server.id}", e)
-                                connectError = e.message ?: "Unable to connect."
-                            }
+                                sshServer = server.withPreferredConnection("ssh")
+                                connectionChoiceServer = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Connect via SSH", color = LitterTheme.accent)
                         }
-                    },
-                ) {
-                    Text("Use Codex")
-                }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = { connectionChoiceServer = null }) {
-                        Text("Cancel")
-                    }
-                    TextButton(
-                        onClick = {
-                            sshServer = server.copy(
-                                port = server.resolvedSshPort,
-                                hasCodexServer = false,
-                                sshPortForwardingEnabled = true,
-                            )
-                            connectionChoiceServer = null
-                        },
-                    ) {
-                        Text("Use SSH", color = LitterTheme.accent)
                     }
                 }
             },
+            confirmButton = {
+                TextButton(onClick = { connectionChoiceServer = null }) {
+                    Text("Cancel")
+                }
+            },
+            dismissButton = {},
         )
     }
 
@@ -314,7 +379,7 @@ fun DiscoveryScreen(
                     Log.d(logTag, "starting SSH connect for ${server.id} host=${server.hostname}:${server.resolvedSshPort}")
                     when (credential.method) {
                         SshAuthMethod.PASSWORD -> {
-                            appModel.ssh.sshConnectRemoteServer(
+                            appModel.ssh.sshStartRemoteServerConnect(
                                 serverId = server.id,
                                 displayName = server.name,
                                 host = server.hostname,
@@ -329,7 +394,7 @@ fun DiscoveryScreen(
                             )
                         }
                         SshAuthMethod.KEY -> {
-                            appModel.ssh.sshConnectRemoteServer(
+                            appModel.ssh.sshStartRemoteServerConnect(
                                 serverId = server.id,
                                 displayName = server.name,
                                 host = server.hostname,
@@ -351,22 +416,53 @@ fun DiscoveryScreen(
                     }
                     SavedServerStore.upsert(
                         context,
-                        server.copy(
-                            port = server.resolvedSshPort,
-                            sshPort = server.resolvedSshPort,
-                            hasCodexServer = false,
-                            sshPortForwardingEnabled = true,
-                        ),
+                        server.withPreferredConnection("ssh"),
                     )
                     savedServers = SavedServerStore.load(context)
                     appModel.refreshSnapshot()
-                    Log.d(logTag, "SSH connect succeeded for ${server.id}")
+                    pendingAutoNavigateServerId = server.id
+                    pendingAutoNavigateServer = server
+                    Log.d(logTag, "SSH bootstrap started for ${server.id}")
                     sshServer = null
-                    onDismiss()
                     null
                 } catch (e: Exception) {
                     Log.e(logTag, "SSH connect failed for ${server.id}", e)
                     e.message ?: "Unable to connect over SSH."
+                }
+            },
+        )
+    }
+
+    snapshot?.servers?.firstOrNull { it.connectionProgress?.pendingInstall == true }?.let { serverSnapshot ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Install Codex?") },
+            text = {
+                Text(
+                    serverSnapshot.connectionProgressDetail
+                        ?: "Codex was not found on the remote host. Install the latest stable release into ~/.litter?",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            appModel.ssh.sshRespondToInstallPrompt(serverSnapshot.serverId, true)
+                        }
+                    },
+                ) {
+                    Text("Install")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            appModel.ssh.sshRespondToInstallPrompt(serverSnapshot.serverId, false)
+                        }
+                    },
+                ) {
+                    Text("Cancel")
                 }
             },
         )
@@ -393,8 +489,23 @@ private fun ServerRow(
     onClick: () -> Unit,
 ) {
     val displayHost = connectedServer?.host ?: entry.hostname
-    val displayPort = connectedServer?.port?.toInt()
-        ?: if (entry.prefersSshConnection) entry.resolvedSshPort else entry.port
+    val subtitle = connectedServer?.connectionProgressDetail
+        ?: buildString {
+            append(displayHost)
+            if (entry.os != null) {
+                append(" - ")
+                append(entry.os)
+            }
+            if (entry.availableDirectCodexPorts.isNotEmpty()) {
+                append(" - codex ")
+                append(entry.availableDirectCodexPorts.joinToString(", "))
+            }
+            if (entry.canConnectViaSsh) {
+                append(" - ssh ")
+                append(entry.resolvedSshPort)
+            }
+        }
+    val serverIcon = serverIconForEntry(entry)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -403,16 +514,16 @@ private fun ServerRow(
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(if (entry.hasCodexServer) LitterTheme.accent else LitterTheme.textMuted),
+        Icon(
+            imageVector = serverIcon,
+            contentDescription = entry.os ?: entry.source,
+            tint = if (entry.hasCodexServer) LitterTheme.accent else LitterTheme.textMuted,
+            modifier = Modifier.size(20.dp),
         )
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(entry.name.ifBlank { entry.hostname }, color = LitterTheme.textPrimary, fontSize = 14.sp)
-            Text("$displayHost:$displayPort", color = LitterTheme.textSecondary, fontSize = 11.sp)
+            Text(subtitle, color = LitterTheme.textSecondary, fontSize = 11.sp)
         }
         val (sourceColor, sourceLabel) = when (entry.source) {
             "bonjour" -> LitterTheme.info to "Bonjour"
@@ -431,6 +542,17 @@ private fun ServerRow(
                 .background(sourceColor.copy(alpha = 0.12f), RoundedCornerShape(4.dp))
                 .padding(horizontal = 6.dp, vertical = 2.dp),
         )
+        if (connectedServer != null && connectedServer.health != uniffi.codex_mobile_client.AppServerHealth.DISCONNECTED) {
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = connectedServer.statusLabel,
+                color = connectedServer.statusColor,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .background(connectedServer.statusColor.copy(alpha = 0.12f), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            )
+        }
         if (connectedServer?.isIpcConnected == true) {
             Spacer(Modifier.width(6.dp))
             Text(
@@ -619,6 +741,25 @@ private fun SSHLoginDialog(
     )
 }
 
+private fun serverIconForEntry(entry: SavedServer): androidx.compose.ui.graphics.vector.ImageVector {
+    if (entry.source == "local") return Icons.Outlined.PhoneAndroid
+    val os = entry.os?.lowercase()
+    if (os != null) {
+        if (os.contains("windows")) return Icons.Outlined.DesktopWindows
+        if (os.contains("raspbian")) return Icons.Outlined.DeveloperBoard
+        if (os.contains("ubuntu") || os.contains("debian") ||
+            os.contains("fedora") || os.contains("red hat") ||
+            os.contains("freebsd") || os.contains("linux")
+        ) return Icons.Outlined.Dns
+    }
+    return when (entry.source) {
+        "bonjour" -> Icons.Outlined.Laptop
+        "tailscale" -> Icons.Outlined.Lan
+        "ssh" -> Icons.Outlined.Terminal
+        else -> Icons.Outlined.Dns
+    }
+}
+
 private fun connectedSnapshot(
     entry: SavedServer,
     servers: List<AppServerSnapshot>,
@@ -645,35 +786,46 @@ private fun mergeServers(
     fun mergeCandidate(existing: SavedServer, candidate: SavedServer): SavedServer {
         val betterSource = sourceRank(candidate.source) < sourceRank(existing.source)
         val hasCodexUpgrade = candidate.hasCodexServer && !existing.hasCodexServer
-        val betterCodexPort = candidate.hasCodexServer && existing.hasCodexServer && candidate.port != existing.port
+        val betterCodexPort = candidate.availableDirectCodexPorts.any { it !in existing.availableDirectCodexPorts }
         val betterName = existing.name == existing.hostname && candidate.name != candidate.hostname
         val preferCandidate = betterSource || hasCodexUpgrade || betterCodexPort || betterName
+
+        val mergedCodexPorts =
+            buildList {
+                addAll(existing.availableDirectCodexPorts)
+                addAll(candidate.availableDirectCodexPorts)
+            }.distinct()
+
+        val mergedOs = if (candidate.sshBanner != null) candidate.os else (candidate.os ?: existing.os)
+        val mergedBanner = candidate.sshBanner ?: existing.sshBanner
 
         val merged = if (preferCandidate) {
             candidate.copy(
                 id = existing.id,
+                codexPorts = mergedCodexPorts,
                 wakeMAC = candidate.wakeMAC ?: existing.wakeMAC,
-                sshPortForwardingEnabled = candidate.sshPortForwardingEnabled || existing.sshPortForwardingEnabled,
+                preferredConnectionMode = existing.resolvedPreferredConnectionMode ?: candidate.resolvedPreferredConnectionMode,
+                preferredCodexPort = existing.resolvedPreferredCodexPort ?: candidate.resolvedPreferredCodexPort,
+                sshPortForwardingEnabled = null,
                 websocketURL = candidate.websocketURL ?: existing.websocketURL,
+                os = mergedOs,
+                sshBanner = mergedBanner,
             )
         } else {
             existing.copy(
+                codexPorts = mergedCodexPorts,
                 sshPort = existing.sshPort ?: candidate.sshPort,
                 wakeMAC = existing.wakeMAC ?: candidate.wakeMAC,
-                sshPortForwardingEnabled = existing.sshPortForwardingEnabled || candidate.sshPortForwardingEnabled,
+                preferredConnectionMode = existing.resolvedPreferredConnectionMode ?: candidate.resolvedPreferredConnectionMode,
+                preferredCodexPort = existing.resolvedPreferredCodexPort ?: candidate.resolvedPreferredCodexPort,
+                sshPortForwardingEnabled = null,
                 websocketURL = existing.websocketURL ?: candidate.websocketURL,
+                os = mergedOs,
+                sshBanner = mergedBanner,
             )
         }
 
-        return if (merged.sshPortForwardingEnabled) {
-            merged.copy(
-                port = merged.resolvedSshPort,
-                sshPort = merged.sshPort ?: existing.sshPort ?: candidate.sshPort,
-                hasCodexServer = false,
-            )
-        } else {
-            merged
-        }
+        return merged.normalizedForPersistence()
     }
 
     for (server in saved) {

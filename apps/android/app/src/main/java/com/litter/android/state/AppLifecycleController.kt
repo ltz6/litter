@@ -61,7 +61,7 @@ class AppLifecycleController {
                                 websocketUrl = server.websocketURL!!,
                             )
                         }
-                        server.prefersSshConnection -> {
+                        server.resolvedPreferredConnectionMode == "ssh" -> {
                             val credential =
                                 sshCredentials.load(server.hostname, server.resolvedSshPort) ?: continue
                             reconnectSshServer(appModel, server, credential)
@@ -74,7 +74,10 @@ class AppLifecycleController {
                                 port = server.directCodexPort!!.toUShort(),
                             )
                         }
-                        else -> continue
+                        else -> {
+                            Log.d("AppLifecycleController", "skipping reconnect for ${server.id}; no valid saved transport")
+                            continue
+                        }
                     }
                     activeServerIds.add(server.id)
                 } catch (_: Exception) {

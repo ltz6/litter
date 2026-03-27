@@ -25,7 +25,22 @@ final class AppLifecycleController {
             }
 
             do {
-                if let target = server.connectionTarget {
+                if savedServer.preferredConnectionMode == .ssh {
+                    guard let credential = try SSHCredentialStore.shared.load(
+                        host: server.hostname,
+                        port: Int(server.resolvedSSHPort)
+                    ) else {
+                        continue
+                    }
+                    try await reconnectSSHServer(
+                        appModel: appModel,
+                        serverId: server.id,
+                        displayName: server.name,
+                        host: server.hostname,
+                        port: server.resolvedSSHPort,
+                        credentials: credential.toConnectionCredential()
+                    )
+                } else if let target = server.connectionTarget {
                     switch target {
                     case .local:
                         _ = try await appModel.serverBridge.connectLocalServer(
@@ -57,7 +72,8 @@ final class AppLifecycleController {
                             credentials: credentials
                         )
                     }
-                } else if let credential = try SSHCredentialStore.shared.load(
+                } else if savedServer.preferredConnectionMode == nil,
+                          let credential = try SSHCredentialStore.shared.load(
                     host: server.hostname,
                     port: Int(server.resolvedSSHPort)
                 ) {

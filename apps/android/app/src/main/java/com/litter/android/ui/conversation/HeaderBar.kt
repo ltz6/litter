@@ -1,7 +1,7 @@
 package com.litter.android.ui.conversation
 
-import android.content.Intent
 import android.net.Uri
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -75,6 +75,7 @@ fun HeaderBar(
     thread: AppThreadSnapshot?,
     onBack: () -> Unit,
     onInfo: (() -> Unit)? = null,
+    transparentBackground: Boolean = false,
 ) {
     val appModel = LocalAppModel.current
     val context = LocalContext.current
@@ -89,7 +90,7 @@ fun HeaderBar(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(LitterTheme.surface),
+            .then(if (!transparentBackground) Modifier.background(LitterTheme.surface) else Modifier),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -195,13 +196,13 @@ fun HeaderBar(
                         isReloading = true
                         try {
                             if (server != null && !server.isLocal && server.account == null) {
-                                val resp = appModel.rpc.loginAccount(
+                                val authUrl = appModel.rpc.startRemoteSshOauthLogin(
                                     thread.key.serverId,
-                                    uniffi.codex_mobile_client.LoginAccountParams.Chatgpt,
                                 )
-                                if (resp is uniffi.codex_mobile_client.LoginAccountResponse.Chatgpt) {
-                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(resp.authUrl)))
-                                }
+                                CustomTabsIntent.Builder()
+                                    .setShowTitle(true)
+                                    .build()
+                                    .launchUrl(context, Uri.parse(authUrl))
                                 return@launch
                             }
                             val config = AppThreadLaunchConfig(model = thread.model)

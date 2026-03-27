@@ -6,6 +6,93 @@ use crate::types::{
 };
 use crate::uniffi_shared::{AppVoiceSessionPhase, AppVoiceTranscriptEntry};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConnectionStepKind {
+    ConnectingToSsh,
+    FindingCodex,
+    InstallingCodex,
+    StartingAppServer,
+    OpeningTunnel,
+    Connected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConnectionStepState {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    AwaitingUserInput,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConnectionStepSnapshot {
+    pub kind: ServerConnectionStepKind,
+    pub state: ServerConnectionStepState,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConnectionProgressSnapshot {
+    pub steps: Vec<ServerConnectionStepSnapshot>,
+    pub pending_install: bool,
+    pub terminal_message: Option<String>,
+}
+
+impl ServerConnectionProgressSnapshot {
+    pub fn ssh_bootstrap() -> Self {
+        Self {
+            steps: vec![
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::ConnectingToSsh,
+                    state: ServerConnectionStepState::InProgress,
+                    detail: None,
+                },
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::FindingCodex,
+                    state: ServerConnectionStepState::Pending,
+                    detail: None,
+                },
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::InstallingCodex,
+                    state: ServerConnectionStepState::Pending,
+                    detail: None,
+                },
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::StartingAppServer,
+                    state: ServerConnectionStepState::Pending,
+                    detail: None,
+                },
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::OpeningTunnel,
+                    state: ServerConnectionStepState::Pending,
+                    detail: None,
+                },
+                ServerConnectionStepSnapshot {
+                    kind: ServerConnectionStepKind::Connected,
+                    state: ServerConnectionStepState::Pending,
+                    detail: None,
+                },
+            ],
+            pending_install: false,
+            terminal_message: None,
+        }
+    }
+
+    pub fn update_step(
+        &mut self,
+        kind: ServerConnectionStepKind,
+        state: ServerConnectionStepState,
+        detail: Option<String>,
+    ) {
+        if let Some(step) = self.steps.iter_mut().find(|step| step.kind == kind) {
+            step.state = state;
+            step.detail = detail;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerHealthSnapshot {
     Disconnected,
@@ -40,6 +127,7 @@ pub struct ServerSnapshot {
     pub requires_openai_auth: bool,
     pub rate_limits: Option<generated::RateLimitSnapshot>,
     pub available_models: Option<Vec<generated::Model>>,
+    pub connection_progress: Option<ServerConnectionProgressSnapshot>,
 }
 
 #[derive(Debug, Clone, Default)]

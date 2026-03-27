@@ -695,12 +695,7 @@ impl ServerSession {
                                     reconnect_url,
                                     request_debug
                                 );
-                                eprintln!(
-                                    "[codex-mobile-client] remote request start url={} request={}",
-                                    reconnect_url,
-                                    request_debug
-                                );
-                                let request_retry = request.clone();
+let request_retry = request.clone();
                                 let mut result = match client.request(request).await {
                                     Ok(Ok(value)) => Ok(value),
                                     Ok(Err(error)) => Err(RpcError::Server {
@@ -718,12 +713,7 @@ impl ServerSession {
                                             reconnect_url,
                                             value
                                         );
-                                        eprintln!(
-                                            "[codex-mobile-client] remote request success url={} response={}",
-                                            reconnect_url,
-                                            value
-                                        );
-                                    }
+}
                                     Err(error) => {
                                         warn!(
                                             "remote request error url={} error={} request={}",
@@ -731,13 +721,7 @@ impl ServerSession {
                                             error,
                                             request_debug
                                         );
-                                        eprintln!(
-                                            "[codex-mobile-client] remote request error url={} error={} request={}",
-                                            reconnect_url,
-                                            error,
-                                            request_debug
-                                        );
-                                    }
+}
                                 }
                                 if matches!(result, Err(RpcError::Transport(_)))
                                     && reconnect_remote_client(
@@ -765,12 +749,7 @@ impl ServerSession {
                                                 reconnect_url,
                                                 value
                                             );
-                                            eprintln!(
-                                                "[codex-mobile-client] remote request retry success url={} response={}",
-                                                reconnect_url,
-                                                value
-                                            );
-                                        }
+}
                                         Err(error) => {
                                             warn!(
                                                 "remote request retry error url={} error={} request={}",
@@ -778,13 +757,7 @@ impl ServerSession {
                                                 error,
                                                 request_debug
                                             );
-                                            eprintln!(
-                                                "[codex-mobile-client] remote request retry error url={} error={} request={}",
-                                                reconnect_url,
-                                                error,
-                                                request_debug
-                                            );
-                                        }
+}
                                     }
                                 }
                                 let _ = response_tx.send(result);
@@ -831,11 +804,7 @@ impl ServerSession {
                     event = client.next_event() => {
                         let Some(event) = event else {
                             warn!("remote event stream ended for {}", reconnect_url);
-                            eprintln!(
-                                "[codex-mobile-client] remote event stream ended url={}",
-                                reconnect_url
-                            );
-                            append_android_debug_log(&format!(
+append_android_debug_log(&format!(
                                 "event_stream_ended url={}",
                                 reconnect_url
                             ));
@@ -852,12 +821,7 @@ impl ServerSession {
                         };
                         if let AppServerEvent::Disconnected { message } = &event {
                             warn!("remote session disconnected for {}: {}", reconnect_url, message);
-                            eprintln!(
-                                "[codex-mobile-client] remote session disconnected url={} message={}",
-                                reconnect_url,
-                                message
-                            );
-                            append_android_debug_log(&format!(
+append_android_debug_log(&format!(
                                 "event_disconnected url={} message={}",
                                 reconnect_url, message
                             ));
@@ -924,6 +888,10 @@ impl ServerSession {
     /// Get the server configuration.
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    pub fn ssh_client(&self) -> Option<Arc<SshClient>> {
+        self.ssh_client.clone()
     }
 
     /// Get a watch receiver for health state changes.
@@ -1110,11 +1078,7 @@ async fn reconnect_remote_client(
             "remote reconnect start url={} attempt={}/{}",
             websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS
         );
-        eprintln!(
-            "[codex-mobile-client] remote reconnect start url={} attempt={}/{}",
-            websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS
-        );
-        let _ = health_tx.send(ConnectionHealth::Connecting {
+let _ = health_tx.send(ConnectionHealth::Connecting {
             attempt,
             max_attempts: REMOTE_RECONNECT_MAX_ATTEMPTS,
         });
@@ -1126,11 +1090,7 @@ async fn reconnect_remote_client(
                     "remote server session reconnected: {} (attempt {attempt}/{})",
                     websocket_url, REMOTE_RECONNECT_MAX_ATTEMPTS
                 );
-                eprintln!(
-                    "[codex-mobile-client] remote reconnect success url={} attempt={}/{}",
-                    websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS
-                );
-                append_android_debug_log(&format!(
+append_android_debug_log(&format!(
                     "reconnect_success url={} attempt={}/{}",
                     websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS
                 ));
@@ -1141,11 +1101,7 @@ async fn reconnect_remote_client(
                     "remote server reconnect failed: {} (attempt {attempt}/{}) - {}",
                     websocket_url, REMOTE_RECONNECT_MAX_ATTEMPTS, error
                 );
-                eprintln!(
-                    "[codex-mobile-client] remote reconnect failed url={} attempt={}/{} error={}",
-                    websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS, error
-                );
-                append_android_debug_log(&format!(
+append_android_debug_log(&format!(
                     "reconnect_failed url={} attempt={}/{} error={}",
                     websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS, error
                 ));
@@ -1172,19 +1128,11 @@ fn route_app_server_event(
     match event {
         AppServerEvent::ServerNotification(notification) => {
             info!("remote event notification {:?}", notification);
-            eprintln!(
-                "[codex-mobile-client] remote event notification {:?}",
-                notification
-            );
-            let _ = event_tx.send(ServerEvent::Notification(notification.clone()));
+let _ = event_tx.send(ServerEvent::Notification(notification.clone()));
         }
         AppServerEvent::LegacyNotification(notification) => {
             info!("remote event legacy method={}", notification.method);
-            eprintln!(
-                "[codex-mobile-client] remote event legacy method={}",
-                notification.method
-            );
-            let method = notification.method.clone();
+let method = notification.method.clone();
             let params = notification
                 .params
                 .clone()
@@ -1194,11 +1142,7 @@ fn route_app_server_event(
         }
         AppServerEvent::ServerRequest(request) => {
             info!("remote event server request {:?}", request);
-            eprintln!(
-                "[codex-mobile-client] remote event server request {:?}",
-                request
-            );
-            append_android_debug_log(&format!("server_request={request:?}"));
+append_android_debug_log(&format!("server_request={request:?}"));
             let _ = event_tx.send(ServerEvent::Request(request.clone()));
         }
         AppServerEvent::Lagged { skipped } => {

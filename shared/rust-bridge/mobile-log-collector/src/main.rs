@@ -650,6 +650,7 @@ async fn run_query(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_tail(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let pretty = args.pretty;
     let client = reqwest::Client::new();
     let response = client
         .get(format!("{}/v1/tail", args.base_url.trim_end_matches('/')))
@@ -669,8 +670,48 @@ async fn run_tail(args: ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
     let mut response = response;
+    let mut buf = String::new();
     while let Some(chunk) = response.chunk().await? {
-        print!("{}", String::from_utf8_lossy(&chunk));
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(newline_pos) = buf.find('\n') {
+            let line = buf[..newline_pos].to_string();
+            buf.drain(..=newline_pos);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !pretty {
+                println!("{trimmed}");
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<StoredLogEvent>(trimmed) {
+                let ts = chrono::Utc
+                    .timestamp_millis_opt(event.timestamp_ms)
+                    .single()
+                    .map(|t| t.format("%H:%M:%S%.3f").to_string())
+                    .unwrap_or_else(|| event.timestamp_ms.to_string());
+                let level_color = match event.level.as_str() {
+                    "ERROR" => "\x1b[31m",
+                    "WARN" => "\x1b[33m",
+                    "INFO" => "\x1b[32m",
+                    "DEBUG" => "\x1b[36m",
+                    "TRACE" => "\x1b[90m",
+                    _ => "\x1b[0m",
+                };
+                let reset = "\x1b[0m";
+                let dim = "\x1b[90m";
+                let sub = event.subsystem.rsplit("::").next().unwrap_or(&event.subsystem);
+                print!("{dim}{ts}{reset} {level_color}{:<5}{reset} {dim}{}{reset} {}", event.level, sub, event.message);
+                if let Some(ref fields) = event.fields_json {
+                    if fields != "null" && !fields.is_empty() {
+                        print!(" {dim}{fields}{reset}");
+                    }
+                }
+                println!();
+            } else {
+                println!("{trimmed}");
+            }
+        }
     }
     Ok(())
 }

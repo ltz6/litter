@@ -16,12 +16,17 @@ data class SavedServer(
     val name: String,
     val hostname: String,
     val port: Int,
+    val codexPorts: List<Int> = emptyList(),
     val sshPort: Int? = null,
     val source: String = "manual", // local, bonjour, tailscale, lanProbe, arpScan, ssh, manual
     val hasCodexServer: Boolean = false,
     val wakeMAC: String? = null,
-    val sshPortForwardingEnabled: Boolean = false,
+    val preferredConnectionMode: String? = null, // directCodex or ssh
+    val preferredCodexPort: Int? = null,
+    val sshPortForwardingEnabled: Boolean? = null, // legacy migration only
     val websocketURL: String? = null,
+    val os: String? = null,
+    val sshBanner: String? = null,
 ) {
     /** Stable key for deduplication across discovery cycles. */
     val deduplicationKey: String
@@ -42,43 +47,97 @@ data class SavedServer(
         put("name", name)
         put("hostname", hostname)
         put("port", port)
+        put("codexPorts", JSONArray(availableDirectCodexPorts))
         sshPort?.let { put("sshPort", it) }
         put("source", source)
         put("hasCodexServer", hasCodexServer)
         wakeMAC?.let { put("wakeMAC", it) }
-        put("sshPortForwardingEnabled", sshPortForwardingEnabled)
+        preferredConnectionMode?.let { put("preferredConnectionMode", it) }
+        preferredCodexPort?.let { put("preferredCodexPort", it) }
+        sshPortForwardingEnabled?.let { put("sshPortForwardingEnabled", it) }
         websocketURL?.let { put("websocketURL", it) }
+        os?.let { put("os", it) }
+        sshBanner?.let { put("sshBanner", it) }
     }
 
+    val availableDirectCodexPorts: List<Int>
+        get() {
+            val ordered = buildList {
+                if (hasCodexServer && port > 0) add(port)
+                addAll(codexPorts.filter { it > 0 })
+            }
+            return ordered.distinct()
+        }
+
+    val resolvedPreferredConnectionMode: String?
+        get() = when (preferredConnectionMode) {
+            "directCodex" -> if (availableDirectCodexPorts.isNotEmpty() || websocketURL != null) "directCodex" else null
+            "ssh" -> if (canConnectViaSsh) "ssh" else null
+            else -> if (sshPortForwardingEnabled == true) "ssh" else null
+        }
+
     val prefersSshConnection: Boolean
-        get() = websocketURL == null && (
-            sshPortForwardingEnabled ||
-                (hasCodexServer && port == 22) ||
-                (!hasCodexServer && (
-                    sshPort != null ||
-                        source == "ssh" ||
-                        port == 22
-                ))
-        )
+        get() = resolvedPreferredConnectionMode == "ssh"
 
     val canConnectViaSsh: Boolean
         get() = websocketURL == null && (
             sshPort != null ||
-                sshPortForwardingEnabled ||
                 source == "ssh" ||
-                port == 22 ||
-                !hasCodexServer
+                (!hasCodexServer && resolvedSshPort > 0) ||
+                preferredConnectionMode == "ssh" ||
+                sshPortForwardingEnabled == true
         )
 
     val resolvedSshPort: Int
-        get() = sshPort ?: port.takeIf { it > 0 } ?: 22
+        get() = sshPort ?: port.takeIf { !hasCodexServer && it > 0 } ?: 22
+
+    val resolvedPreferredCodexPort: Int?
+        get() = when {
+            resolvedPreferredConnectionMode != "directCodex" -> null
+            preferredCodexPort != null && availableDirectCodexPorts.contains(preferredCodexPort) -> preferredCodexPort
+            else -> null
+        }
+
+    val requiresConnectionChoice: Boolean
+        get() = websocketURL == null &&
+            resolvedPreferredConnectionMode == null &&
+            (
+                availableDirectCodexPorts.size > 1 ||
+                    (availableDirectCodexPorts.isNotEmpty() && canConnectViaSsh)
+            )
 
     val directCodexPort: Int?
         get() = when {
             websocketURL != null -> null
-            hasCodexServer && !prefersSshConnection && port > 0 -> port
+            prefersSshConnection -> null
+            resolvedPreferredCodexPort != null -> resolvedPreferredCodexPort
+            requiresConnectionChoice -> null
+            availableDirectCodexPorts.isNotEmpty() -> availableDirectCodexPorts.first()
             else -> null
         }
+
+    fun withPreferredConnection(mode: String?, codexPort: Int? = null): SavedServer =
+        copy(
+            port = when (mode) {
+                "directCodex" -> codexPort ?: directCodexPort ?: availableDirectCodexPorts.firstOrNull() ?: port
+                "ssh" -> resolvedSshPort
+                else -> port
+            },
+            codexPorts = availableDirectCodexPorts,
+            sshPort = sshPort ?: if (canConnectViaSsh) resolvedSshPort else null,
+            preferredConnectionMode = mode,
+            preferredCodexPort = if (mode == "directCodex") {
+                codexPort ?: directCodexPort ?: availableDirectCodexPorts.firstOrNull()
+            } else {
+                null
+            },
+            sshPortForwardingEnabled = null,
+        )
+
+    fun normalizedForPersistence(): SavedServer = withPreferredConnection(
+        mode = resolvedPreferredConnectionMode,
+        codexPort = resolvedPreferredCodexPort ?: availableDirectCodexPorts.firstOrNull(),
+    )
 
     companion object {
         fun fromJson(obj: JSONObject): SavedServer = SavedServer(
@@ -86,12 +145,28 @@ data class SavedServer(
             name = obj.optString("name", ""),
             hostname = obj.optString("hostname", ""),
             port = obj.optInt("port", 0),
+            codexPorts = buildList {
+                val ports = obj.optJSONArray("codexPorts")
+                if (ports != null) {
+                    for (index in 0 until ports.length()) {
+                        add(ports.optInt(index))
+                    }
+                }
+            },
             sshPort = if (obj.has("sshPort")) obj.getInt("sshPort") else null,
             source = obj.optString("source", "manual"),
             hasCodexServer = obj.optBoolean("hasCodexServer", false),
             wakeMAC = if (obj.has("wakeMAC")) obj.getString("wakeMAC") else null,
-            sshPortForwardingEnabled = obj.optBoolean("sshPortForwardingEnabled", false),
+            preferredConnectionMode = obj.optString("preferredConnectionMode").ifBlank { null },
+            preferredCodexPort = if (obj.has("preferredCodexPort")) obj.getInt("preferredCodexPort") else null,
+            sshPortForwardingEnabled = if (obj.has("sshPortForwardingEnabled")) {
+                obj.optBoolean("sshPortForwardingEnabled")
+            } else {
+                null
+            },
             websocketURL = if (obj.has("websocketURL")) obj.getString("websocketURL") else null,
+            os = if (obj.has("os")) obj.getString("os") else null,
+            sshBanner = if (obj.has("sshBanner")) obj.getString("sshBanner") else null,
         )
 
         fun from(server: FfiDiscoveredServer): SavedServer = SavedServer(
@@ -99,6 +174,7 @@ data class SavedServer(
             name = server.displayName,
             hostname = server.host,
             port = server.codexPort?.toInt() ?: server.port.toInt(),
+            codexPorts = server.codexPorts.map { it.toInt() },
             sshPort = server.sshPort?.toInt(),
             source = when (server.source) {
                 FfiDiscoverySource.BONJOUR -> "bonjour"
@@ -108,7 +184,9 @@ data class SavedServer(
                 FfiDiscoverySource.MANUAL -> "manual"
                 FfiDiscoverySource.LOCAL -> "local"
             },
-            hasCodexServer = server.codexPort != null,
+            hasCodexServer = server.codexPort != null || server.codexPorts.isNotEmpty(),
+            os = if (server.sshBanner != null) server.os else server.os,
+            sshBanner = server.sshBanner,
         )
     }
 }
@@ -124,7 +202,12 @@ object SavedServerStore {
         val json = prefs(context).getString(KEY, null) ?: return emptyList()
         return try {
             val array = JSONArray(json)
-            (0 until array.length()).map { SavedServer.fromJson(array.getJSONObject(it)) }
+            val decoded = (0 until array.length()).map { SavedServer.fromJson(array.getJSONObject(it)) }
+            val migrated = decoded.map { it.normalizedForPersistence() }
+            if (decoded != migrated) {
+                save(context, migrated)
+            }
+            migrated
         } catch (_: Exception) {
             emptyList()
         }

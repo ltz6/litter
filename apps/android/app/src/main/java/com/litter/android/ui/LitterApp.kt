@@ -140,6 +140,7 @@ fun LitterApp(appModel: AppModel) {
                         title = route.title,
                         onOpenConversation = navigateToConversation,
                         onBack = navigateBack,
+                        onInfo = { navigate(Route.ServerInfo(route.serverId)) },
                     )
                 }
 
@@ -172,11 +173,42 @@ fun LitterApp(appModel: AppModel) {
                         threadKey = route.key,
                         onBack = navigateBack,
                         onApplied = {
-                            // Pop back to conversation
+                            // Pop back to conversation info (keep it on the stack)
                             navStack = navStack.filter {
                                 it !is Route.WallpaperSelection &&
-                                    it !is Route.WallpaperAdjust &&
-                                    it !is Route.ConversationInfo
+                                    it !is Route.WallpaperAdjust
+                            }
+                        },
+                    )
+                }
+
+                is Route.ServerInfo -> {
+                    ConversationInfoScreen(
+                        threadKey = null,
+                        serverId = route.serverId,
+                        onBack = navigateBack,
+                        onChangeWallpaper = { navigate(Route.ServerWallpaperSelection(route.serverId)) },
+                    )
+                }
+
+                is Route.ServerWallpaperSelection -> {
+                    com.litter.android.ui.settings.WallpaperSelectionScreen(
+                        threadKey = null,
+                        serverId = route.serverId,
+                        onBack = navigateBack,
+                        onAdjust = { navigate(Route.ServerWallpaperAdjust(route.serverId)) },
+                    )
+                }
+
+                is Route.ServerWallpaperAdjust -> {
+                    com.litter.android.ui.settings.WallpaperAdjustScreen(
+                        threadKey = null,
+                        serverId = route.serverId,
+                        onBack = navigateBack,
+                        onApplied = {
+                            navStack = navStack.filter {
+                                it !is Route.ServerWallpaperSelection &&
+                                    it !is Route.ServerWallpaperAdjust
                             }
                         },
                     )
@@ -206,6 +238,8 @@ fun LitterApp(appModel: AppModel) {
         if (showDiscovery) {
             val discoveredServers by networkDiscovery.servers.collectAsState()
             val isScanning by networkDiscovery.isScanning.collectAsState()
+            val scanProgress by networkDiscovery.scanProgress.collectAsState()
+            val scanProgressLabel by networkDiscovery.scanProgressLabel.collectAsState()
             val context = LocalContext.current
 
             // Start scanning when discovery sheet opens
@@ -224,6 +258,8 @@ fun LitterApp(appModel: AppModel) {
                 DiscoveryScreen(
                     discoveredServers = discoveredServers,
                     isScanning = isScanning,
+                    scanProgress = scanProgress,
+                    scanProgressLabel = scanProgressLabel,
                     onRefresh = { networkDiscovery.startScanning(context) },
                     onDismiss = {
                         showDiscovery = false

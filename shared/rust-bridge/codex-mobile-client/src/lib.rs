@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod discovery_uniffi;
 pub mod ffi;
 pub mod hydration;
+pub mod immer_patch;
 pub mod logging;
 pub mod parser;
 pub mod rpc;

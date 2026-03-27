@@ -26,6 +26,9 @@ fun WallpaperBackdrop(
     threadKey: ThreadKey? = null,
     modifier: Modifier = Modifier,
 ) {
+    // Read version to recompose when wallpaper prefs change
+    @Suppress("UNUSED_VARIABLE")
+    val ver = WallpaperManager.version
     val config = if (threadKey != null) WallpaperManager.resolvedConfig(threadKey) else null
     val bitmap = if (config != null) {
         WallpaperManager.resolvedBitmapForConfig(config, threadKey)
@@ -33,11 +36,25 @@ fun WallpaperBackdrop(
         null
     }
 
-    if (config != null && (bitmap != null || config.type == WallpaperType.SOLID_COLOR)) {
+    val isVideo = config?.type == WallpaperType.CUSTOM_VIDEO || config?.type == WallpaperType.VIDEO_URL
+    val videoPath = if (isVideo) WallpaperManager.videoFilePath(threadKey) else null
+
+    if (config != null && (bitmap != null || config.type == WallpaperType.SOLID_COLOR || (isVideo && videoPath != null))) {
         val blurRadius = (config.blur * 25f).dp
         val brightnessAlpha = config.brightness.coerceIn(0f, 1f)
 
-        if (config.type == WallpaperType.SOLID_COLOR) {
+        if (isVideo && videoPath != null) {
+            Box(
+                modifier = modifier
+                    .blur(blurRadius)
+                    .graphicsLayer { alpha = brightnessAlpha },
+            ) {
+                VideoWallpaperPlayer(
+                    filePath = videoPath,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        } else if (config.type == WallpaperType.SOLID_COLOR) {
             val color = config.colorHex?.let { colorFromHex(it) }
                 ?: LitterTheme.background
             Box(
@@ -51,7 +68,7 @@ fun WallpaperBackdrop(
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = modifier
-                    .then(if (blurRadius > 0.dp) Modifier.blur(blurRadius) else Modifier)
+                    .blur(blurRadius)
                     .graphicsLayer { alpha = brightnessAlpha },
             )
         }

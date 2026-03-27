@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 
-/// Default ports to probe for Codex servers.
-const DEFAULT_SCAN_PORTS: &[u16] = &[8390, 4222, 9234];
+/// Default ports to probe for Codex and SSH servers.
+const DEFAULT_SCAN_PORTS: &[u16] = &[8390, 9234, 22];
 
 /// Maximum concurrent TCP probes during subnet scans.
 const MAX_CONCURRENT_PROBES: usize = 64;
@@ -40,6 +40,7 @@ pub struct DiscoveredServer {
     pub host: String,
     pub port: u16,
     pub codex_port: Option<u16>,
+    pub codex_ports: Vec<u16>,
     pub ssh_port: Option<u16>,
     pub source: DiscoverySource,
     pub metadata: HashMap<String, String>,
@@ -85,6 +86,10 @@ pub struct ProgressiveDiscoveryUpdate {
     pub kind: ProgressiveDiscoveryUpdateKind,
     pub source: Option<DiscoverySource>,
     pub servers: Vec<DiscoveredServer>,
+    /// Overall scan progress from 0.0 to 1.0.
+    pub progress: f32,
+    /// Human-readable label for what just completed or is in progress.
+    pub progress_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,14 +280,18 @@ impl DiscoveryService {
         tx: &broadcast::Sender<ProgressiveDiscoveryUpdate>,
     ) -> Vec<DiscoveredServer> {
         let local_ipv4_hint = local_ipv4_hint.and_then(parse_ipv4_hint);
+        let lan_probed = Arc::new(AtomicU32::new(0));
+        let lan_total = self.lan_probe_host_count();
         let mut join_set = JoinSet::new();
 
         {
             let svc = self.clone_for_one_shot();
+            let counter = Arc::clone(&lan_probed);
             join_set.spawn(async move {
                 (
                     DiscoverySource::LanProbe,
-                    svc.scan_lan_probe(local_ipv4_hint).await,
+                    svc.scan_lan_probe_with_progress(local_ipv4_hint, Some(counter))
+                        .await,
                 )
             });
         }
@@ -315,18 +324,66 @@ impl DiscoveryService {
 
         let mut cumulative = Vec::new();
         let mut latest_results = Vec::new();
+        let mut completed_weight: f32 = 0.0;
+        let lan_weight = source_progress_weight(DiscoverySource::LanProbe);
+        let mut lan_finished = false;
 
-        while let Some(result) = join_set.join_next().await {
-            let Ok((source, servers)) = result else {
-                continue;
-            };
-            cumulative.extend(servers);
-            latest_results = reconcile_discovered_servers(cumulative.clone());
-            let _ = tx.send(ProgressiveDiscoveryUpdate {
-                kind: ProgressiveDiscoveryUpdateKind::PartialResults,
-                source: Some(source),
-                servers: latest_results.clone(),
-            });
+        // Emit intermediate LAN progress until all sources finish.
+        loop {
+            // Poll the JoinSet with a short timeout so we can emit LAN progress.
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                join_set.join_next(),
+            )
+            .await;
+
+            match result {
+                Ok(Some(Ok((source, servers)))) => {
+                    cumulative.extend(servers);
+                    latest_results = reconcile_discovered_servers(cumulative.clone());
+                    completed_weight += source_progress_weight(source);
+                    if source == DiscoverySource::LanProbe {
+                        lan_finished = true;
+                    }
+                    let progress = completed_weight.min(1.0);
+                    let _ = tx.send(ProgressiveDiscoveryUpdate {
+                        kind: ProgressiveDiscoveryUpdateKind::PartialResults,
+                        source: Some(source),
+                        servers: latest_results.clone(),
+                        progress,
+                        progress_label: Some(source_display_label(source)),
+                    });
+                }
+                Ok(Some(Err(_))) => {
+                    // Task panicked, skip
+                }
+                Ok(None) => {
+                    // JoinSet exhausted
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — emit intermediate LAN progress if still running.
+                    if !lan_finished {
+                        let probed = lan_probed.load(Ordering::Relaxed);
+                        let lan_frac = if lan_total > 0 {
+                            probed as f32 / lan_total as f32
+                        } else {
+                            0.0
+                        };
+                        let progress = (completed_weight + lan_frac * lan_weight).min(0.99);
+                        let _ = tx.send(ProgressiveDiscoveryUpdate {
+                            kind: ProgressiveDiscoveryUpdateKind::PartialResults,
+                            source: None,
+                            servers: latest_results.clone(),
+                            progress,
+                            progress_label: Some(format!(
+                                "Scanning LAN · {}/{}",
+                                probed, lan_total
+                            )),
+                        });
+                    }
+                }
+            }
         }
 
         self.update_cached_servers(&latest_results);
@@ -334,6 +391,8 @@ impl DiscoveryService {
             kind: ProgressiveDiscoveryUpdateKind::ScanComplete,
             source: None,
             servers: latest_results.clone(),
+            progress: 1.0,
+            progress_label: None,
         });
         latest_results
     }
@@ -447,6 +506,7 @@ impl DiscoveryService {
             host: host.clone(),
             port,
             codex_port: Some(port),
+            codex_ports: vec![port],
             ssh_port: None,
             source: DiscoverySource::Manual,
             metadata: HashMap::new(),
@@ -475,6 +535,14 @@ impl DiscoveryService {
 
     /// LAN subnet probe: detect local IP, scan /24 subnet in parallel.
     async fn scan_lan_probe(&self, local_ipv4_hint: Option<Ipv4Addr>) -> Vec<DiscoveredServer> {
+        self.scan_lan_probe_with_progress(local_ipv4_hint, None).await
+    }
+
+    async fn scan_lan_probe_with_progress(
+        &self,
+        local_ipv4_hint: Option<Ipv4Addr>,
+        probed_counter: Option<Arc<AtomicU32>>,
+    ) -> Vec<DiscoveredServer> {
         if !self.config.enable_lan_probe {
             return Vec::new();
         }
@@ -504,25 +572,24 @@ impl DiscoveryService {
             let ip = Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host_octet);
             let sem = semaphore.clone();
             let ports = ports.clone();
+            let counter = probed_counter.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let host_str = ip.to_string();
-                if let Some(port) = first_reachable_port(&host_str, &ports, timeout).await {
-                    return Some(DiscoveredServer {
-                        id: format!("network-{}", host_str),
-                        display_name: host_str.clone(),
-                        host: host_str,
-                        port,
-                        codex_port: Some(port),
-                        ssh_port: None,
-                        source: DiscoverySource::LanProbe,
-                        metadata: HashMap::new(),
-                        last_seen: Instant::now(),
-                        reachable: true,
-                    });
+                let reachable_ports = all_reachable_ports(&host_str, &ports, timeout).await;
+                if let Some(c) = &counter {
+                    c.fetch_add(1, Ordering::Relaxed);
                 }
-                None
+                if reachable_ports.is_empty() {
+                    return None;
+                }
+                Some(server_from_reachable_ports(
+                    &host_str,
+                    &reachable_ports,
+                    DiscoverySource::LanProbe,
+                    timeout,
+                ).await)
             }));
         }
 
@@ -534,6 +601,10 @@ impl DiscoveryService {
         }
 
         results
+    }
+
+    fn lan_probe_host_count(&self) -> u32 {
+        253
     }
 
     /// Tailscale peer discovery via local API.
@@ -557,32 +628,28 @@ impl DiscoveryService {
         for (ip, hostname) in peers {
             let ports = ports.clone();
             handles.push(tokio::spawn(async move {
-                if let Some(port) = first_reachable_port(&ip, &ports, timeout).await {
-                    let display = if hostname.is_empty() {
-                        ip.clone()
-                    } else {
-                        hostname.clone()
-                    };
-                    return Some(DiscoveredServer {
-                        id: format!("network-{}", ip),
-                        display_name: display,
-                        host: ip,
-                        port,
-                        codex_port: Some(port),
-                        ssh_port: None,
-                        source: DiscoverySource::Tailscale,
-                        metadata: {
-                            let mut m = HashMap::new();
-                            if !hostname.is_empty() {
-                                m.insert("hostname".to_string(), hostname);
-                            }
-                            m
-                        },
-                        last_seen: Instant::now(),
-                        reachable: true,
-                    });
+                let reachable_ports = all_reachable_ports(&ip, &ports, timeout).await;
+                if reachable_ports.is_empty() {
+                    return None;
                 }
-                None
+                let display = if hostname.is_empty() {
+                    ip.clone()
+                } else {
+                    hostname.clone()
+                };
+                let mut server = server_from_reachable_ports(
+                    &ip,
+                    &reachable_ports,
+                    DiscoverySource::Tailscale,
+                    timeout,
+                ).await;
+                server.display_name = display;
+                if !hostname.is_empty() {
+                    server
+                        .metadata
+                        .insert("hostname".to_string(), hostname);
+                }
+                Some(server)
             }));
         }
 
@@ -672,8 +739,15 @@ impl DiscoveryService {
             }
 
             if codex_port.is_none() {
+                let codex_only_ports: Vec<u16> = self
+                    .config
+                    .scan_ports
+                    .iter()
+                    .copied()
+                    .filter(|&p| p != SSH_PORT)
+                    .collect();
                 if let Some(port) =
-                    first_reachable_port(&host, &self.config.scan_ports, self.config.probe_timeout)
+                    first_reachable_port(&host, &codex_only_ports, self.config.probe_timeout)
                         .await
                 {
                     codex_port = Some(port);
@@ -687,6 +761,16 @@ impl DiscoveryService {
 
             let mut metadata = seed.txt;
             metadata.insert("service_type".to_string(), seed.service_type);
+            if let Some(sp) = ssh_port {
+                if let Some(banner) =
+                    grab_ssh_banner(&host, sp, self.config.probe_timeout).await
+                {
+                    if let Some(os) = parse_ssh_banner_os(&banner) {
+                        metadata.insert("os".to_string(), os);
+                    }
+                    metadata.insert("ssh_banner".to_string(), banner);
+                }
+            }
             let port = primary_port(codex_port, ssh_port);
             if port == 0 {
                 continue;
@@ -702,6 +786,7 @@ impl DiscoveryService {
                 host,
                 port,
                 codex_port,
+                codex_ports: codex_port.into_iter().collect(),
                 ssh_port,
                 source: DiscoverySource::Bonjour,
                 metadata,
@@ -734,21 +819,16 @@ impl DiscoveryService {
             let ports = ports.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                if let Some(port) = first_reachable_port(&ip, &ports, timeout).await {
-                    return Some(DiscoveredServer {
-                        id: format!("network-{}", ip),
-                        display_name: ip.clone(),
-                        host: ip,
-                        port,
-                        codex_port: Some(port),
-                        ssh_port: None,
-                        source: DiscoverySource::ArpScan,
-                        metadata: HashMap::new(),
-                        last_seen: Instant::now(),
-                        reachable: true,
-                    });
+                let reachable_ports = all_reachable_ports(&ip, &ports, timeout).await;
+                if reachable_ports.is_empty() {
+                    return None;
                 }
-                None
+                Some(server_from_reachable_ports(
+                    &ip,
+                    &reachable_ports,
+                    DiscoverySource::ArpScan,
+                    timeout,
+                ).await)
             }));
         }
 
@@ -776,6 +856,7 @@ impl DiscoveryService {
                     host,
                     port,
                     codex_port: Some(port),
+                    codex_ports: vec![port],
                     ssh_port: None,
                     source: DiscoverySource::Manual,
                     metadata: HashMap::new(),
@@ -814,6 +895,118 @@ async fn any_reachable_port(host: &str, ports: &[u16], timeout: Duration) -> boo
         .await
         .into_iter()
         .any(|reachable| reachable)
+}
+
+async fn all_reachable_ports(host: &str, ports: &[u16], timeout: Duration) -> Vec<u16> {
+    let probes = ports.iter().map(|&port| tcp_probe(host, port, timeout));
+    let results = join_all(probes).await;
+    ports
+        .iter()
+        .copied()
+        .zip(results.into_iter())
+        .filter_map(|(port, reachable)| reachable.then_some(port))
+        .collect()
+}
+
+/// Well-known SSH port.
+const SSH_PORT: u16 = 22;
+
+/// Build a `DiscoveredServer` from the set of reachable ports, correctly
+/// classifying SSH vs Codex ports. Grabs the SSH banner when port 22 is
+/// open to identify the remote OS.
+async fn server_from_reachable_ports(
+    host: &str,
+    reachable_ports: &[u16],
+    source: DiscoverySource,
+    probe_timeout: Duration,
+) -> DiscoveredServer {
+    let ssh_port = reachable_ports.contains(&SSH_PORT).then_some(SSH_PORT);
+    let codex_ports: Vec<u16> = reachable_ports
+        .iter()
+        .copied()
+        .filter(|&p| p != SSH_PORT)
+        .collect();
+    let codex_port = codex_ports.first().copied();
+    let port = primary_port(codex_port, ssh_port);
+
+    let mut metadata = HashMap::new();
+    if ssh_port.is_some() {
+        if let Some(banner) = grab_ssh_banner(host, SSH_PORT, probe_timeout).await {
+            if let Some(os) = parse_ssh_banner_os(&banner) {
+                metadata.insert("os".to_string(), os);
+            }
+            metadata.insert("ssh_banner".to_string(), banner);
+        }
+    }
+
+    DiscoveredServer {
+        id: format!("network-{}", host),
+        display_name: host.to_string(),
+        host: host.to_string(),
+        port,
+        codex_port,
+        codex_ports,
+        ssh_port,
+        source,
+        metadata,
+        last_seen: Instant::now(),
+        reachable: true,
+    }
+}
+
+/// Connect to an SSH port and read the server's version banner.
+///
+/// The SSH protocol requires the server to send its banner immediately
+/// after TCP connect, so this adds negligible latency on top of the
+/// probe we already did.
+async fn grab_ssh_banner(host: &str, port: u16, timeout: Duration) -> Option<String> {
+    let addr = format!("{}:{}", host, port);
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    let line = String::from_utf8_lossy(&buf[..n]);
+    let banner = line.lines().next()?.trim().to_string();
+    banner.starts_with("SSH-").then_some(banner)
+}
+
+/// Extract an OS name from an SSH version banner.
+///
+/// Common banners:
+///   SSH-2.0-OpenSSH_for_Windows_8.1
+///   SSH-2.0-OpenSSH_9.5 Windows_NT
+///   SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6
+///   SSH-2.0-OpenSSH_9.2p1 Debian-5+deb12u1
+///   SSH-2.0-OpenSSH_9.2p1 Raspbian-5+deb12u1
+fn parse_ssh_banner_os(banner: &str) -> Option<String> {
+    let lower = banner.to_lowercase();
+    if lower.contains("windows") {
+        Some("Windows".to_string())
+    } else if lower.contains("raspbian") {
+        Some("Raspbian".to_string())
+    } else if lower.contains("ubuntu") {
+        Some("Ubuntu".to_string())
+    } else if lower.contains("debian") {
+        Some("Debian".to_string())
+    } else if lower.contains("fedora") {
+        Some("Fedora".to_string())
+    } else if lower.contains("red hat") || lower.contains("redhat") {
+        Some("Red Hat".to_string())
+    } else if lower.contains("freebsd") {
+        Some("FreeBSD".to_string())
+    } else {
+        // Bare OpenSSH (macOS, some minimal Linux) or non-OpenSSH servers
+        // (dropbear, libssh). Don't guess — let the platform layer use
+        // discovery source (e.g. Bonjour → macOS) to infer the OS.
+        None
+    }
 }
 
 async fn first_reachable_port(host: &str, ports: &[u16], timeout: Duration) -> Option<u16> {
@@ -866,6 +1059,7 @@ fn merge_server(existing: &mut DiscoveredServer, candidate: DiscoveredServer) {
     if candidate.codex_port.is_some() && (existing.codex_port.is_none() || prefer_candidate) {
         existing.codex_port = candidate.codex_port;
     }
+    merge_codex_ports(existing, &candidate, prefer_candidate);
     if candidate.ssh_port.is_some() && (existing.ssh_port.is_none() || prefer_candidate) {
         existing.ssh_port = candidate.ssh_port;
     }
@@ -880,6 +1074,31 @@ fn merge_server(existing: &mut DiscoveredServer, candidate: DiscoveredServer) {
     } else if prefer_candidate && candidate.port > 0 {
         existing.port = candidate.port;
     }
+    existing.codex_port = existing.codex_ports.first().copied();
+}
+
+fn merge_codex_ports(
+    existing: &mut DiscoveredServer,
+    candidate: &DiscoveredServer,
+    prefer_candidate: bool,
+) {
+    let mut ports = if prefer_candidate {
+        candidate.codex_ports.clone()
+    } else {
+        existing.codex_ports.clone()
+    };
+    let incoming = if prefer_candidate {
+        &existing.codex_ports
+    } else {
+        &candidate.codex_ports
+    };
+    for port in incoming {
+        if !ports.contains(port) {
+            ports.push(*port);
+        }
+    }
+    ports.sort_unstable();
+    existing.codex_ports = ports;
 }
 
 /// Detect the local IPv4 address by binding a UDP socket to a public address.
@@ -1081,6 +1300,29 @@ fn clean_hostname(name: &str) -> String {
     s
 }
 
+/// Approximate time-weight for each source, used to compute a smooth
+/// progress fraction. LAN probe dominates wall-clock time.
+fn source_progress_weight(source: DiscoverySource) -> f32 {
+    match source {
+        DiscoverySource::Manual | DiscoverySource::Bundled => 0.02,
+        DiscoverySource::ArpScan => 0.05,
+        DiscoverySource::Bonjour => 0.13,
+        DiscoverySource::Tailscale => 0.15,
+        DiscoverySource::LanProbe => 0.65,
+    }
+}
+
+fn source_display_label(source: DiscoverySource) -> String {
+    match source {
+        DiscoverySource::LanProbe => "LAN scan".to_string(),
+        DiscoverySource::Tailscale => "Tailscale".to_string(),
+        DiscoverySource::Bonjour => "Bonjour".to_string(),
+        DiscoverySource::ArpScan => "ARP scan".to_string(),
+        DiscoverySource::Manual => "Saved servers".to_string(),
+        DiscoverySource::Bundled => "Local".to_string(),
+    }
+}
+
 /// Rank discovery sources for deduplication priority (lower = better).
 fn source_rank(source: DiscoverySource) -> u8 {
     match source {
@@ -1136,7 +1378,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = DiscoveryConfig::default();
-        assert_eq!(config.scan_ports, vec![8390, 4222, 9234]);
+        assert_eq!(config.scan_ports, vec![8390, 9234, 22]);
         assert_eq!(config.probe_timeout, Duration::from_secs(2));
         assert!(config.enable_bonjour);
         assert!(config.enable_tailscale);
@@ -1261,6 +1503,7 @@ mod tests {
             host: "10.0.0.1".to_string(),
             port: 8390,
             codex_port: Some(8390),
+            codex_ports: vec![8390],
             ssh_port: None,
             source: DiscoverySource::LanProbe,
             metadata: HashMap::new(),
@@ -1281,6 +1524,7 @@ mod tests {
             host: "10.0.0.2".to_string(),
             port: 22,
             codex_port: None,
+            codex_ports: vec![],
             ssh_port: Some(22),
             source: DiscoverySource::Manual,
             metadata: HashMap::new(),
@@ -1293,6 +1537,7 @@ mod tests {
             host: "10.0.0.2".to_string(),
             port: 8390,
             codex_port: Some(8390),
+            codex_ports: vec![8390],
             ssh_port: Some(22),
             source: DiscoverySource::Bonjour,
             metadata: HashMap::new(),

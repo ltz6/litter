@@ -27,6 +27,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Pets
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Science
@@ -111,21 +112,24 @@ fun SettingsSheet(
     when (subScreen) {
         SettingsSubScreen.Appearance -> AppearanceScreen(onBack = { subScreen = null })
         SettingsSubScreen.Experimental -> ExperimentalScreen(onBack = { subScreen = null })
+        SettingsSubScreen.TipJar -> TipJarScreen(onBack = { subScreen = null })
         null -> SettingsTopLevel(
             onDismiss = onDismiss,
             onOpenAppearance = { subScreen = SettingsSubScreen.Appearance },
             onOpenExperimental = { subScreen = SettingsSubScreen.Experimental },
+            onOpenTipJar = { subScreen = SettingsSubScreen.TipJar },
         )
     }
 }
 
-private enum class SettingsSubScreen { Appearance, Experimental }
+private enum class SettingsSubScreen { Appearance, Experimental, TipJar }
 
 @Composable
 private fun SettingsTopLevel(
     onDismiss: () -> Unit,
     onOpenAppearance: () -> Unit,
     onOpenExperimental: () -> Unit,
+    onOpenTipJar: () -> Unit,
 ) {
     val appModel = LocalAppModel.current
     val context = LocalContext.current
@@ -190,6 +194,12 @@ private fun SettingsTopLevel(
         item { SectionHeader("Experimental") }
         item {
             NavRow(icon = Icons.Default.Science, label = "Experimental Features", onClick = onOpenExperimental)
+        }
+
+        // ── Support ──
+        item { SectionHeader("Support") }
+        item {
+            NavRow(icon = Icons.Default.Pets, label = "Tip the Kitty", onClick = onOpenTipJar)
         }
 
         // ── Account ──
@@ -350,7 +360,7 @@ private fun AppearanceScreen(onBack: () -> Unit) {
                             .clip(RoundedCornerShape(8.dp))
                             .border(1.dp, LitterTheme.border.copy(alpha = 0.5f), RoundedCornerShape(8.dp)),
                     ) {
-                        WallpaperBackdrop(Modifier.fillMaxSize())
+                        WallpaperBackdrop(modifier = Modifier.fillMaxSize())
                     }
                     Column(
                         modifier = Modifier.weight(1f),
@@ -394,7 +404,7 @@ private fun AppearanceScreen(onBack: () -> Unit) {
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(10.dp))
                 ) {
-                    WallpaperBackdrop(Modifier.fillMaxSize())
+                    WallpaperBackdrop(modifier = Modifier.fillMaxSize())
                     Column(
                         Modifier
                             .fillMaxWidth()
