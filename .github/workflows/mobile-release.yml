@@ -506,7 +506,7 @@ jobs:
   upload-testflight:
     needs: [detect-release-changes, ios-release-prep]
     if: needs.detect-release-changes.outputs.release_ios == 'true'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 150
     environment: release
     env:
@@ -526,6 +526,11 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
 
       - name: Validate required secrets
         env:
