@@ -19,6 +19,7 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.sqrt
+import uniffi.codex_mobile_client.AuthMode
 
 /**
  * Records microphone input and transcribes via ChatGPT/OpenAI API.
@@ -91,7 +92,7 @@ class VoiceTranscriptionManager {
         }.also { it.start() }
     }
 
-    suspend fun stopAndTranscribe(authToken: String, useOpenAI: Boolean = false): String? {
+    suspend fun stopAndTranscribe(authMethod: AuthMode?, authToken: String?): String? {
         _isRecording.value = false
         audioRecord?.stop()
         audioRecord?.release()
@@ -119,6 +120,12 @@ class VoiceTranscriptionManager {
             return null
         }
 
+        val token = authToken?.trim().orEmpty()
+        if (token.isEmpty()) {
+            _error.value = "Not logged in."
+            return null
+        }
+
         // Resample to 24kHz
         val targetRate = 24000
         val resampled = resample(allSamples, deviceSampleRate, targetRate)
@@ -128,10 +135,10 @@ class VoiceTranscriptionManager {
         _isTranscribing.value = true
         return try {
             withContext(Dispatchers.IO) {
-                if (useOpenAI) {
-                    transcribeOpenAI(wav, authToken)
+                if (authMethod == AuthMode.API_KEY) {
+                    transcribeOpenAI(wav, token)
                 } else {
-                    transcribeChatGPT(wav, authToken)
+                    transcribeChatGPT(wav, token)
                 }
             }
         } catch (e: Exception) {
@@ -259,7 +266,7 @@ class VoiceTranscriptionManager {
 
         // Parse transcript from JSON response
         return try {
-            org.json.JSONObject(response).optString("text", null)
+            org.json.JSONObject(response).optString("text").takeIf { it.isNotBlank() }
         } catch (_: Exception) {
             response.takeIf { it.isNotBlank() }
         }

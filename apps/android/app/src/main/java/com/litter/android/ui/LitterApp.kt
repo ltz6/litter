@@ -108,10 +108,13 @@ fun LitterApp(appModel: AppModel) {
                 serverId,
                 appModel.launchState.threadStartParams(cwd),
             )
-            val key = ThreadKey(serverId = serverId, threadId = response.thread.id)
-            appModel.store.setActiveThread(key)
+            val startedKey = ThreadKey(serverId = serverId, threadId = response.thread.id)
+            appModel.store.setActiveThread(startedKey)
             appModel.refreshSnapshot()
-            navigateToConversation(key)
+            val resolvedKey = appModel.ensureThreadLoaded(startedKey)
+                ?: appModel.snapshot.value?.threads?.firstOrNull { it.key == startedKey }?.key
+                ?: startedKey
+            navigateToConversation(resolvedKey)
         }
 
         fun openDirectoryPicker(preferredServerId: String? = null) {

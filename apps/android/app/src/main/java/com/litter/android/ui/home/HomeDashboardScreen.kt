@@ -1,8 +1,10 @@
 package com.litter.android.ui.home
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -379,6 +381,7 @@ fun HomeDashboardScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionCard(
     session: AppSessionSummary,
@@ -392,7 +395,10 @@ private fun SessionCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(LitterTheme.surface, RoundedCornerShape(10.dp))
-                .clickable(onClick = onClick)
+                .combinedClickable(
+                    onClick = onClick,
+                    onLongClick = { showMenu = true },
+                )
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -444,6 +450,18 @@ private fun SessionCard(
                         fontSize = 10.sp,
                     )
                 }
+            }
+
+            Spacer(Modifier.width(4.dp))
+            IconButton(
+                onClick = { showMenu = true },
+                modifier = Modifier.size(28.dp),
+            ) {
+                Icon(
+                    Icons.Default.MoreVert,
+                    contentDescription = "Session actions",
+                    tint = LitterTheme.textSecondary,
+                )
             }
         }
 

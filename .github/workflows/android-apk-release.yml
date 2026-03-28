@@ -115,6 +115,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: release
+    env:
+      SCCACHE_BUCKET: rust-cache
+      SCCACHE_ENDPOINT: ${{ secrets.SCCACHE_R2_ENDPOINT }}
+      SCCACHE_REGION: auto
+      SCCACHE_S3_USE_SSL: "true"
+      SCCACHE_S3_KEY_PREFIX: ci/android
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
     steps:
       - name: Checkout
@@ -147,14 +155,6 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-        env:
-          SCCACHE_BUCKET: rust-cache
-          SCCACHE_ENDPOINT: ${{ secrets.SCCACHE_R2_ENDPOINT }}
-          SCCACHE_REGION: auto
-          SCCACHE_S3_USE_SSL: "true"
-          SCCACHE_S3_KEY_PREFIX: ci/android
-          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
       - name: Download shared prep artifact
         uses: actions/download-artifact@v4

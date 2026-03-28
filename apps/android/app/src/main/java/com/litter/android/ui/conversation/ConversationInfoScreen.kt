@@ -169,17 +169,19 @@ fun ConversationInfoScreen(
                                 val t = thread ?: return@launch
                                 val tk = threadKey ?: return@launch
                                 try {
-                                    val newKey = appModel.store.forkThreadFromMessage(
-                                        tk,
-                                        0u,
+                                    val response = appModel.rpc.threadFork(
+                                        tk.serverId,
                                         appModel.launchState.threadForkParams(
-                                            tk.threadId,
+                                            sourceThreadId = tk.threadId,
                                             cwdOverride = t.info.cwd,
                                         ),
                                     )
+                                    val newKey = ThreadKey(
+                                        serverId = tk.serverId,
+                                        threadId = response.thread.id,
+                                    )
                                     appModel.store.setActiveThread(newKey)
                                     appModel.refreshSnapshot()
-                                    onBack()
                                 } catch (_: Exception) {}
                             }
                         },

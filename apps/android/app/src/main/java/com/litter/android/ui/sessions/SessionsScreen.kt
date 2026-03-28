@@ -93,6 +93,7 @@ fun SessionsScreen(
     var searchQuery by remember { mutableStateOf("") }
     var showSortMenu by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
+    var isForkingActiveThread by remember { mutableStateOf(false) }
     var hasLoadedInitialSessions by remember { mutableStateOf(false) }
     var pendingActiveSessionScroll by remember { mutableStateOf(false) }
     val derived = remember(
@@ -176,6 +177,30 @@ fun SessionsScreen(
         }
     }
 
+    suspend fun forkThread(summary: uniffi.codex_mobile_client.AppSessionSummary) {
+        if (isForkingActiveThread) return
+        isForkingActiveThread = true
+        try {
+            val response = appModel.rpc.threadFork(
+                summary.key.serverId,
+                appModel.launchState.threadForkParams(
+                    sourceThreadId = summary.key.threadId,
+                    cwdOverride = summary.cwd,
+                ),
+            )
+            val newKey = ThreadKey(
+                serverId = summary.key.serverId,
+                threadId = response.thread.id,
+            )
+            appModel.store.setActiveThread(newKey)
+            appModel.refreshSnapshot()
+            appModel.launchState.updateCurrentCwd(summary.cwd)
+            onOpenConversation(newKey)
+        } finally {
+            isForkingActiveThread = false
+        }
+    }
+
     LaunchedEffect(connectedServerIds) {
         if (connectedServerIds.isEmpty()) {
             isLoading = false
@@ -233,6 +258,25 @@ fun SessionsScreen(
                 color = LitterTheme.textMuted,
                 fontSize = 12.sp,
             )
+            val activeSummary = snapshot?.activeThread?.let { activeKey ->
+                snapshot?.sessionSummaries?.firstOrNull { it.key == activeKey }
+            }
+            if (activeSummary != null) {
+                TextButton(
+                    onClick = { scope.launch { forkThread(activeSummary) } },
+                    enabled = !isForkingActiveThread && !activeSummary.hasActiveTurn,
+                ) {
+                    if (isForkingActiveThread) {
+                        CircularProgressIndicator(
+                            color = LitterTheme.accent,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    } else {
+                        Text("Fork", color = LitterTheme.accent, fontSize = 12.sp)
+                    }
+                }
+            }
             IconButton(
                 onClick = { scope.launch { loadSessions(force = true) } },
                 enabled = !isLoading && connectedServerIds.isNotEmpty(),
@@ -413,6 +457,9 @@ fun SessionsScreen(
                                 appModel.launchState.updateCurrentCwd(node.summary.cwd)
                                 onOpenConversation(node.summary.key)
                             },
+                            onFork = {
+                                scope.launch { forkThread(node.summary) }
+                            },
                         )
                     }
                 }
@@ -431,6 +478,7 @@ private fun SessionNodeRow(
     isCollapsed: Boolean,
     onToggleCollapse: () -> Unit,
     onClick: () -> Unit,
+    onFork: () -> Unit,
 ) {
     val appModel = LocalAppModel.current
     val scope = rememberCoroutineScope()
@@ -520,6 +568,13 @@ private fun SessionNodeRow(
         }
 
         DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+            DropdownMenuItem(
+                text = { Text("Fork") },
+                onClick = {
+                    showMenu = false
+                    onFork()
+                },
+            )
             DropdownMenuItem(
                 text = { Text("Rename") },
                 onClick = { showMenu = false; showRenameDialog = true },

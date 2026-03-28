@@ -9,6 +9,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,6 +28,7 @@ import uniffi.codex_mobile_client.ServerBridge
 import uniffi.codex_mobile_client.SshBridge
 import uniffi.codex_mobile_client.ThreadKey
 import uniffi.codex_mobile_client.ThreadListParams
+import uniffi.codex_mobile_client.ThreadReadParams
 
 /**
  * Central app state singleton. Thin wrapper over Rust [AppStore] — all business
@@ -336,6 +338,81 @@ class AppModel private constructor(context: android.content.Context) {
             _lastError.value = e.message
             throw e
         }
+    }
+
+    suspend fun ensureThreadLoaded(
+        key: ThreadKey,
+        maxAttempts: Int = 5,
+    ): ThreadKey? {
+        if (_snapshot.value?.threads?.any { it.key == key } == true) {
+            return key
+        }
+
+        var currentKey = key
+        repeat(maxAttempts) { attempt ->
+            var readSucceeded = false
+            try {
+                val response = rpc.threadRead(
+                    currentKey.serverId,
+                    ThreadReadParams(
+                        threadId = currentKey.threadId,
+                        includeTurns = true,
+                    ),
+                )
+                currentKey = ThreadKey(
+                    serverId = currentKey.serverId,
+                    threadId = response.thread.id,
+                )
+                store.setActiveThread(currentKey)
+                readSucceeded = true
+            } catch (e: Exception) {
+                _lastError.value = e.message
+            }
+
+            refreshSnapshot()
+            if (_snapshot.value?.threads?.any { it.key == currentKey } == true) {
+                return currentKey
+            }
+
+            if (!readSucceeded) {
+                try {
+                    rpc.threadList(
+                        currentKey.serverId,
+                        ThreadListParams(
+                            cursor = null,
+                            limit = null,
+                            sortKey = null,
+                            modelProviders = null,
+                            sourceKinds = null,
+                            archived = null,
+                            cwd = null,
+                            searchTerm = null,
+                        ),
+                    )
+                } catch (e: Exception) {
+                    _lastError.value = e.message
+                }
+
+                refreshSnapshot()
+                if (_snapshot.value?.threads?.any { it.key == currentKey } == true) {
+                    return currentKey
+                }
+            }
+
+            if (attempt + 1 < maxAttempts) {
+                delay(250)
+            }
+        }
+
+        val activeKey = _snapshot.value?.activeThread
+        if (activeKey != null &&
+            activeKey.serverId == currentKey.serverId &&
+            _snapshot.value?.threads?.any { it.key == activeKey } == true
+        ) {
+            return activeKey
+        }
+
+        return null
     }
 
     // --- Internal event handling ----------------------------------------------

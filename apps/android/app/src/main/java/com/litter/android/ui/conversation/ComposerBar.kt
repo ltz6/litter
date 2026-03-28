@@ -67,6 +67,7 @@ import com.litter.android.state.VoiceTranscriptionManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import uniffi.codex_mobile_client.FuzzyFileSearchParams
+import uniffi.codex_mobile_client.GetAuthStatusParams
 import uniffi.codex_mobile_client.PendingUserInputAnswer
 import uniffi.codex_mobile_client.PendingUserInputRequest
 import uniffi.codex_mobile_client.ReasoningEffort
@@ -205,15 +206,20 @@ fun ComposerBar(
             "fork" -> scope.launch {
                 try {
                     val cwd = appModel.snapshot.value?.threads?.find { it.key == threadKey }?.info?.cwd
-                    appModel.store.forkThreadFromMessage(
-                        threadKey,
-                        0u,
+                    val response = appModel.rpc.threadFork(
+                        threadKey.serverId,
                         appModel.launchState.threadForkParams(
                             sourceThreadId = threadKey.threadId,
                             cwdOverride = cwd,
                             modelOverride = appModel.launchState.snapshot.value.selectedModel.trim().ifEmpty { null },
                         ),
                     )
+                    val newKey = ThreadKey(
+                        serverId = threadKey.serverId,
+                        threadId = response.thread.id,
+                    )
+                    appModel.store.setActiveThread(newKey)
+                    appModel.refreshSnapshot()
                 } catch (e: Exception) {
                     onSlashError?.invoke(e.message ?: "Failed to fork conversation")
                 }
@@ -376,17 +382,19 @@ fun ComposerBar(
                 onClick = {
                     if (isRecording) {
                         scope.launch {
-                            // Get auth token from server account
-                            val snap = appModel.snapshot.value
-                            val server = snap?.servers?.firstOrNull { it.serverId == threadKey.serverId }
-                            // Extract auth token from server account
-                            val account = snap?.servers?.firstOrNull { it.serverId == threadKey.serverId }?.account
-                            val token = when (account) {
-                                is uniffi.codex_mobile_client.Account.Chatgpt -> "" // ChatGPT uses cookies, not bearer
-                                is uniffi.codex_mobile_client.Account.ApiKey -> "" // No direct token access
-                                else -> ""
-                            }
-                            val transcript = transcriptionManager.stopAndTranscribe(token)
+                            val auth = runCatching {
+                                appModel.rpc.getAuthStatus(
+                                    threadKey.serverId,
+                                    GetAuthStatusParams(
+                                        includeToken = true,
+                                        refreshToken = false,
+                                    ),
+                                )
+                            }.getOrNull()
+                            val transcript = transcriptionManager.stopAndTranscribe(
+                                authMethod = auth?.authMethod,
+                                authToken = auth?.authToken,
+                            )
                             transcript?.let { text = if (text.isBlank()) it else "$text $it" }
                         }
                     } else {

@@ -40,6 +40,7 @@ import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.Account
+import uniffi.codex_mobile_client.GetAccountParams
 import uniffi.codex_mobile_client.LoginAccountParams
 
 /**
@@ -100,6 +101,19 @@ fun AccountSheet(
 
     androidx.compose.runtime.LaunchedEffect(serverId, account) {
         hasStoredApiKey = apiKeyStore.hasStoredKey()
+    }
+
+    androidx.compose.runtime.LaunchedEffect(serverId) {
+        runCatching {
+            appModel.rpc.getAccount(
+                serverId,
+                GetAccountParams(refreshToken = false),
+            )
+            appModel.refreshSnapshot()
+            error = null
+        }.onFailure { throwable ->
+            error = throwable.localizedMessage ?: throwable.message
+        }
     }
 
     Column(
