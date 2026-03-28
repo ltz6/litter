@@ -66,12 +66,15 @@ import com.litter.android.state.contextPercent
 import com.litter.android.state.hasActiveTurn
 import com.litter.android.state.isIpcConnected
 import com.litter.android.state.isActiveStatus
+import com.litter.android.ui.BerkeleyMono
 import com.litter.android.ui.ChatWallpaperBackground
 import com.litter.android.ui.ConversationPrefs
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.WallpaperManager
 import com.litter.android.ui.WallpaperType
+import com.litter.android.ui.isNearListBottom
+import com.litter.android.ui.rememberStickyFollowTail
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.HydratedConversationItemContent
 import uniffi.codex_mobile_client.ThreadSetNameParams
@@ -112,11 +115,12 @@ fun ConversationScreen(
             expandedRecentTurnCount = if (collapseTurns) 1 else Int.MAX_VALUE,
         )
     }
-    val transcriptContentSignature = remember(items, normalizedActiveTurnId, isThinking) {
+    val transcriptTailSignature = remember(items, normalizedActiveTurnId, isThinking) {
         var hash = 17
-        items.forEach { item ->
+        items.takeLast(4).forEach { item ->
             hash = 31 * hash + item.hashCode()
         }
+        hash = 31 * hash + items.size
         hash = 31 * hash + (normalizedActiveTurnId?.hashCode() ?: 0)
         hash = 31 * hash + if (isThinking) 1 else 0
         hash
@@ -193,7 +197,7 @@ fun ConversationScreen(
     // Pinned context: latest TODO progress + file change summary
     val pinnedContext = remember(items) {
         var todoProgress: String? = null
-        var diffSummary: String? = null
+        var diffSummary: DiffSummary? = null
         for (i in items.indices.reversed()) {
             when (val c = items[i].content) {
                 is HydratedConversationItemContent.TodoList -> {
@@ -206,52 +210,52 @@ fun ConversationScreen(
                 }
                 is HydratedConversationItemContent.FileChange -> {
                     if (diffSummary == null) {
-                        val adds = c.v1.changes.count { it.kind.contains("create", true) || it.kind.contains("edit", true) }
-                        val dels = c.v1.changes.count { it.kind.contains("delete", true) }
-                        if (adds > 0 || dels > 0) diffSummary = "+$adds -$dels"
+                        var additions = 0
+                        var deletions = 0
+                        var sawDiff = false
+                        c.v1.changes.forEach { change ->
+                            sawDiff = true
+                            val stats = summarizeDiff(change.diff)
+                            additions += stats.additions
+                            deletions += stats.deletions
+                        }
+                        if (sawDiff) {
+                            diffSummary = DiffSummary(additions = additions, deletions = deletions)
+                        }
                     }
                 }
                 else -> {}
             }
             if (todoProgress != null && diffSummary != null) break
         }
-        if (todoProgress != null || diffSummary != null) Pair(todoProgress, diffSummary) else null
+        if (todoProgress != null || diffSummary != null) {
+            PinnedContextData(todoProgress = todoProgress, diffSummary = diffSummary)
+        } else {
+            null
+        }
     }
 
     // Auto-scroll state
     val listState = rememberLazyListState()
+    val shouldFollowTail = rememberStickyFollowTail(
+        listState = listState,
+        resetKey = threadKey,
+    )
     val isAtBottom by remember {
         derivedStateOf {
-            val info = listState.layoutInfo
-            if (info.totalItemsCount == 0) true
-            else {
-                val lastVisible = info.visibleItemsInfo.lastOrNull()
-                lastVisible != null && lastVisible.index >= info.totalItemsCount - 2
-            }
+            listState.isNearListBottom()
         }
     }
 
-    LaunchedEffect(transcriptTurns.size, isAtBottom) {
-        if (isAtBottom && transcriptTurns.isNotEmpty()) {
-            listState.animateScrollToItem(transcriptTurns.size)
+    LaunchedEffect(threadKey, transcriptTurns.size) {
+        if (shouldFollowTail && transcriptTurns.isNotEmpty()) {
+            listState.animateScrollToItem(conversationBottomAnchorIndex(transcriptTurns.size))
         }
     }
 
-    LaunchedEffect(transcriptContentSignature, isAtBottom, isThinking) {
-        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
-            listState.scrollToItem(transcriptTurns.size)
-        }
-    }
-
-    LaunchedEffect(followScrollToken, isThinking, isAtBottom) {
-        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
-            listState.scrollToItem(transcriptTurns.size)
-        }
-    }
-
-    LaunchedEffect(streamingRenderTick, isThinking, isAtBottom) {
-        if (isThinking && isAtBottom && transcriptTurns.isNotEmpty()) {
-            listState.scrollToItem(transcriptTurns.size)
+    LaunchedEffect(threadKey, transcriptTailSignature, followScrollToken, streamingRenderTick) {
+        if (shouldFollowTail && transcriptTurns.isNotEmpty()) {
+            listState.scrollToItem(conversationBottomAnchorIndex(transcriptTurns.size))
         }
     }
 
@@ -416,7 +420,7 @@ fun ConversationScreen(
                     SmallFloatingActionButton(
                         onClick = {
                             scope.launch {
-                                listState.animateScrollToItem(transcriptTurns.size)
+                                listState.animateScrollToItem(conversationBottomAnchorIndex(transcriptTurns.size))
                             }
                         },
                         modifier = Modifier
@@ -459,14 +463,14 @@ fun ConversationScreen(
                                 .fillMaxWidth()
                                 .background(LitterTheme.codeBackground.copy(alpha = if (hasWallpaper) 0.75f else 1f))
                                 .padding(horizontal = 16.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            pinnedContext.first?.let { todo ->
-                                Text("Plan $todo", color = LitterTheme.accent, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            pinnedContext.todoProgress?.let { todo ->
+                                PlanContextBadge(progress = todo)
                             }
-                            pinnedContext.second?.let { diff ->
-                                Text(diff, color = LitterTheme.toolCallFileChange, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            pinnedContext.diffSummary?.let { diff ->
+                                DiffSummaryBadge(summary = diff)
                             }
                         }
                     }
@@ -475,8 +479,9 @@ fun ConversationScreen(
                     ComposerBar(
                         threadKey = threadKey,
                         activeTurnId = thread?.activeTurnId,
-                        contextPercent = thread?.contextPercent ?: 0,
+                        contextPercent = thread?.composerContextPercent(),
                         isThinking = isThinking,
+                        queuedFollowUps = thread?.queuedFollowUps ?: emptyList(),
                         rateLimits = server?.rateLimits,
                         onToggleModelSelector = { showModelSelector = !showModelSelector },
                         onNavigateToSessions = onNavigateToSessions,
@@ -614,6 +619,103 @@ fun ConversationScreen(
                         Text("OK")
                     }
                 },
+            )
+        }
+    }
+}
+
+private data class PinnedContextData(
+    val todoProgress: String?,
+    val diffSummary: DiffSummary?,
+)
+
+private data class DiffSummary(
+    val additions: Int,
+    val deletions: Int,
+) {
+    val hasChanges: Boolean
+        get() = additions > 0 || deletions > 0
+}
+
+private fun summarizeDiff(diff: String): DiffSummary {
+    var additions = 0
+    var deletions = 0
+    diff.lineSequence().forEach { line ->
+        when {
+            line.startsWith("+") && !line.startsWith("+++") -> additions += 1
+            line.startsWith("-") && !line.startsWith("---") -> deletions += 1
+        }
+    }
+    return DiffSummary(additions = additions, deletions = deletions)
+}
+
+private fun uniffi.codex_mobile_client.AppThreadSnapshot.composerContextPercent(): Int? {
+    if (contextTokensUsed == null && modelContextWindow == null) return null
+    val contextWindow = modelContextWindow?.toLong()
+    val baseline = 12_000L
+    if (contextWindow == null || contextWindow <= baseline) {
+        return contextPercent.coerceIn(0, 100)
+    }
+    val totalTokens = contextTokensUsed?.toLong() ?: baseline
+    val effectiveWindow = contextWindow - baseline
+    val usedTokens = (totalTokens - baseline).coerceAtLeast(0)
+    val remainingTokens = (effectiveWindow - usedTokens).coerceAtLeast(0)
+    return ((remainingTokens.toDouble() / effectiveWindow.toDouble()) * 100.0)
+        .toInt()
+        .coerceIn(0, 100)
+}
+
+private fun conversationBottomAnchorIndex(turnCount: Int): Int = turnCount + 1
+
+@Composable
+private fun PlanContextBadge(progress: String) {
+    Text(
+        text = "Plan $progress",
+        color = LitterTheme.accent,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier
+            .background(LitterTheme.surface.copy(alpha = 0.72f), RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    )
+}
+
+@Composable
+private fun DiffSummaryBadge(summary: DiffSummary) {
+    Row(
+        modifier = Modifier
+            .background(LitterTheme.surface.copy(alpha = 0.72f), RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "\u2194",
+            color = LitterTheme.accent,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (summary.hasChanges) {
+            Text(
+                text = "+${summary.additions}",
+                color = LitterTheme.success,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = BerkeleyMono,
+            )
+            Text(
+                text = "-${summary.deletions}",
+                color = LitterTheme.danger,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = BerkeleyMono,
+            )
+        } else {
+            Text(
+                text = "Diff",
+                color = LitterTheme.textSecondary,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
             )
         }
     }

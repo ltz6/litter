@@ -1441,7 +1441,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LOG_COLLECTOR_URL = "$(LOG_COLLECTOR_URL)";
 				OTHER_LDFLAGS = "$(inherited) -lc++ -lz -lcodex_mobile_client";
 				PRODUCT_BUNDLE_IDENTIFIER = com.sigkitten.litter;
 				SDKROOT = iphoneos;
@@ -1484,7 +1483,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LOG_COLLECTOR_URL = "$(LOG_COLLECTOR_URL)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.sigkitten.litter;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = Sources/Litter/Bridge/codex_bridge_objc.h;

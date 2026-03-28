@@ -8,6 +8,7 @@ use crate::conversation::{
     UserInputResponseOptionData, UserInputResponseQuestionData, make_error_item,
     make_model_rerouted_item, make_turn_diff_item,
 };
+use crate::conversation_uniffi::HydratedConversationItem;
 use crate::session::connection::ServerConfig;
 use crate::session::events::UiEvent;
 use crate::types::{
@@ -15,18 +16,21 @@ use crate::types::{
     PendingUserInputRequest, ThreadInfo, ThreadKey, ThreadSummaryStatus, generated,
 };
 use crate::uniffi_shared::{
-    AppVoiceSessionPhase, AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate,
+    AppOperationStatus, AppVoiceSessionPhase, AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate,
 };
 
 use super::actions::{
     conversation_item_from_upstream, thread_info_from_upstream,
     thread_info_from_upstream_status_change,
 };
-use super::snapshot::{
-    AppSnapshot, ServerConnectionProgressSnapshot, ServerHealthSnapshot, ServerSnapshot,
-    ThreadSnapshot, VoiceSessionSnapshot,
+use super::boundary::{
+    current_agent_directory_version, project_thread_state_update, project_thread_update,
 };
-use super::updates::AppUpdate;
+use super::snapshot::{
+    AppSnapshot, QueuedFollowUpPreview, ServerConnectionProgressSnapshot, ServerHealthSnapshot,
+    ServerSnapshot, ThreadSnapshot, VoiceSessionSnapshot,
+};
+use super::updates::{AppUpdate, ThreadStreamingDeltaKind};
 use super::voice::{VoiceDerivedUpdate, VoiceRealtimeState};
 
 pub struct AppStoreReducer {
@@ -35,9 +39,23 @@ pub struct AppStoreReducer {
     voice_state: VoiceRealtimeState,
 }
 
+enum ItemMutationUpdate {
+    Upsert(HydratedConversationItem),
+    CommandExecutionUpdated {
+        item_id: String,
+        status: AppOperationStatus,
+        exit_code: Option<i32>,
+        duration_ms: Option<i64>,
+        process_id: Option<String>,
+        output_delta: Option<String>,
+    },
+}
+
 impl AppStoreReducer {
     pub fn new() -> Self {
-        let (updates_tx, _) = broadcast::channel(256);
+        // Streaming turns can burst small deltas quickly; keep enough headroom so
+        // native subscribers do not immediately fall into lagged/full-resync mode.
+        let (updates_tx, _) = broadcast::channel(1024);
         Self {
             snapshot: RwLock::new(AppSnapshot::default()),
             updates_tx,
@@ -108,6 +126,7 @@ impl AppStoreReducer {
 
     pub fn remove_server(&self, server_id: &str) {
         let mut removed_thread_keys = Vec::new();
+        let agent_directory_version;
         {
             let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
             snapshot.servers.remove(server_id);
@@ -142,12 +161,16 @@ impl AppStoreReducer {
             {
                 snapshot.voice_session = VoiceSessionSnapshot::default();
             }
+            agent_directory_version = current_agent_directory_version(&snapshot);
         }
         self.emit(AppUpdate::ServerRemoved {
             server_id: server_id.to_string(),
         });
         for key in removed_thread_keys {
-            self.emit(AppUpdate::ThreadRemoved { key });
+            self.emit(AppUpdate::ThreadRemoved {
+                key,
+                agent_directory_version,
+            });
         }
         self.emit(AppUpdate::ActiveThreadChanged { key: None });
     }
@@ -157,8 +180,14 @@ impl AppStoreReducer {
             .iter()
             .map(|info| info.id.clone())
             .collect::<HashSet<_>>();
+        let mut upserted_thread_keys = Vec::new();
+        let mut updated_thread_keys = Vec::new();
         let mut removed_thread_keys = Vec::new();
         let mut active_thread_cleared = false;
+        let mut pending_approvals = None;
+        let mut pending_user_inputs = None;
+        let mut voice_session_changed = false;
+        let agent_directory_version;
         {
             let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
             let active_thread_key = snapshot.active_thread.clone();
@@ -176,12 +205,22 @@ impl AppStoreReducer {
                     server_id: server_id.to_string(),
                     thread_id: info.id.clone(),
                 };
-                let entry = snapshot
-                    .threads
-                    .entry(key.clone())
-                    .or_insert_with(|| ThreadSnapshot::from_info(server_id, info.clone()));
-                entry.info = info.clone();
-                entry.model = info.model.clone().or(entry.model.clone());
+                if let Some(entry) = snapshot.threads.get_mut(&key) {
+                    let next_model = info.model.clone().or_else(|| entry.model.clone());
+                    let info_changed = entry.info != *info;
+                    let model_changed = entry.model != next_model;
+                    if info_changed || model_changed {
+                        entry.info = info.clone();
+                        entry.model = next_model;
+                        updated_thread_keys.push(key);
+                    }
+                } else {
+                    snapshot.threads.insert(
+                        key.clone(),
+                        ThreadSnapshot::from_info(server_id, info.clone()),
+                    );
+                    upserted_thread_keys.push(key);
+                }
             }
             if snapshot.active_thread.as_ref().is_some_and(|key| {
                 key.server_id == server_id && !incoming_ids.contains(&key.thread_id)
@@ -195,6 +234,7 @@ impl AppStoreReducer {
                     active_thread_cleared = true;
                 }
             }
+            let approvals_before = snapshot.pending_approvals.len();
             snapshot.pending_approvals.retain(|approval| {
                 approval.thread_id.as_deref().is_none_or(|tid| {
                     !removed_thread_keys
@@ -202,12 +242,19 @@ impl AppStoreReducer {
                         .any(|key| key.thread_id.as_str() == tid)
                 })
             });
+            if snapshot.pending_approvals.len() != approvals_before {
+                pending_approvals = Some(snapshot.pending_approvals.clone());
+            }
+            let pending_user_inputs_before = snapshot.pending_user_inputs.len();
             snapshot.pending_user_inputs.retain(|request| {
                 !(request.server_id == server_id
                     && removed_thread_keys
                         .iter()
                         .any(|key| key.thread_id == request.thread_id))
             });
+            if snapshot.pending_user_inputs.len() != pending_user_inputs_before {
+                pending_user_inputs = Some(snapshot.pending_user_inputs.clone());
+            }
             if snapshot
                 .voice_session
                 .active_thread
@@ -217,15 +264,34 @@ impl AppStoreReducer {
                 })
             {
                 snapshot.voice_session = VoiceSessionSnapshot::default();
+                voice_session_changed = true;
             }
+            agent_directory_version = current_agent_directory_version(&snapshot);
         }
         for key in removed_thread_keys {
-            self.emit(AppUpdate::ThreadRemoved { key });
+            self.emit(AppUpdate::ThreadRemoved {
+                key,
+                agent_directory_version,
+            });
+        }
+        for key in upserted_thread_keys {
+            self.emit_thread_upsert(&key);
+        }
+        for key in updated_thread_keys {
+            self.emit_thread_state_update(&key);
+        }
+        if let Some(approvals) = pending_approvals {
+            self.emit(AppUpdate::PendingApprovalsChanged { approvals });
+        }
+        if let Some(requests) = pending_user_inputs {
+            self.emit(AppUpdate::PendingUserInputsChanged { requests });
+        }
+        if voice_session_changed {
+            self.emit(AppUpdate::VoiceSessionChanged);
         }
         if active_thread_cleared {
             self.emit(AppUpdate::ActiveThreadChanged { key: None });
         }
-        self.emit(AppUpdate::FullResync);
     }
 
     pub fn upsert_thread_snapshot(&self, mut thread: ThreadSnapshot) {
@@ -234,13 +300,43 @@ impl AppStoreReducer {
             let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
             if let Some(existing) = snapshot.threads.get(&key) {
                 preserve_local_overlay_items(existing, &mut thread);
+                preserve_queued_follow_ups(existing, &mut thread);
             }
             snapshot.threads.insert(key.clone(), thread);
         }
-        self.emit(AppUpdate::ThreadChanged { key });
+        self.emit_thread_upsert(&key);
+    }
+
+    pub fn enqueue_thread_follow_up_preview(
+        &self,
+        key: &ThreadKey,
+        preview: QueuedFollowUpPreview,
+    ) {
+        if self
+            .mutate_thread_with_result(key, |thread| {
+                thread.queued_follow_ups.push(preview);
+            })
+            .is_some()
+        {
+            self.emit_thread_state_update(key);
+        }
+    }
+
+    pub fn remove_thread_follow_up_preview(&self, key: &ThreadKey, preview_id: &str) {
+        if self
+            .mutate_thread_with_result(key, |thread| {
+                thread
+                    .queued_follow_ups
+                    .retain(|preview| preview.id != preview_id);
+            })
+            .is_some()
+        {
+            self.emit_thread_state_update(key);
+        }
     }
 
     pub fn remove_thread(&self, key: &ThreadKey) {
+        let agent_directory_version;
         {
             let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
             snapshot.threads.remove(key);
@@ -256,8 +352,12 @@ impl AppStoreReducer {
             snapshot.pending_user_inputs.retain(|request| {
                 !(request.server_id == key.server_id && request.thread_id == key.thread_id)
             });
+            agent_directory_version = current_agent_directory_version(&snapshot);
         }
-        self.emit(AppUpdate::ThreadRemoved { key: key.clone() });
+        self.emit(AppUpdate::ThreadRemoved {
+            key: key.clone(),
+            agent_directory_version,
+        });
     }
 
     pub fn set_active_thread(&self, key: Option<ThreadKey>) {
@@ -352,7 +452,7 @@ impl AppStoreReducer {
         };
         self.emit(AppUpdate::PendingUserInputsChanged { requests });
         if let Some(key) = thread_key {
-            self.emit(AppUpdate::ThreadChanged { key });
+            self.emit_thread_upsert(&key);
         }
     }
 
@@ -482,47 +582,64 @@ impl AppStoreReducer {
                 });
             }
             UiEvent::ModelRerouted { key, notification } => {
-                self.mutate_thread(key, |thread| {
-                    thread.model = Some(notification.to_model.clone());
-                    thread.info.model = Some(notification.to_model.clone());
-                    upsert_item(
-                        thread,
-                        make_model_rerouted_item(
-                            &notification.turn_id,
-                            Some(notification.from_model.clone()),
-                            notification.to_model.clone(),
-                            Some(format_model_reroute_reason(&notification.reason)),
-                            Some(&notification.turn_id),
-                        ),
-                    );
-                });
+                let item = make_model_rerouted_item(
+                    &notification.turn_id,
+                    Some(notification.from_model.clone()),
+                    notification.to_model.clone(),
+                    Some(format_model_reroute_reason(&notification.reason)),
+                    Some(&notification.turn_id),
+                );
+                if self
+                    .mutate_thread_with_result(key, |thread| {
+                        thread.model = Some(notification.to_model.clone());
+                        thread.info.model = Some(notification.to_model.clone());
+                        upsert_item(thread, item.clone());
+                    })
+                    .is_some()
+                {
+                    self.emit_thread_state_update(key);
+                    self.emit_thread_item_upsert(key, &item);
+                }
             }
             UiEvent::TurnStarted { key, turn_id } => {
-                self.mutate_thread(key, |thread| {
-                    thread.active_turn_id = Some(turn_id.clone());
-                    thread.info.status = ThreadSummaryStatus::Active;
-                    if thread.info.parent_thread_id.is_some() {
-                        thread.info.agent_status = Some("running".to_string());
-                    }
-                });
+                if self
+                    .mutate_thread_with_result(key, |thread| {
+                        if !thread.queued_follow_ups.is_empty() {
+                            thread.queued_follow_ups.remove(0);
+                        }
+                        thread.active_turn_id = Some(turn_id.clone());
+                        thread.info.status = ThreadSummaryStatus::Active;
+                        if thread.info.parent_thread_id.is_some() {
+                            thread.info.agent_status = Some("running".to_string());
+                        }
+                    })
+                    .is_some()
+                {
+                    self.emit_thread_state_update(key);
+                }
             }
             UiEvent::TurnCompleted { key, .. } => {
-                self.mutate_thread(key, |thread| {
-                    thread.active_turn_id = None;
-                    thread.info.status = ThreadSummaryStatus::Idle;
-                    if thread.info.parent_thread_id.is_some() {
-                        thread.info.agent_status = Some("completed".to_string());
-                    }
-                });
+                if self
+                    .mutate_thread_with_result(key, |thread| {
+                        thread.active_turn_id = None;
+                        thread.info.status = ThreadSummaryStatus::Idle;
+                        if thread.info.parent_thread_id.is_some() {
+                            thread.info.agent_status = Some("completed".to_string());
+                        }
+                    })
+                    .is_some()
+                {
+                    self.emit_thread_state_update(key);
+                }
             }
             UiEvent::ItemStarted { key, notification } => {
                 if let Some(item) = conversation_item_from_upstream(notification.item.clone()) {
-                    self.mutate_thread(key, |thread| upsert_item(thread, item.clone()));
+                    self.apply_item_update(key, item);
                 }
             }
             UiEvent::ItemCompleted { key, notification } => {
                 if let Some(item) = conversation_item_from_upstream(notification.item.clone()) {
-                    self.mutate_thread(key, |thread| upsert_item(thread, item.clone()));
+                    self.apply_item_update(key, item);
                 }
             }
             UiEvent::MessageDelta {
@@ -530,47 +647,114 @@ impl AppStoreReducer {
                 item_id,
                 delta,
             } => {
-                self.mutate_thread(key, |thread| append_assistant_delta(thread, item_id, delta));
+                let inserted_placeholder = self
+                    .mutate_thread_with_result(key, |thread| {
+                        append_assistant_delta(thread, item_id, delta)
+                    })
+                    .unwrap_or(false);
+                if inserted_placeholder {
+                    self.emit_thread_item_upsert_by_id(key, item_id);
+                } else {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        item_id,
+                        ThreadStreamingDeltaKind::AssistantText,
+                        delta,
+                    );
+                }
             }
             UiEvent::ReasoningDelta {
                 key,
                 item_id,
                 delta,
             } => {
-                self.mutate_thread(key, |thread| append_reasoning_delta(thread, item_id, delta));
+                let updated = self
+                    .mutate_thread_with_result(key, |thread| {
+                        append_reasoning_delta(thread, item_id, delta)
+                    })
+                    .unwrap_or(false);
+                if updated {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        item_id,
+                        ThreadStreamingDeltaKind::ReasoningText,
+                        delta,
+                    );
+                } else {
+                    self.emit_thread_upsert(key);
+                }
             }
             UiEvent::PlanDelta {
                 key,
                 item_id,
                 delta,
             } => {
-                self.mutate_thread(key, |thread| append_plan_delta(thread, item_id, delta));
+                let updated = self
+                    .mutate_thread_with_result(key, |thread| {
+                        append_plan_delta(thread, item_id, delta)
+                    })
+                    .unwrap_or(false);
+                if updated {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        item_id,
+                        ThreadStreamingDeltaKind::PlanText,
+                        delta,
+                    );
+                } else {
+                    self.emit_thread_upsert(key);
+                }
             }
             UiEvent::CommandOutputDelta {
                 key,
                 item_id,
                 delta,
             } => {
-                self.mutate_thread(key, |thread| {
-                    append_command_output_delta(thread, item_id, delta)
-                });
+                let updated = self
+                    .mutate_thread_with_result(key, |thread| {
+                        append_command_output_delta(thread, item_id, delta)
+                    })
+                    .unwrap_or(false);
+                if updated {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        item_id,
+                        ThreadStreamingDeltaKind::CommandOutput,
+                        delta,
+                    );
+                } else {
+                    self.emit_thread_upsert(key);
+                }
             }
             UiEvent::TurnDiffUpdated { key, notification } => {
-                self.mutate_thread(key, |thread| {
-                    upsert_item(
-                        thread,
-                        make_turn_diff_item(
-                            &notification.turn_id,
-                            notification.diff.clone(),
-                            Some(&notification.turn_id),
-                        ),
-                    );
-                });
+                let item = make_turn_diff_item(
+                    &notification.turn_id,
+                    notification.diff.clone(),
+                    Some(&notification.turn_id),
+                );
+                if self
+                    .mutate_thread_with_result(key, |thread| upsert_item(thread, item.clone()))
+                    .is_some()
+                {
+                    self.emit_thread_item_upsert(key, &item);
+                }
             }
             UiEvent::McpToolCallProgress { key, notification } => {
-                self.mutate_thread(key, |thread| {
-                    append_mcp_progress(thread, &notification.item_id, &notification.message);
-                });
+                let updated = self
+                    .mutate_thread_with_result(key, |thread| {
+                        append_mcp_progress(thread, &notification.item_id, &notification.message)
+                    })
+                    .unwrap_or(false);
+                if updated {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        &notification.item_id,
+                        ThreadStreamingDeltaKind::McpProgress,
+                        &notification.message,
+                    );
+                } else {
+                    self.emit_thread_upsert(key);
+                }
             }
             UiEvent::ApprovalRequested { approval, .. } => {
                 let approvals = {
@@ -616,10 +800,15 @@ impl AppStoreReducer {
                 });
             }
             UiEvent::ContextTokensUpdated { key, used, limit } => {
-                self.mutate_thread(key, |thread| {
-                    thread.context_tokens_used = Some(*used);
-                    thread.model_context_window = Some(*limit);
-                });
+                if self
+                    .mutate_thread_with_result(key, |thread| {
+                        thread.context_tokens_used = Some(*used);
+                        thread.model_context_window = Some(*limit);
+                    })
+                    .is_some()
+                {
+                    self.emit_thread_state_update(key);
+                }
             }
             UiEvent::RealtimeStarted { key, notification } => {
                 self.voice_state.reset_thread(key);
@@ -645,7 +834,7 @@ impl AppStoreReducer {
                     key: key.clone(),
                     notification: generated_notification,
                 });
-                self.emit(AppUpdate::ThreadChanged { key: key.clone() });
+                self.emit_thread_state_update(key);
             }
             UiEvent::RealtimeTranscriptUpdated { key, role, text } => {
                 for update in self
@@ -771,16 +960,26 @@ impl AppStoreReducer {
                     key: key.clone(),
                     notification: generated_notification,
                 });
-                self.emit(AppUpdate::ThreadChanged { key: key.clone() });
+                self.emit_thread_state_update(key);
             }
             UiEvent::Error { key, message, code } => {
                 if let Some(key) = key {
-                    self.mutate_thread(key, |thread| {
-                        let id = format!("error-{}-{}", key.thread_id, thread.items.len());
-                        thread
-                            .items
-                            .push(make_error_item(id, message.clone(), *code));
-                    });
+                    let item = {
+                        let mut item = None;
+                        self.mutate_thread_with_result(key, |thread| {
+                            let next = make_error_item(
+                                format!("error-{}-{}", key.thread_id, thread.items.len()),
+                                message.clone(),
+                                *code,
+                            );
+                            thread.items.push(next.clone());
+                            item = Some(next);
+                        });
+                        item
+                    };
+                    if let Some(item) = item {
+                        self.emit_thread_item_upsert(key, &item);
+                    }
                 }
             }
             UiEvent::RawNotification {
@@ -848,21 +1047,210 @@ impl AppStoreReducer {
             thread.info.status = info.status;
             mutate(thread);
         }
-        self.emit(AppUpdate::ThreadChanged { key });
+        self.emit_thread_upsert(&key);
     }
 
-    fn mutate_thread<F>(&self, key: &ThreadKey, mutate: F)
+    pub(crate) fn mutate_thread<F>(&self, key: &ThreadKey, mutate: F)
     where
         F: FnOnce(&mut ThreadSnapshot),
     {
+        if self
+            .mutate_thread_with_result(key, |thread| {
+                mutate(thread);
+            })
+            .is_some()
         {
-            let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
-            let Some(thread) = snapshot.threads.get_mut(key) else {
-                return;
-            };
-            mutate(thread);
+            self.emit_thread_upsert(key);
         }
-        self.emit(AppUpdate::ThreadChanged { key: key.clone() });
+    }
+
+    pub(crate) fn mutate_thread_with_result<F, R>(&self, key: &ThreadKey, mutate: F) -> Option<R>
+    where
+        F: FnOnce(&mut ThreadSnapshot) -> R,
+    {
+        let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
+        let thread = snapshot.threads.get_mut(key)?;
+        Some(mutate(thread))
+    }
+
+    pub(crate) fn emit_thread_state_update(&self, key: &ThreadKey) {
+        let update = {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            match project_thread_state_update(&snapshot, key) {
+                Ok(Some((state, session_summary, agent_directory_version))) => {
+                    Some(AppUpdate::ThreadStateUpdated {
+                        state,
+                        session_summary,
+                        agent_directory_version,
+                    })
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::error!(
+                        target: "store",
+                        server_id = key.server_id,
+                        thread_id = key.thread_id,
+                        %error,
+                        "failed to project ThreadStateUpdated"
+                    );
+                    Some(AppUpdate::FullResync)
+                }
+            }
+        };
+        if let Some(update) = update {
+            self.emit(update);
+        }
+    }
+
+    pub(crate) fn emit_thread_upsert(&self, key: &ThreadKey) {
+        let update = {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            match project_thread_update(&snapshot, key) {
+                Ok(Some((thread, session_summary, agent_directory_version))) => {
+                    Some(AppUpdate::ThreadUpserted {
+                        thread,
+                        session_summary,
+                        agent_directory_version,
+                    })
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::error!(
+                        target: "store",
+                        server_id = key.server_id,
+                        thread_id = key.thread_id,
+                        %error,
+                        "failed to project ThreadUpserted"
+                    );
+                    Some(AppUpdate::FullResync)
+                }
+            }
+        };
+        if let Some(update) = update {
+            self.emit(update);
+        }
+    }
+
+    pub(crate) fn emit_thread_item_upsert(&self, key: &ThreadKey, item: &ConversationItem) {
+        self.emit(AppUpdate::ThreadItemUpserted {
+            key: key.clone(),
+            item: HydratedConversationItem::from(item.clone()),
+        });
+    }
+
+    pub(crate) fn emit_thread_item_upsert_by_id(&self, key: &ThreadKey, item_id: &str) {
+        let item = {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            snapshot
+                .threads
+                .get(key)
+                .and_then(|thread| thread.items.iter().find(|item| item.id == item_id).cloned())
+        };
+        if let Some(item) = item {
+            self.emit_thread_item_upsert(key, &item);
+        }
+    }
+
+    pub(crate) fn emit_thread_command_execution_updated(
+        &self,
+        key: &ThreadKey,
+        item_id: &str,
+        status: AppOperationStatus,
+        exit_code: Option<i32>,
+        duration_ms: Option<i64>,
+        process_id: Option<String>,
+    ) {
+        self.emit(AppUpdate::ThreadCommandExecutionUpdated {
+            key: key.clone(),
+            item_id: item_id.to_string(),
+            status,
+            exit_code,
+            duration_ms,
+            process_id,
+        });
+    }
+
+    pub(crate) fn emit_thread_streaming_delta(
+        &self,
+        key: &ThreadKey,
+        item_id: &str,
+        kind: ThreadStreamingDeltaKind,
+        text: &str,
+    ) {
+        self.emit(AppUpdate::ThreadStreamingDelta {
+            key: key.clone(),
+            item_id: item_id.to_string(),
+            kind,
+            text: text.to_string(),
+        });
+    }
+
+    fn apply_item_update(&self, key: &ThreadKey, item: ConversationItem) {
+        let result = self.mutate_thread_with_result(key, |thread| {
+            let existing = thread
+                .items
+                .iter()
+                .find(|existing| existing.id == item.id)
+                .cloned();
+            let queued_count_before = thread.queued_follow_ups.len();
+            upsert_item(thread, item.clone());
+            if item.is_from_user_turn_boundary && matches!(item.content, ConversationItemContent::User(_))
+            {
+                if !thread.queued_follow_ups.is_empty() {
+                    thread.queued_follow_ups.remove(0);
+                }
+            }
+            (
+                classify_item_mutation(existing.as_ref(), &item),
+                queued_count_before != thread.queued_follow_ups.len(),
+            )
+        });
+
+        match result {
+            Some((Some(ItemMutationUpdate::Upsert(item)), queued_changed)) => {
+                if queued_changed {
+                    self.emit_thread_state_update(key);
+                }
+                self.emit(AppUpdate::ThreadItemUpserted {
+                    key: key.clone(),
+                    item,
+                });
+            }
+            Some((Some(ItemMutationUpdate::CommandExecutionUpdated {
+                item_id,
+                status,
+                exit_code,
+                duration_ms,
+                process_id,
+                output_delta,
+            }), queued_changed)) => {
+                if queued_changed {
+                    self.emit_thread_state_update(key);
+                }
+                if let Some(delta) = output_delta.filter(|delta| !delta.is_empty()) {
+                    self.emit_thread_streaming_delta(
+                        key,
+                        &item_id,
+                        ThreadStreamingDeltaKind::CommandOutput,
+                        &delta,
+                    );
+                }
+                self.emit_thread_command_execution_updated(
+                    key,
+                    &item_id,
+                    status,
+                    exit_code,
+                    duration_ms,
+                    process_id,
+                );
+            }
+            Some((None, queued_changed)) => {
+                if queued_changed {
+                    self.emit_thread_state_update(key);
+                }
+            }
+            None => {}
+        }
     }
 
     fn apply_voice_transcript_update(&self, key: &ThreadKey, update: &AppVoiceTranscriptUpdate) {
@@ -908,10 +1296,53 @@ impl AppStoreReducer {
             AppUpdate::ServerRemoved { server_id } => {
                 tracing::debug!(target: "store", server_id, "emit ServerRemoved")
             }
-            AppUpdate::ThreadChanged { key } => {
-                tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit ThreadChanged")
+            AppUpdate::ThreadUpserted { thread, .. } => {
+                tracing::debug!(
+                    target: "store",
+                    server_id = thread.key.server_id,
+                    thread_id = thread.key.thread_id,
+                    "emit ThreadUpserted"
+                )
             }
-            AppUpdate::ThreadRemoved { key } => {
+            AppUpdate::ThreadStateUpdated { state, .. } => {
+                tracing::debug!(
+                    target: "store",
+                    server_id = state.key.server_id,
+                    thread_id = state.key.thread_id,
+                    "emit ThreadStateUpdated"
+                )
+            }
+            AppUpdate::ThreadItemUpserted { key, item } => {
+                tracing::debug!(
+                    target: "store",
+                    server_id = key.server_id,
+                    thread_id = key.thread_id,
+                    item_id = item.id,
+                    "emit ThreadItemUpserted"
+                )
+            }
+            AppUpdate::ThreadCommandExecutionUpdated { key, item_id, .. } => {
+                tracing::debug!(
+                    target: "store",
+                    server_id = key.server_id,
+                    thread_id = key.thread_id,
+                    item_id,
+                    "emit ThreadCommandExecutionUpdated"
+                )
+            }
+            AppUpdate::ThreadStreamingDelta {
+                key, item_id, kind, ..
+            } => {
+                tracing::trace!(
+                    target: "store",
+                    server_id = key.server_id,
+                    thread_id = key.thread_id,
+                    item_id,
+                    kind = ?kind,
+                    "emit ThreadStreamingDelta"
+                )
+            }
+            AppUpdate::ThreadRemoved { key, .. } => {
                 tracing::debug!(target: "store", server_id = key.server_id, thread_id = key.thread_id, "emit ThreadRemoved")
             }
             AppUpdate::ActiveThreadChanged { key } => {
@@ -1044,7 +1475,8 @@ fn upsert_item(thread: &mut ThreadSnapshot, item: crate::conversation::Conversat
     }
 }
 
-fn append_assistant_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) {
+fn append_assistant_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) -> bool {
+    let mut inserted_placeholder = false;
     if !thread.items.iter().any(|item| item.id == item_id) {
         thread.items.push(ConversationItem {
             id: item_id.to_string(),
@@ -1059,14 +1491,16 @@ fn append_assistant_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &st
             timestamp: None,
             is_from_user_turn_boundary: false,
         });
+        inserted_placeholder = true;
     }
 
     let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
-        return;
+        return inserted_placeholder;
     };
     if let ConversationItemContent::Assistant(message) = &mut item.content {
         message.text.push_str(delta);
     }
+    inserted_placeholder
 }
 
 const USER_INPUT_RESPONSE_ITEM_PREFIX: &str = "user-input-response:";
@@ -1084,6 +1518,12 @@ fn preserve_local_overlay_items(source: &ThreadSnapshot, target: &mut ThreadSnap
         {
             target.local_overlay_items.push(item.clone());
         }
+    }
+}
+
+fn preserve_queued_follow_ups(source: &ThreadSnapshot, target: &mut ThreadSnapshot) {
+    if target.queued_follow_ups.is_empty() {
+        target.queued_follow_ups = source.queued_follow_ups.clone();
     }
 }
 
@@ -1143,9 +1583,9 @@ fn answered_user_input_item(
     }
 }
 
-fn append_reasoning_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) {
+fn append_reasoning_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) -> bool {
     let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
-        return;
+        return false;
     };
     if let ConversationItemContent::Reasoning(reasoning) = &mut item.content {
         if let Some(last) = reasoning.content.last_mut() {
@@ -1153,7 +1593,9 @@ fn append_reasoning_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &st
         } else {
             reasoning.content.push(delta.to_string());
         }
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -1164,6 +1606,7 @@ mod tests {
         McpToolCallProgressNotification, ModelRerouteReason, ModelReroutedNotification,
         TurnDiffUpdatedNotification,
     };
+    use tokio::sync::broadcast::error::TryRecvError;
 
     fn make_thread_info(id: &str) -> ThreadInfo {
         ThreadInfo {
@@ -1184,6 +1627,18 @@ mod tests {
         }
     }
 
+    fn drain_updates(receiver: &mut tokio::sync::broadcast::Receiver<AppUpdate>) -> Vec<AppUpdate> {
+        let mut updates = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) => break,
+                Err(error) => panic!("unexpected broadcast receive error: {error:?}"),
+            }
+        }
+        updates
+    }
+
     #[test]
     fn sync_thread_list_preserves_active_missing_thread() {
         let reducer = AppStoreReducer::new();
@@ -1194,12 +1649,68 @@ mod tests {
         reducer
             .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("active")));
         reducer.set_active_thread(Some(active_key.clone()));
+        let mut receiver = reducer.subscribe();
 
         reducer.sync_thread_list("srv", &[make_thread_info("other")]);
 
         let snapshot = reducer.snapshot();
         assert!(snapshot.threads.contains_key(&active_key));
         assert_eq!(snapshot.active_thread, Some(active_key));
+        let updates = drain_updates(&mut receiver);
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update, AppUpdate::FullResync))
+        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadUpserted { thread, .. } if thread.key.thread_id == "other"
+        )));
+    }
+
+    #[test]
+    fn sync_thread_list_emits_incremental_updates_without_full_resync() {
+        let reducer = AppStoreReducer::new();
+        let existing_key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "existing".to_string(),
+        };
+        reducer.upsert_thread_snapshot(ThreadSnapshot::from_info(
+            "srv",
+            make_thread_info("existing"),
+        ));
+        let mut receiver = reducer.subscribe();
+
+        let mut updated_existing = make_thread_info("existing");
+        updated_existing.title = Some("Updated existing".to_string());
+        updated_existing.model = Some("gpt-5.4".to_string());
+        updated_existing.status = ThreadSummaryStatus::Active;
+
+        let mut inserted = make_thread_info("inserted");
+        inserted.model = Some("gpt-5.4".to_string());
+
+        reducer.sync_thread_list("srv", &[updated_existing.clone(), inserted.clone()]);
+
+        let updates = drain_updates(&mut receiver);
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update, AppUpdate::FullResync))
+        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadStateUpdated { state, .. }
+                if state.key == existing_key
+                    && state.info == updated_existing
+                    && state.model.as_deref() == Some("gpt-5.4")
+        )));
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadUpserted { thread, .. }
+                if thread.key.thread_id == "inserted"
+                    && thread.info == inserted
+                    && thread.model.as_deref() == Some("gpt-5.4")
+        )));
     }
 
     #[test]
@@ -1434,37 +1945,188 @@ mod tests {
         assert_eq!(thread.items.len(), 1);
         assert_eq!(thread.items[0].id, "server-item-1");
     }
-}
 
-fn append_plan_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) {
-    let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
-        return;
-    };
-    if let ConversationItemContent::ProposedPlan(plan) = &mut item.content {
-        plan.content.push_str(delta);
+    #[test]
+    fn turn_started_consumes_first_queued_follow_up_preview() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer.upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        reducer.enqueue_thread_follow_up_preview(
+            &key,
+            QueuedFollowUpPreview {
+                id: "queued-1".to_string(),
+                text: "first".to_string(),
+            },
+        );
+        reducer.enqueue_thread_follow_up_preview(
+            &key,
+            QueuedFollowUpPreview {
+                id: "queued-2".to_string(),
+                text: "second".to_string(),
+            },
+        );
+
+        reducer.apply_ui_event(&UiEvent::TurnStarted {
+            key: key.clone(),
+            turn_id: "turn-2".to_string(),
+        });
+
+        let snapshot = reducer.snapshot();
+        let thread = snapshot.threads.get(&key).expect("thread exists");
+        assert_eq!(thread.active_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(thread.queued_follow_ups.len(), 1);
+        assert_eq!(thread.queued_follow_ups[0].id, "queued-2");
+    }
+
+    #[test]
+    fn user_turn_boundary_item_consumes_stale_queued_follow_up_preview() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer.upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        reducer.enqueue_thread_follow_up_preview(
+            &key,
+            QueuedFollowUpPreview {
+                id: "queued-1".to_string(),
+                text: "queued follow-up".to_string(),
+            },
+        );
+
+        reducer.apply_item_update(
+            &key,
+            ConversationItem {
+                id: "user-1".to_string(),
+                content: ConversationItemContent::User(crate::conversation::UserMessageData {
+                    text: "queued follow-up".to_string(),
+                    image_data_uris: Vec::new(),
+                }),
+                source_turn_id: Some("turn-2".to_string()),
+                source_turn_index: None,
+                timestamp: None,
+                is_from_user_turn_boundary: true,
+            },
+        );
+
+        let snapshot = reducer.snapshot();
+        let thread = snapshot.threads.get(&key).expect("thread exists");
+        assert!(thread.queued_follow_ups.is_empty());
     }
 }
 
-fn append_command_output_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) {
+fn append_plan_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) -> bool {
     let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
-        return;
+        return false;
+    };
+    if let ConversationItemContent::ProposedPlan(plan) = &mut item.content {
+        plan.content.push_str(delta);
+        return true;
+    }
+    false
+}
+
+fn append_command_output_delta(thread: &mut ThreadSnapshot, item_id: &str, delta: &str) -> bool {
+    let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
+        return false;
     };
     if let ConversationItemContent::CommandExecution(command) = &mut item.content {
         command
             .output
             .get_or_insert_with(String::new)
             .push_str(delta);
+        return true;
     }
+    false
 }
 
-fn append_mcp_progress(thread: &mut ThreadSnapshot, item_id: &str, message: &str) {
+fn append_mcp_progress(thread: &mut ThreadSnapshot, item_id: &str, message: &str) -> bool {
     let Some(item) = thread.items.iter_mut().find(|item| item.id == item_id) else {
-        return;
+        return false;
     };
     if let ConversationItemContent::McpToolCall(call) = &mut item.content {
         if !message.trim().is_empty() {
             call.progress_messages.push(message.to_string());
         }
+        return true;
+    }
+    false
+}
+
+fn appended_text_delta(existing: &str, projected: &str) -> Option<String> {
+    projected
+        .starts_with(existing)
+        .then(|| projected[existing.len()..].to_string())
+}
+
+fn appended_optional_text_delta(
+    existing: &Option<String>,
+    projected: &Option<String>,
+) -> Option<String> {
+    match (existing.as_deref(), projected.as_deref()) {
+        (None, None) => Some(String::new()),
+        (None, Some(projected)) => Some(projected.to_string()),
+        (Some(existing), Some(projected)) => appended_text_delta(existing, projected),
+        (Some(_), None) => None,
+    }
+}
+
+fn classify_item_mutation(
+    existing: Option<&ConversationItem>,
+    item: &ConversationItem,
+) -> Option<ItemMutationUpdate> {
+    let Some(existing) = existing else {
+        return Some(ItemMutationUpdate::Upsert(HydratedConversationItem::from(
+            item.clone(),
+        )));
+    };
+
+    match (&existing.content, &item.content) {
+        (
+            ConversationItemContent::CommandExecution(existing_data),
+            ConversationItemContent::CommandExecution(projected_data),
+        ) => {
+            if existing.id != item.id
+                || existing.source_turn_id != item.source_turn_id
+                || existing.source_turn_index != item.source_turn_index
+                || existing.timestamp != item.timestamp
+                || existing.is_from_user_turn_boundary != item.is_from_user_turn_boundary
+                || existing_data.command != projected_data.command
+                || existing_data.cwd != projected_data.cwd
+                || existing_data.actions != projected_data.actions
+            {
+                return Some(ItemMutationUpdate::Upsert(HydratedConversationItem::from(
+                    item.clone(),
+                )));
+            }
+
+            let output_delta =
+                appended_optional_text_delta(&existing_data.output, &projected_data.output)?;
+            let status = AppOperationStatus::from_raw(&projected_data.status);
+            let status_changed = existing_data.status != projected_data.status
+                || existing_data.exit_code != projected_data.exit_code
+                || existing_data.duration_ms != projected_data.duration_ms
+                || existing_data.process_id != projected_data.process_id;
+            if output_delta.is_empty() && !status_changed {
+                None
+            } else {
+                Some(ItemMutationUpdate::CommandExecutionUpdated {
+                    item_id: item.id.clone(),
+                    status,
+                    exit_code: projected_data.exit_code,
+                    duration_ms: projected_data.duration_ms,
+                    process_id: projected_data.process_id.clone(),
+                    output_delta: (!output_delta.is_empty()).then_some(output_delta),
+                })
+            }
+        }
+        _ if existing.content == item.content => None,
+        _ => Some(ItemMutationUpdate::Upsert(HydratedConversationItem::from(
+            item.clone(),
+        ))),
     }
 }
 

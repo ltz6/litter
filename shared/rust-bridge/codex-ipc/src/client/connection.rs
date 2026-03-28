@@ -13,6 +13,7 @@ use crate::protocol::envelope::{ClientDiscoveryResponse, DiscoveryAnswer, Envelo
 use crate::protocol::method::Method;
 use crate::protocol::params::{TypedBroadcast, TypedRequest};
 use crate::transport::frame;
+use crate::wire_trace::{RawFrameDirection, emit_raw_frame_trace};
 
 /// Active IPC connection with spawned read/write loop tasks.
 pub struct IpcConnection {
@@ -115,6 +116,7 @@ impl IpcConnection {
                     break;
                 }
             };
+            emit_raw_frame_trace(RawFrameDirection::In, &raw);
 
             let envelope: Envelope = match serde_json::from_str(&raw) {
                 Ok(e) => e,
@@ -213,6 +215,7 @@ impl IpcConnection {
                     continue;
                 }
             };
+            emit_raw_frame_trace(RawFrameDirection::Out, &json_str);
             if let Err(e) = frame::write_frame(&mut writer, &json_str).await {
                 error!("ipc: write error: {e}");
                 break;

@@ -3,15 +3,16 @@ use std::hash::{Hash, Hasher};
 use crate::conversation_uniffi::HydratedConversationItem;
 use crate::types::{PendingApproval, PendingUserInputRequest, ThreadInfo, ThreadKey};
 use crate::uniffi_shared::{
-    AppSubagentStatus, AppVoiceHandoffRequest, AppVoiceSessionPhase, AppVoiceTranscriptEntry,
-    AppVoiceTranscriptUpdate,
+    AppOperationStatus, AppSubagentStatus, AppVoiceHandoffRequest, AppVoiceSessionPhase,
+    AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate,
 };
 
 use super::snapshot::{
     AppSnapshot, ServerConnectionProgressSnapshot, ServerConnectionStepKind,
-    ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot,
+    ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot, ServerSnapshot,
+    ThreadSnapshot,
 };
-use super::updates::AppUpdate;
+use super::updates::{AppUpdate, ThreadStreamingDeltaKind};
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum AppServerConnectionStepKind {
@@ -73,12 +74,33 @@ pub enum AppServerHealth {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct AppQueuedFollowUpPreview {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct AppThreadSnapshot {
     pub key: ThreadKey,
     pub info: ThreadInfo,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub hydrated_conversation_items: Vec<HydratedConversationItem>,
+    pub queued_follow_ups: Vec<AppQueuedFollowUpPreview>,
+    pub active_turn_id: Option<String>,
+    pub context_tokens_used: Option<u64>,
+    pub model_context_window: Option<u64>,
+    pub rate_limits_json: Option<String>,
+    pub realtime_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AppThreadStateRecord {
+    pub key: ThreadKey,
+    pub info: ThreadInfo,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub queued_follow_ups: Vec<AppQueuedFollowUpPreview>,
     pub active_turn_id: Option<String>,
     pub context_tokens_used: Option<u64>,
     pub model_context_window: Option<u64>,
@@ -90,23 +112,71 @@ impl TryFrom<super::snapshot::ThreadSnapshot> for AppThreadSnapshot {
     type Error = String;
 
     fn try_from(thread: super::snapshot::ThreadSnapshot) -> Result<Self, Self::Error> {
+        (&thread).try_into()
+    }
+}
+
+impl TryFrom<&super::snapshot::ThreadSnapshot> for AppThreadSnapshot {
+    type Error = String;
+
+    fn try_from(thread: &super::snapshot::ThreadSnapshot) -> Result<Self, Self::Error> {
         let hydrated_conversation_items =
-            merged_hydrated_items(thread.items, thread.local_overlay_items);
+            merged_hydrated_items(thread.items.clone(), thread.local_overlay_items.clone());
         Ok(Self {
-            key: thread.key,
-            info: thread.info,
-            model: thread.model,
-            reasoning_effort: thread.reasoning_effort,
+            key: thread.key.clone(),
+            info: thread.info.clone(),
+            model: thread.model.clone(),
+            reasoning_effort: thread.reasoning_effort.clone(),
             hydrated_conversation_items,
-            active_turn_id: thread.active_turn_id,
+            queued_follow_ups: thread
+                .queued_follow_ups
+                .iter()
+                .map(|preview| AppQueuedFollowUpPreview {
+                    id: preview.id.clone(),
+                    text: preview.text.clone(),
+                })
+                .collect(),
+            active_turn_id: thread.active_turn_id.clone(),
             context_tokens_used: thread.context_tokens_used,
             model_context_window: thread.model_context_window,
             rate_limits_json: thread
                 .rate_limits
+                .clone()
                 .map(|limits| serde_json::to_string(&limits))
                 .transpose()
                 .map_err(|error| format!("serialize rate limits: {error}"))?,
-            realtime_session_id: thread.realtime_session_id,
+            realtime_session_id: thread.realtime_session_id.clone(),
+        })
+    }
+}
+
+impl TryFrom<&super::snapshot::ThreadSnapshot> for AppThreadStateRecord {
+    type Error = String;
+
+    fn try_from(thread: &super::snapshot::ThreadSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            key: thread.key.clone(),
+            info: thread.info.clone(),
+            model: thread.model.clone(),
+            reasoning_effort: thread.reasoning_effort.clone(),
+            queued_follow_ups: thread
+                .queued_follow_ups
+                .iter()
+                .map(|preview| AppQueuedFollowUpPreview {
+                    id: preview.id.clone(),
+                    text: preview.text.clone(),
+                })
+                .collect(),
+            active_turn_id: thread.active_turn_id.clone(),
+            context_tokens_used: thread.context_tokens_used,
+            model_context_window: thread.model_context_window,
+            rate_limits_json: thread
+                .rate_limits
+                .clone()
+                .map(|limits| serde_json::to_string(&limits))
+                .transpose()
+                .map_err(|error| format!("serialize rate limits: {error}"))?,
+            realtime_session_id: thread.realtime_session_id.clone(),
         })
     }
 }
@@ -191,87 +261,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
     type Error = String;
 
     fn try_from(snapshot: AppSnapshot) -> Result<Self, Self::Error> {
-        let mut session_summaries = snapshot
-            .threads
-            .values()
-            .map(|thread| {
-                let server = snapshot.servers.get(&thread.key.server_id);
-                let preview = thread.info.preview.clone().unwrap_or_default();
-                let title = {
-                    let explicit_title = thread.info.title.clone().unwrap_or_default();
-                    let trimmed_title = explicit_title.trim();
-                    if !trimmed_title.is_empty() {
-                        trimmed_title.to_string()
-                    } else {
-                        let trimmed_preview = preview.trim();
-                        if !trimmed_preview.is_empty() {
-                            trimmed_preview.to_string()
-                        } else {
-                            "Untitled session".to_string()
-                        }
-                    }
-                };
-                let parent_thread_id = thread.info.parent_thread_id.clone().and_then(|value| {
-                    let trimmed = value.trim().to_string();
-                    (!trimmed.is_empty()).then_some(trimmed)
-                });
-                let has_agent_label = thread
-                    .info
-                    .agent_nickname
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-                    || thread
-                        .info
-                        .agent_role
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty());
-                let is_fork = parent_thread_id.is_some();
-
-                AppSessionSummary {
-                    key: thread.key.clone(),
-                    server_display_name: server
-                        .map(|server| server.display_name.clone())
-                        .unwrap_or_else(|| thread.key.server_id.clone()),
-                    server_host: server
-                        .map(|server| server.host.clone())
-                        .unwrap_or_else(|| thread.key.server_id.clone()),
-                    title,
-                    preview,
-                    cwd: thread.info.cwd.clone().unwrap_or_default(),
-                    model: thread
-                        .info
-                        .model
-                        .clone()
-                        .or_else(|| thread.model.clone())
-                        .unwrap_or_default(),
-                    model_provider: thread.info.model_provider.clone().unwrap_or_default(),
-                    parent_thread_id,
-                    agent_nickname: thread.info.agent_nickname.clone(),
-                    agent_role: thread.info.agent_role.clone(),
-                    agent_display_label: agent_display_label(
-                        thread.info.agent_nickname.as_deref(),
-                        thread.info.agent_role.as_deref(),
-                        None,
-                    ),
-                    agent_status: thread
-                        .info
-                        .agent_status
-                        .as_deref()
-                        .map(AppSubagentStatus::from_raw)
-                        .unwrap_or(AppSubagentStatus::Unknown),
-                    updated_at: thread.info.updated_at,
-                    has_active_turn: thread.active_turn_id.is_some(),
-                    is_subagent: is_fork && has_agent_label,
-                    is_fork,
-                }
-            })
-            .collect::<Vec<_>>();
-        session_summaries.sort_by(|lhs, rhs| {
-            rhs.updated_at
-                .cmp(&lhs.updated_at)
-                .then_with(|| lhs.key.server_id.cmp(&rhs.key.server_id))
-                .then_with(|| lhs.key.thread_id.cmp(&rhs.key.thread_id))
-        });
+        let session_summaries = session_summaries_from_snapshot(&snapshot);
         let agent_directory_version = agent_directory_version(&session_summaries);
 
         let mut servers = snapshot
@@ -296,7 +286,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
 
         let mut threads = snapshot
             .threads
-            .into_values()
+            .values()
             .map(AppThreadSnapshot::try_from)
             .collect::<Result<Vec<_>, String>>()?;
         threads.sort_by(|lhs, rhs| lhs.key.thread_id.cmp(&rhs.key.thread_id));
@@ -319,6 +309,139 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
             },
         })
     }
+}
+
+pub(crate) fn session_summaries_from_snapshot(snapshot: &AppSnapshot) -> Vec<AppSessionSummary> {
+    let mut session_summaries = snapshot
+        .threads
+        .values()
+        .map(|thread| app_session_summary(thread, snapshot.servers.get(&thread.key.server_id)))
+        .collect::<Vec<_>>();
+    sort_session_summaries(&mut session_summaries);
+    session_summaries
+}
+
+pub(crate) fn app_session_summary(
+    thread: &ThreadSnapshot,
+    server: Option<&ServerSnapshot>,
+) -> AppSessionSummary {
+    let preview = thread.info.preview.clone().unwrap_or_default();
+    let title = {
+        let explicit_title = thread.info.title.clone().unwrap_or_default();
+        let trimmed_title = explicit_title.trim();
+        if !trimmed_title.is_empty() {
+            trimmed_title.to_string()
+        } else {
+            let trimmed_preview = preview.trim();
+            if !trimmed_preview.is_empty() {
+                trimmed_preview.to_string()
+            } else {
+                "Untitled session".to_string()
+            }
+        }
+    };
+    let parent_thread_id = thread.info.parent_thread_id.clone().and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+    let has_agent_label = thread
+        .info
+        .agent_nickname
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || thread
+            .info
+            .agent_role
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let is_fork = parent_thread_id.is_some();
+
+    AppSessionSummary {
+        key: thread.key.clone(),
+        server_display_name: server
+            .map(|server| server.display_name.clone())
+            .unwrap_or_else(|| thread.key.server_id.clone()),
+        server_host: server
+            .map(|server| server.host.clone())
+            .unwrap_or_else(|| thread.key.server_id.clone()),
+        title,
+        preview,
+        cwd: thread.info.cwd.clone().unwrap_or_default(),
+        model: thread
+            .info
+            .model
+            .clone()
+            .or_else(|| thread.model.clone())
+            .unwrap_or_default(),
+        model_provider: thread.info.model_provider.clone().unwrap_or_default(),
+        parent_thread_id,
+        agent_nickname: thread.info.agent_nickname.clone(),
+        agent_role: thread.info.agent_role.clone(),
+        agent_display_label: agent_display_label(
+            thread.info.agent_nickname.as_deref(),
+            thread.info.agent_role.as_deref(),
+            None,
+        ),
+        agent_status: thread
+            .info
+            .agent_status
+            .as_deref()
+            .map(AppSubagentStatus::from_raw)
+            .unwrap_or(AppSubagentStatus::Unknown),
+        updated_at: thread.info.updated_at,
+        has_active_turn: thread.active_turn_id.is_some(),
+        is_subagent: is_fork && has_agent_label,
+        is_fork,
+    }
+}
+
+pub(crate) fn sort_session_summaries(session_summaries: &mut [AppSessionSummary]) {
+    session_summaries.sort_by(|lhs, rhs| {
+        rhs.updated_at
+            .cmp(&lhs.updated_at)
+            .then_with(|| lhs.key.server_id.cmp(&rhs.key.server_id))
+            .then_with(|| lhs.key.thread_id.cmp(&rhs.key.thread_id))
+    });
+}
+
+pub(crate) fn project_thread_update(
+    snapshot: &AppSnapshot,
+    key: &ThreadKey,
+) -> Result<Option<(AppThreadSnapshot, AppSessionSummary, u64)>, String> {
+    let Some(thread) = snapshot.threads.get(key) else {
+        return Ok(None);
+    };
+    let thread_snapshot = AppThreadSnapshot::try_from(thread)?;
+    let session_summary = app_session_summary(thread, snapshot.servers.get(&key.server_id));
+    let agent_directory_version =
+        agent_directory_version(&session_summaries_from_snapshot(snapshot));
+    Ok(Some((
+        thread_snapshot,
+        session_summary,
+        agent_directory_version,
+    )))
+}
+
+pub(crate) fn project_thread_state_update(
+    snapshot: &AppSnapshot,
+    key: &ThreadKey,
+) -> Result<Option<(AppThreadStateRecord, AppSessionSummary, u64)>, String> {
+    let Some(thread) = snapshot.threads.get(key) else {
+        return Ok(None);
+    };
+    let thread_state = AppThreadStateRecord::try_from(thread)?;
+    let session_summary = app_session_summary(thread, snapshot.servers.get(&key.server_id));
+    let agent_directory_version =
+        agent_directory_version(&session_summaries_from_snapshot(snapshot));
+    Ok(Some((
+        thread_state,
+        session_summary,
+        agent_directory_version,
+    )))
+}
+
+pub(crate) fn current_agent_directory_version(snapshot: &AppSnapshot) -> u64 {
+    agent_directory_version(&session_summaries_from_snapshot(snapshot))
 }
 
 impl From<ServerHealthSnapshot> for AppServerHealth {
@@ -417,6 +540,15 @@ fn sanitized_label_field(raw: Option<&str>) -> Option<&str> {
     })
 }
 
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum AppThreadStreamingDeltaKind {
+    AssistantText,
+    ReasoningText,
+    PlanText,
+    CommandOutput,
+    McpProgress,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum AppStoreUpdateRecord {
     FullResync,
@@ -426,11 +558,37 @@ pub enum AppStoreUpdateRecord {
     ServerRemoved {
         server_id: String,
     },
-    ThreadChanged {
+    ThreadUpserted {
+        thread: AppThreadSnapshot,
+        session_summary: AppSessionSummary,
+        agent_directory_version: u64,
+    },
+    ThreadStateUpdated {
+        state: AppThreadStateRecord,
+        session_summary: AppSessionSummary,
+        agent_directory_version: u64,
+    },
+    ThreadItemUpserted {
         key: ThreadKey,
+        item: HydratedConversationItem,
+    },
+    ThreadCommandExecutionUpdated {
+        key: ThreadKey,
+        item_id: String,
+        status: AppOperationStatus,
+        exit_code: Option<i32>,
+        duration_ms: Option<i64>,
+        process_id: Option<String>,
+    },
+    ThreadStreamingDelta {
+        key: ThreadKey,
+        item_id: String,
+        kind: AppThreadStreamingDeltaKind,
+        text: String,
     },
     ThreadRemoved {
         key: ThreadKey,
+        agent_directory_version: u64,
     },
     ActiveThreadChanged {
         key: Option<ThreadKey>,
@@ -473,8 +631,58 @@ impl From<AppUpdate> for AppStoreUpdateRecord {
             AppUpdate::FullResync => Self::FullResync,
             AppUpdate::ServerChanged { server_id } => Self::ServerChanged { server_id },
             AppUpdate::ServerRemoved { server_id } => Self::ServerRemoved { server_id },
-            AppUpdate::ThreadChanged { key } => Self::ThreadChanged { key },
-            AppUpdate::ThreadRemoved { key } => Self::ThreadRemoved { key },
+            AppUpdate::ThreadUpserted {
+                thread,
+                session_summary,
+                agent_directory_version,
+            } => Self::ThreadUpserted {
+                thread,
+                session_summary,
+                agent_directory_version,
+            },
+            AppUpdate::ThreadStateUpdated {
+                state,
+                session_summary,
+                agent_directory_version,
+            } => Self::ThreadStateUpdated {
+                state,
+                session_summary,
+                agent_directory_version,
+            },
+            AppUpdate::ThreadItemUpserted { key, item } => Self::ThreadItemUpserted { key, item },
+            AppUpdate::ThreadCommandExecutionUpdated {
+                key,
+                item_id,
+                status,
+                exit_code,
+                duration_ms,
+                process_id,
+            } => Self::ThreadCommandExecutionUpdated {
+                key,
+                item_id,
+                status,
+                exit_code,
+                duration_ms,
+                process_id,
+            },
+            AppUpdate::ThreadStreamingDelta {
+                key,
+                item_id,
+                kind,
+                text,
+            } => Self::ThreadStreamingDelta {
+                key,
+                item_id,
+                kind: kind.into(),
+                text,
+            },
+            AppUpdate::ThreadRemoved {
+                key,
+                agent_directory_version,
+            } => Self::ThreadRemoved {
+                key,
+                agent_directory_version,
+            },
             AppUpdate::ActiveThreadChanged { key } => Self::ActiveThreadChanged { key },
             AppUpdate::PendingApprovalsChanged { .. } => Self::PendingApprovalsChanged,
             AppUpdate::PendingUserInputsChanged { .. } => Self::PendingUserInputsChanged,
@@ -498,6 +706,18 @@ impl From<AppUpdate> for AppStoreUpdateRecord {
             AppUpdate::RealtimeClosed { key, notification } => {
                 Self::RealtimeClosed { key, notification }
             }
+        }
+    }
+}
+
+impl From<ThreadStreamingDeltaKind> for AppThreadStreamingDeltaKind {
+    fn from(value: ThreadStreamingDeltaKind) -> Self {
+        match value {
+            ThreadStreamingDeltaKind::AssistantText => Self::AssistantText,
+            ThreadStreamingDeltaKind::ReasoningText => Self::ReasoningText,
+            ThreadStreamingDeltaKind::PlanText => Self::PlanText,
+            ThreadStreamingDeltaKind::CommandOutput => Self::CommandOutput,
+            ThreadStreamingDeltaKind::McpProgress => Self::McpProgress,
         }
     }
 }

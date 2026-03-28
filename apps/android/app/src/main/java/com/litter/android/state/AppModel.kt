@@ -15,12 +15,21 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicLong
 import uniffi.codex_mobile_client.AppServerRpc
+import uniffi.codex_mobile_client.AppSessionSummary
 import uniffi.codex_mobile_client.AppSnapshotRecord
 import uniffi.codex_mobile_client.AppStore
 import uniffi.codex_mobile_client.AppStoreSubscription
 import uniffi.codex_mobile_client.AppThreadSnapshot
+import uniffi.codex_mobile_client.AppThreadStreamingDeltaKind
 import uniffi.codex_mobile_client.AppStoreUpdateRecord
 import uniffi.codex_mobile_client.DiscoveryBridge
+import uniffi.codex_mobile_client.HydratedAssistantMessageData
+import uniffi.codex_mobile_client.HydratedCommandExecutionData
+import uniffi.codex_mobile_client.HydratedConversationItem
+import uniffi.codex_mobile_client.HydratedConversationItemContent
+import uniffi.codex_mobile_client.HydratedMcpToolCallData
+import uniffi.codex_mobile_client.HydratedProposedPlanData
+import uniffi.codex_mobile_client.HydratedReasoningData
 import uniffi.codex_mobile_client.HandoffManager
 import uniffi.codex_mobile_client.MessageParser
 import uniffi.codex_mobile_client.ModelListParams
@@ -124,12 +133,11 @@ class AppModel private constructor(context: android.content.Context) {
         if (subscriptionJob?.isActive == true) return
         subscriptionJob = scope.launch {
             try {
-                refreshSnapshot()
                 val subscription: AppStoreSubscription = store.subscribeUpdates()
+                refreshSnapshot()
                 while (true) {
                     try {
                         val update: AppStoreUpdateRecord = subscription.nextUpdate()
-                        LLog.d("AppModel", "AppStore update", fields = mapOf("update" to update::class.simpleName))
                         handleUpdate(update)
                     } catch (e: Exception) {
                         LLog.e("AppModel", "AppStore subscription loop failed", e)
@@ -174,13 +182,16 @@ class AppModel private constructor(context: android.content.Context) {
         }
     }
 
-    private fun applySavedServerNames(snapshot: AppSnapshotRecord): AppSnapshotRecord {
-        val nameByServerId = SavedServerStore.load(appContext)
+    private fun loadSavedServerNames(): Map<String, String> =
+        SavedServerStore.load(appContext)
             .mapNotNull { server ->
                 val trimmed = server.name.trim()
                 if (trimmed.isEmpty()) null else server.id to trimmed
             }
             .toMap()
+
+    private fun applySavedServerNames(snapshot: AppSnapshotRecord): AppSnapshotRecord {
+        val nameByServerId = loadSavedServerNames()
         if (nameByServerId.isEmpty()) return snapshot
 
         return snapshot.copy(
@@ -201,6 +212,15 @@ class AppModel private constructor(context: android.content.Context) {
                 }
             },
         )
+    }
+
+    private fun applySavedServerName(summary: AppSessionSummary): AppSessionSummary {
+        val savedName = loadSavedServerNames()[summary.key.serverId] ?: return summary
+        return if (savedName != summary.serverDisplayName) {
+            summary.copy(serverDisplayName = savedName)
+        } else {
+            summary
+        }
     }
 
     suspend fun restartLocalServer() {
@@ -250,7 +270,6 @@ class AppModel private constructor(context: android.content.Context) {
                         ),
                     )
                 }
-                refreshSnapshot()
                 _lastError.value = null
             } catch (e: Exception) {
                 _lastError.value = e.message
@@ -419,8 +438,35 @@ class AppModel private constructor(context: android.content.Context) {
 
     private suspend fun handleUpdate(update: AppStoreUpdateRecord) {
         when (update) {
-            is AppStoreUpdateRecord.ThreadChanged -> refreshThreadSnapshot(update.key)
-            is AppStoreUpdateRecord.ThreadRemoved -> removeThreadSnapshot(update.key)
+            is AppStoreUpdateRecord.ThreadUpserted ->
+                applyThreadUpsert(update.thread, update.sessionSummary, update.agentDirectoryVersion)
+            is AppStoreUpdateRecord.ThreadStateUpdated ->
+                applyThreadStateUpdated(update.state, update.sessionSummary, update.agentDirectoryVersion)
+            is AppStoreUpdateRecord.ThreadItemUpserted -> {
+                if (!applyThreadItemUpsert(update.key, update.item)) {
+                    recoverThreadDeltaApplication(update.key)
+                }
+            }
+            is AppStoreUpdateRecord.ThreadCommandExecutionUpdated -> {
+                if (!applyThreadCommandExecutionUpdated(
+                        update.key,
+                        update.itemId,
+                        update.status,
+                        update.exitCode,
+                        update.durationMs,
+                        update.processId,
+                    )
+                ) {
+                    recoverThreadDeltaApplication(update.key)
+                }
+            }
+            is AppStoreUpdateRecord.ThreadStreamingDelta -> {
+                if (!applyThreadStreamingDelta(update.key, update.itemId, update.kind, update.text)) {
+                    recoverThreadDeltaApplication(update.key)
+                }
+            }
+            is AppStoreUpdateRecord.ThreadRemoved ->
+                removeThreadSnapshot(update.key, update.agentDirectoryVersion)
             is AppStoreUpdateRecord.ActiveThreadChanged -> {
                 updateActiveThread(update.key)
                 if (update.key != null && snapshot.value?.threads?.any { it.key == update.key } != true) {
@@ -440,6 +486,17 @@ class AppModel private constructor(context: android.content.Context) {
             is AppStoreUpdateRecord.RealtimeOutputAudioDelta -> Unit
             is AppStoreUpdateRecord.RealtimeError -> refreshSnapshot()
             is AppStoreUpdateRecord.RealtimeClosed -> refreshSnapshot()
+        }
+    }
+
+    private suspend fun recoverThreadDeltaApplication(key: ThreadKey) {
+        val current = _snapshot.value
+        val threadMissing = current?.threads?.any { it.key == key } != true
+        val summaryMissing = current?.sessionSummaries?.any { it.key == key } != true
+        if (threadMissing && summaryMissing) {
+            refreshSnapshot()
+        } else {
+            refreshThreadSnapshot(key)
         }
     }
 
@@ -476,10 +533,236 @@ class AppModel private constructor(context: android.content.Context) {
         _lastError.value = null
     }
 
-    private fun removeThreadSnapshot(key: ThreadKey) {
+    private fun applyThreadUpsert(
+        thread: AppThreadSnapshot,
+        sessionSummary: AppSessionSummary,
+        agentDirectoryVersion: ULong,
+    ) {
+        val current = _snapshot.value ?: return
+        val existingThreadIndex = current.threads.indexOfFirst { it.key == thread.key }
+        val updatedThreads = current.threads.toMutableList().apply {
+            if (existingThreadIndex >= 0) {
+                this[existingThreadIndex] = thread
+            } else {
+                add(thread)
+            }
+        }
+
+        val adjustedSummary = applySavedServerName(sessionSummary)
+        val existingSummaryIndex = current.sessionSummaries.indexOfFirst { it.key == adjustedSummary.key }
+        val updatedSummaries = current.sessionSummaries.toMutableList().apply {
+            if (existingSummaryIndex >= 0) {
+                this[existingSummaryIndex] = adjustedSummary
+            } else {
+                add(adjustedSummary)
+            }
+            sortWith(compareByDescending<AppSessionSummary> { it.updatedAt ?: Long.MIN_VALUE }
+                .thenBy { it.key.serverId }
+                .thenBy { it.key.threadId })
+        }
+
+        _snapshot.value = current.copy(
+            threads = updatedThreads,
+            sessionSummaries = updatedSummaries,
+            agentDirectoryVersion = agentDirectoryVersion,
+        )
+        _lastError.value = null
+    }
+
+    private fun applyThreadStateUpdated(
+        state: uniffi.codex_mobile_client.AppThreadStateRecord,
+        sessionSummary: AppSessionSummary,
+        agentDirectoryVersion: ULong,
+    ) {
+        val current = _snapshot.value ?: return
+        val existingThreadIndex = current.threads.indexOfFirst { it.key == state.key }
+        if (existingThreadIndex < 0) return
+
+        val existingThread = current.threads[existingThreadIndex]
+        val updatedThread = existingThread.copy(
+            info = state.info,
+            model = state.model,
+            reasoningEffort = state.reasoningEffort,
+            activeTurnId = state.activeTurnId,
+            contextTokensUsed = state.contextTokensUsed,
+            modelContextWindow = state.modelContextWindow,
+            rateLimitsJson = state.rateLimitsJson,
+            realtimeSessionId = state.realtimeSessionId,
+        )
+        val updatedThreads = current.threads.toMutableList().apply {
+            this[existingThreadIndex] = updatedThread
+        }
+
+        val adjustedSummary = applySavedServerName(sessionSummary)
+        val existingSummaryIndex = current.sessionSummaries.indexOfFirst { it.key == adjustedSummary.key }
+        val updatedSummaries = current.sessionSummaries.toMutableList().apply {
+            if (existingSummaryIndex >= 0) {
+                this[existingSummaryIndex] = adjustedSummary
+            } else {
+                add(adjustedSummary)
+            }
+            sortWith(compareByDescending<AppSessionSummary> { it.updatedAt ?: Long.MIN_VALUE }
+                .thenBy { it.key.serverId }
+                .thenBy { it.key.threadId })
+        }
+
+        _snapshot.value = current.copy(
+            threads = updatedThreads,
+            sessionSummaries = updatedSummaries,
+            agentDirectoryVersion = agentDirectoryVersion,
+        )
+        _lastError.value = null
+    }
+
+    private fun applyThreadItemUpsert(
+        key: ThreadKey,
+        item: HydratedConversationItem,
+    ): Boolean {
+        val current = _snapshot.value ?: return false
+        val threadIndex = current.threads.indexOfFirst { it.key == key }
+        if (threadIndex < 0) return false
+
+        val thread = current.threads[threadIndex]
+        val updatedItems = thread.hydratedConversationItems.toMutableList()
+        val existingItemIndex = updatedItems.indexOfFirst { it.id == item.id }
+        if (existingItemIndex >= 0) {
+            updatedItems[existingItemIndex] = item
+        } else {
+            val insertionIndex = insertionIndexForItem(updatedItems, item)
+            updatedItems.add(insertionIndex, item)
+        }
+        applyThreadSnapshot(thread.copy(hydratedConversationItems = updatedItems))
+        return true
+    }
+
+    private fun applyThreadCommandExecutionUpdated(
+        key: ThreadKey,
+        itemId: String,
+        status: uniffi.codex_mobile_client.AppOperationStatus,
+        exitCode: Int?,
+        durationMs: Long?,
+        processId: String?,
+    ): Boolean {
+        val current = _snapshot.value ?: return false
+        val threadIndex = current.threads.indexOfFirst { it.key == key }
+        if (threadIndex < 0) return false
+
+        val thread = current.threads[threadIndex]
+        val itemIndex = thread.hydratedConversationItems.indexOfFirst { it.id == itemId }
+        if (itemIndex < 0) return false
+
+        val item = thread.hydratedConversationItems[itemIndex]
+        val content = item.content as? HydratedConversationItemContent.CommandExecution ?: return false
+        val updatedItems = thread.hydratedConversationItems.toMutableList().apply {
+            this[itemIndex] = item.copy(
+                content = HydratedConversationItemContent.CommandExecution(
+                    content.v1.copy(
+                        status = status,
+                        exitCode = exitCode,
+                        durationMs = durationMs,
+                        processId = processId,
+                    ),
+                ),
+            )
+        }
+        applyThreadSnapshot(thread.copy(hydratedConversationItems = updatedItems))
+        return true
+    }
+
+    private fun applyThreadStreamingDelta(
+        key: ThreadKey,
+        itemId: String,
+        kind: AppThreadStreamingDeltaKind,
+        text: String,
+    ): Boolean {
+        val current = _snapshot.value ?: return false
+        val threadIndex = current.threads.indexOfFirst { it.key == key }
+        if (threadIndex < 0) return false
+
+        val thread = current.threads[threadIndex]
+        val itemIndex = thread.hydratedConversationItems.indexOfFirst { it.id == itemId }
+        if (itemIndex < 0) return false
+
+        val updatedContent = applyStreamingDelta(kind, text, thread.hydratedConversationItems[itemIndex].content)
+            ?: return false
+        val updatedItems = thread.hydratedConversationItems.toMutableList().apply {
+            this[itemIndex] = this[itemIndex].copy(content = updatedContent)
+        }
+        applyThreadSnapshot(thread.copy(hydratedConversationItems = updatedItems))
+        return true
+    }
+
+    private fun applyStreamingDelta(
+        kind: AppThreadStreamingDeltaKind,
+        text: String,
+        content: HydratedConversationItemContent,
+    ): HydratedConversationItemContent? = when (kind) {
+        AppThreadStreamingDeltaKind.ASSISTANT_TEXT -> when (content) {
+            is HydratedConversationItemContent.Assistant ->
+                HydratedConversationItemContent.Assistant(content.v1.copy(text = content.v1.text + text))
+            else -> null
+        }
+        AppThreadStreamingDeltaKind.REASONING_TEXT -> when (content) {
+            is HydratedConversationItemContent.Reasoning -> {
+                val updatedContent = content.v1.content.toMutableList().apply {
+                    if (isEmpty()) {
+                        add(text)
+                    } else {
+                        this[lastIndex] = this[lastIndex] + text
+                    }
+                }
+                HydratedConversationItemContent.Reasoning(content.v1.copy(content = updatedContent))
+            }
+            else -> null
+        }
+        AppThreadStreamingDeltaKind.PLAN_TEXT -> when (content) {
+            is HydratedConversationItemContent.ProposedPlan ->
+                HydratedConversationItemContent.ProposedPlan(content.v1.copy(content = content.v1.content + text))
+            else -> null
+        }
+        AppThreadStreamingDeltaKind.COMMAND_OUTPUT -> when (content) {
+            is HydratedConversationItemContent.CommandExecution ->
+                HydratedConversationItemContent.CommandExecution(
+                    content.v1.copy(output = (content.v1.output ?: "") + text)
+                )
+            else -> null
+        }
+        AppThreadStreamingDeltaKind.MCP_PROGRESS -> when (content) {
+            is HydratedConversationItemContent.McpToolCall -> {
+                val updatedProgress = content.v1.progressMessages.toMutableList().apply {
+                    if (text.isNotBlank()) {
+                        add(text)
+                    }
+                }
+                HydratedConversationItemContent.McpToolCall(
+                    content.v1.copy(progressMessages = updatedProgress)
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun insertionIndexForItem(
+        items: List<HydratedConversationItem>,
+        item: HydratedConversationItem,
+    ): Int {
+        val targetTurn = item.sourceTurnIndex?.toInt() ?: return items.size
+        val lastSameTurn = items.indexOfLast { it.sourceTurnIndex?.toInt() == targetTurn }
+        if (lastSameTurn >= 0) return lastSameTurn + 1
+
+        val nextTurn = items.indexOfFirst {
+            val sourceTurn = it.sourceTurnIndex?.toInt()
+            sourceTurn != null && sourceTurn > targetTurn
+        }
+        return if (nextTurn >= 0) nextTurn else items.size
+    }
+
+    private fun removeThreadSnapshot(key: ThreadKey, agentDirectoryVersion: ULong? = null) {
         val current = _snapshot.value ?: return
         _snapshot.value = current.copy(
             threads = current.threads.filterNot { it.key == key },
+            sessionSummaries = current.sessionSummaries.filterNot { it.key == key },
+            agentDirectoryVersion = agentDirectoryVersion ?: current.agentDirectoryVersion,
             activeThread = if (current.activeThread == key) null else current.activeThread,
         )
     }

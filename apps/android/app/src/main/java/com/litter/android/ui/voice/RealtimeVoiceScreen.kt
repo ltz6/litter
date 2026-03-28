@@ -71,6 +71,7 @@ import com.litter.android.state.OpenAIApiKeyStore
 import com.litter.android.state.VoiceRuntimeController
 import com.litter.android.ui.LitterTheme
 import com.litter.android.ui.LocalAppModel
+import com.litter.android.ui.rememberStickyFollowTail
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.Account
@@ -100,6 +101,11 @@ fun RealtimeVoiceScreen(
         voiceSession?.transcriptEntries?.filter { it.text.trim().isNotEmpty() }.orEmpty()
     }
     val transcriptListState = rememberLazyListState()
+    val shouldFollowTail = rememberStickyFollowTail(
+        listState = transcriptListState,
+        resetKey = threadKey,
+        bufferItems = 1,
+    )
 
     var hasCheckedAuth by remember { mutableStateOf(false) }
     var hasStartedRealtime by remember { mutableStateOf(false) }
@@ -128,7 +134,14 @@ fun RealtimeVoiceScreen(
     }
     val needsApiKey = hasCheckedAuth && server?.isLocal == true && !hasStoredApiKey
     val phaseColor = voicePhaseColor(phase)
-    val transcriptSignature = transcriptEntries.lastOrNull()?.let { "${it.itemId}:${it.text.length}" }
+    val transcriptTailSignature = remember(transcriptEntries) {
+        var hash = 17
+        transcriptEntries.takeLast(4).forEach { entry ->
+            hash = 31 * hash + entry.hashCode()
+        }
+        hash = 31 * hash + transcriptEntries.size
+        hash
+    }
 
     LaunchedEffect(threadKey) {
         try {
@@ -158,9 +171,9 @@ fun RealtimeVoiceScreen(
         }
     }
 
-    LaunchedEffect(transcriptSignature) {
-        if (transcriptEntries.isNotEmpty()) {
-            transcriptListState.animateScrollToItem(transcriptEntries.lastIndex)
+    LaunchedEffect(threadKey, transcriptTailSignature) {
+        if (shouldFollowTail && transcriptEntries.isNotEmpty()) {
+            transcriptListState.scrollToItem(transcriptEntries.lastIndex)
         }
     }
 

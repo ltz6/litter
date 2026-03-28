@@ -18,6 +18,7 @@ struct ConversationTranscriptSnapshot {
 struct ConversationComposerSnapshot {
     var threadKey: ThreadKey
     var pendingUserInputRequest: PendingUserInputRequest?
+    var queuedFollowUps: [AppQueuedFollowUpPreview]
     var composerPrefillRequest: AppModel.ComposerPrefillRequest?
     var activeTurnId: String?
     var isTurnActive: Bool
@@ -33,6 +34,7 @@ struct ConversationComposerSnapshot {
     static let empty = ConversationComposerSnapshot(
         threadKey: ThreadKey(serverId: "", threadId: ""),
         pendingUserInputRequest: nil,
+        queuedFollowUps: [],
         composerPrefillRequest: nil,
         activeTurnId: nil,
         isTurnActive: false,
@@ -111,6 +113,7 @@ final class ConversationScreenModel {
         let composerSnapshot = ConversationComposerSnapshot(
             threadKey: thread.key,
             pendingUserInputRequest: pendingUserInputRequest,
+            queuedFollowUps: thread.queuedFollowUps,
             composerPrefillRequest: composerPrefillRequest,
             activeTurnId: activeTurnId,
             isTurnActive: activeTurnId != nil,

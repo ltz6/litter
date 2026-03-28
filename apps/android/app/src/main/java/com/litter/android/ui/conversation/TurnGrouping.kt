@@ -98,7 +98,9 @@ fun buildTranscriptTurns(
 ): List<TranscriptTurn> {
     if (items.isEmpty()) return emptyList()
 
-    val groupedItems = mergeTrailingStreamingGroups(groupItems(items), isStreaming)
+    val groupedItems = mergeConsecutiveExplorationGroups(
+        mergeTrailingStreamingGroups(groupItems(items), isStreaming),
+    )
     val collapseBoundary = maxOf(0, groupedItems.size - expandedRecentTurnCount)
     val lastIndex = groupedItems.lastIndex
 
@@ -165,9 +167,41 @@ private fun mergeTrailingStreamingGroups(
     }
 }
 
+private fun mergeConsecutiveExplorationGroups(
+    groups: List<List<HydratedConversationItem>>,
+): List<List<HydratedConversationItem>> {
+    val merged = mutableListOf<List<HydratedConversationItem>>()
+    val explorationBuffer = mutableListOf<HydratedConversationItem>()
+
+    fun flushExplorationBuffer() {
+        if (explorationBuffer.isEmpty()) return
+        merged += explorationBuffer.toList()
+        explorationBuffer.clear()
+    }
+
+    groups.forEach { group ->
+        if (group.isExplorationGroup()) {
+            explorationBuffer += group
+        } else {
+            flushExplorationBuffer()
+            merged += group
+        }
+    }
+
+    flushExplorationBuffer()
+    return merged
+}
+
 private fun containsLiveTurnBoundary(items: List<HydratedConversationItem>): Boolean {
     return items.any { item ->
         item.isFromUserTurnBoundary || item.content is HydratedConversationItemContent.User
+    }
+}
+
+private fun List<HydratedConversationItem>.isExplorationGroup(): Boolean {
+    return isNotEmpty() && all { item ->
+        val content = item.content as? HydratedConversationItemContent.CommandExecution
+        content?.v1?.isPureExploration() == true
     }
 }
 
@@ -262,6 +296,12 @@ data class ExplorationGroup(
     val items: List<HydratedConversationItem>,
 )
 
+private data class ExplorationDisplayEntry(
+    val id: String,
+    val label: String,
+    val isInProgress: Boolean,
+)
+
 /**
  * Detects exploration groups in a list of items within a single turn.
  * Returns a mixed list of either individual items or exploration groups.
@@ -311,7 +351,8 @@ fun buildTimelineEntries(
 fun ExplorationGroupRow(group: ExplorationGroup) {
     val textScale = LocalTextScale.current
     var expanded by remember { mutableStateOf(false) }
-    val isActive = remember(group.items) { group.items.any { it.isInProgressExplorationItem() } }
+    val entries = remember(group.items) { group.explorationEntries() }
+    val isActive = remember(entries) { entries.any { it.isInProgress } }
     val shimmerProgress by rememberInfiniteTransition(label = "exploration-header-shimmer").animateFloat(
         initialValue = -1f,
         targetValue = 2f,
@@ -344,7 +385,9 @@ fun ExplorationGroupRow(group: ExplorationGroup) {
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = if (isActive) "Exploring ${group.items.size} locations" else "Explored ${group.items.size} locations",
+                text = remember(entries, isActive) {
+                    group.explorationSummaryText(isActive = isActive)
+                },
                 color = if (isActive) LitterTheme.textPrimary else LitterTheme.textSecondary,
                 fontSize = LitterTextStyle.caption.scaled,
                 modifier = Modifier
@@ -354,8 +397,7 @@ fun ExplorationGroupRow(group: ExplorationGroup) {
         }
 
         if (expanded) {
-            for (item in group.items) {
-                val cmd = (item.content as HydratedConversationItemContent.CommandExecution).v1
+            for (entry in entries) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -369,7 +411,7 @@ fun ExplorationGroupRow(group: ExplorationGroup) {
                             .width(bulletSize)
                             .height(bulletSize)
                             .background(
-                                color = if (cmd.status == AppOperationStatus.PENDING || cmd.status == AppOperationStatus.IN_PROGRESS) {
+                                color = if (entry.isInProgress) {
                                     LitterTheme.warning
                                 } else {
                                     LitterTheme.textMuted
@@ -378,7 +420,7 @@ fun ExplorationGroupRow(group: ExplorationGroup) {
                             ),
                     )
                     Text(
-                        text = explorationLabel(cmd),
+                        text = entry.label,
                         color = LitterTheme.textSecondary,
                         fontSize = LitterTextStyle.caption.scaled,
                         maxLines = Int.MAX_VALUE,
@@ -410,11 +452,77 @@ private fun HydratedConversationItem.isInProgressExplorationItem(): Boolean {
     return content.v1.status == AppOperationStatus.PENDING || content.v1.status == AppOperationStatus.IN_PROGRESS
 }
 
-private fun explorationLabel(data: uniffi.codex_mobile_client.HydratedCommandExecutionData): String {
-    val action = data.actions.firstOrNull() ?: return data.command
+private fun ExplorationGroup.explorationEntries(): List<ExplorationDisplayEntry> {
+    return items.flatMap { item ->
+        val content = item.content as? HydratedConversationItemContent.CommandExecution ?: return@flatMap emptyList()
+        val data = content.v1
+        val isInProgress = data.status == AppOperationStatus.PENDING || data.status == AppOperationStatus.IN_PROGRESS
+        if (data.actions.isEmpty()) {
+            listOf(
+                ExplorationDisplayEntry(
+                    id = "${item.id}-command",
+                    label = data.command,
+                    isInProgress = isInProgress,
+                ),
+            )
+        } else {
+            data.actions.mapIndexed { index, action ->
+                ExplorationDisplayEntry(
+                    id = "${item.id}-$index",
+                    label = explorationActionLabel(action, data.command),
+                    isInProgress = isInProgress,
+                )
+            }
+        }
+    }
+}
+
+private fun ExplorationGroup.explorationSummaryText(isActive: Boolean): String {
+    var readCount = 0
+    var searchCount = 0
+    var listingCount = 0
+    var fallbackCount = 0
+
+    items.forEach { item ->
+        val content = item.content as? HydratedConversationItemContent.CommandExecution ?: return@forEach
+        val data = content.v1
+        if (data.actions.isEmpty()) {
+            fallbackCount += 1
+            return@forEach
+        }
+        data.actions.forEach { action ->
+            when (action.kind) {
+                HydratedCommandActionKind.READ -> readCount += 1
+                HydratedCommandActionKind.SEARCH -> searchCount += 1
+                HydratedCommandActionKind.LIST_FILES -> listingCount += 1
+                HydratedCommandActionKind.UNKNOWN -> fallbackCount += 1
+            }
+        }
+    }
+
+    val parts = buildList {
+        if (readCount > 0) add("$readCount ${if (readCount == 1) "file" else "files"}")
+        if (searchCount > 0) add("$searchCount ${if (searchCount == 1) "search" else "searches"}")
+        if (listingCount > 0) add("$listingCount ${if (listingCount == 1) "listing" else "listings"}")
+        if (fallbackCount > 0) add("$fallbackCount ${if (fallbackCount == 1) "step" else "steps"}")
+    }
+
+    val prefix = if (isActive) "Exploring" else "Explored"
+    return if (parts.isEmpty()) {
+        val count = explorationEntries().size
+        "$prefix $count exploration ${if (count == 1) "step" else "steps"}"
+    } else {
+        "$prefix ${parts.joinToString(", ")}"
+    }
+}
+
+private fun explorationActionLabel(
+    action: uniffi.codex_mobile_client.HydratedCommandActionData,
+    fallback: String,
+): String {
     return when (action.kind) {
         HydratedCommandActionKind.READ -> {
-            action.path?.let { "Read ${workspaceTitle(it)}" } ?: action.command
+            action.path?.let { "Read ${workspaceTitle(it)}" } ?: fallback
         }
 
         HydratedCommandActionKind.SEARCH -> {
@@ -423,15 +531,15 @@ private fun explorationLabel(data: uniffi.codex_mobile_client.HydratedCommandExe
                     "Searched for ${action.query} in ${workspaceTitle(action.path!!)}"
                 !action.query.isNullOrBlank() ->
                     "Searched for ${action.query}"
-                else -> action.command
+                else -> fallback
             }
         }
 
         HydratedCommandActionKind.LIST_FILES -> {
-            action.path?.let { "Listed files in ${workspaceTitle(it)}" } ?: action.command
+            action.path?.let { "Listed files in ${workspaceTitle(it)}" } ?: fallback
         }
 
-        HydratedCommandActionKind.UNKNOWN -> data.command
+        HydratedCommandActionKind.UNKNOWN -> fallback
     }
 }
 

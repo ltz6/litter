@@ -58,6 +58,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.sp
@@ -107,8 +108,9 @@ private val SLASH_COMMANDS = listOf(
 fun ComposerBar(
     threadKey: ThreadKey,
     activeTurnId: String?,
-    contextPercent: Int,
+    contextPercent: Int?,
     isThinking: Boolean,
+    queuedFollowUps: List<uniffi.codex_mobile_client.AppQueuedFollowUpPreview> = emptyList(),
     rateLimits: uniffi.codex_mobile_client.RateLimitSnapshot? = null,
     onToggleModelSelector: (() -> Unit)? = null,
     onNavigateToSessions: (() -> Unit)? = null,
@@ -357,6 +359,38 @@ fun ComposerBar(
                 )
             }
         }
+
+        if (queuedFollowUps.isNotEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp)
+                    .background(LitterTheme.codeBackground, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = if (queuedFollowUps.size == 1) "Queued Follow-Up" else "Queued Follow-Ups",
+                    color = LitterTheme.textPrimary,
+                    fontSize = LitterTextStyle.caption.scaled,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                queuedFollowUps.forEach { preview ->
+                    Text(
+                        text = preview.text,
+                        color = LitterTheme.textSecondary,
+                        fontSize = LitterTextStyle.caption.scaled,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(LitterTheme.surface, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                    )
+                }
+            }
+        }
+
         // Input row
         Row(
             modifier = Modifier
@@ -415,175 +449,231 @@ fun ComposerBar(
             }
 
             // Text field
-            Box(
+            Row(
                 modifier = Modifier
                     .weight(1f)
                     .heightIn(min = 36.dp, max = 120.dp)
                     .background(LitterTheme.codeBackground, RoundedCornerShape(18.dp))
                     .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (text.isEmpty()) {
-                    Text(
-                        text = "Message\u2026",
-                        color = LitterTheme.textMuted,
-                        fontSize = LitterTextStyle.body.scaled,
-                    )
-                }
-                BasicTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    textStyle = TextStyle(
-                        color = LitterTheme.textPrimary,
-                        fontSize = LitterTextStyle.body.scaled,
-                        fontFamily = LitterTheme.monoFont,
-                    ),
-                    cursorBrush = SolidColor(LitterTheme.accent),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-
-                // Slash command popup
-                DropdownMenu(
-                    expanded = showSlashMenu,
-                    onDismissRequest = { showSlashMenu = false },
-                ) {
-                    for (cmd in filteredCommands) {
-                        DropdownMenuItem(
-                            text = {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("/${cmd.name}", color = LitterTheme.accent, fontSize = LitterTextStyle.footnote.scaled, fontWeight = FontWeight.Medium)
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(cmd.description, color = LitterTheme.textMuted, fontSize = 11.sp)
-                                }
-                            },
-                            onClick = {
-                                showSlashMenu = false
-                                if (dispatchSlashCommand(cmd.name, args = null)) {
-                                    text = ""
-                                    attachedImage = null
-                                }
-                            },
+                Box(modifier = Modifier.weight(1f)) {
+                    if (text.isEmpty()) {
+                        Text(
+                            text = "Message\u2026",
+                            color = LitterTheme.textMuted,
+                            fontSize = LitterTextStyle.body.scaled,
                         )
+                    }
+                    BasicTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        textStyle = TextStyle(
+                            color = LitterTheme.textPrimary,
+                            fontSize = LitterTextStyle.body.scaled,
+                            fontFamily = LitterTheme.monoFont,
+                        ),
+                        cursorBrush = SolidColor(LitterTheme.accent),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+
+                    // Slash command popup
+                    DropdownMenu(
+                        expanded = showSlashMenu,
+                        onDismissRequest = { showSlashMenu = false },
+                    ) {
+                        for (cmd in filteredCommands) {
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("/${cmd.name}", color = LitterTheme.accent, fontSize = LitterTextStyle.footnote.scaled, fontWeight = FontWeight.Medium)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(cmd.description, color = LitterTheme.textMuted, fontSize = 11.sp)
+                                    }
+                                },
+                                onClick = {
+                                    showSlashMenu = false
+                                    if (dispatchSlashCommand(cmd.name, args = null)) {
+                                        text = ""
+                                        attachedImage = null
+                                    }
+                                },
+                            )
+                        }
+                    }
+
+                    // @file search popup
+                    DropdownMenu(
+                        expanded = showFileMenu,
+                        onDismissRequest = { showFileMenu = false },
+                    ) {
+                        for (path in fileSearchResults) {
+                            DropdownMenuItem(
+                                text = { Text(path, color = LitterTheme.textPrimary, fontSize = 12.sp, fontFamily = LitterTheme.monoFont) },
+                                onClick = {
+                                    showFileMenu = false
+                                    val atIdx = text.lastIndexOf('@')
+                                    if (atIdx >= 0) {
+                                        text = text.substring(0, atIdx) + "@$path "
+                                    }
+                                },
+                            )
+                        }
                     }
                 }
 
-                // @file search popup
-                DropdownMenu(
-                    expanded = showFileMenu,
-                    onDismissRequest = { showFileMenu = false },
-                ) {
-                    for (path in fileSearchResults) {
-                        DropdownMenuItem(
-                            text = { Text(path, color = LitterTheme.textPrimary, fontSize = 12.sp, fontFamily = LitterTheme.monoFont) },
+                val canSend = text.isNotBlank() || attachedImage != null
+                when {
+                    canSend -> {
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(
                             onClick = {
-                                showFileMenu = false
-                                val atIdx = text.lastIndexOf('@')
-                                if (atIdx >= 0) {
-                                    text = text.substring(0, atIdx) + "@$path "
+                                parseSlashCommandInvocation(text)?.let { invocation ->
+                                    if (dispatchSlashCommand(invocation.command.name, invocation.args)) {
+                                        text = ""
+                                        attachedImage = null
+                                        return@IconButton
+                                    }
+                                }
+                                val launchState = appModel.launchState.snapshot.value
+                                val pendingModel = launchState.selectedModel.trim().ifEmpty { null }
+                                val effort = launchState.reasoningEffort.trim().ifEmpty { null }?.let(::reasoningEffortFromServerValue)
+                                val tier = if (HeaderOverrides.pendingFastMode) ServiceTier.FAST else null
+                                val attachmentToSend = attachedImage
+                                val payload = AppComposerPayload(
+                                    text = text.trim(),
+                                    additionalInputs = listOfNotNull(attachmentToSend?.toUserInput()),
+                                    approvalPolicy = appModel.launchState.approvalPolicyValue(),
+                                    sandboxPolicy = appModel.launchState.turnSandboxPolicy(),
+                                    model = pendingModel,
+                                    reasoningEffort = effort,
+                                    serviceTier = tier,
+                                )
+                                text = ""
+                                attachedImage = null
+                                scope.launch {
+                                    try {
+                                        appModel.startTurn(threadKey, payload)
+                                    } catch (e: Exception) {
+                                        text = payload.text
+                                        attachedImage = attachmentToSend
+                                    }
                                 }
                             },
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(LitterTheme.accent, CircleShape),
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send",
+                                tint = Color.Black,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+
+                    isRecording -> {
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    val auth = runCatching {
+                                        appModel.rpc.getAuthStatus(
+                                            threadKey.serverId,
+                                            GetAuthStatusParams(
+                                                includeToken = true,
+                                                refreshToken = false,
+                                            ),
+                                        )
+                                    }.getOrNull()
+                                    val transcript = transcriptionManager.stopAndTranscribe(
+                                        authMethod = auth?.authMethod,
+                                        authToken = auth?.authToken,
+                                    )
+                                    transcript?.let { text = if (text.isBlank()) it else "$text $it" }
+                                }
+                            },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Stop,
+                                contentDescription = "Stop recording",
+                                tint = LitterTheme.accentStrong,
+                            )
+                        }
+                    }
+
+                    isTranscribing -> {
+                        Spacer(Modifier.width(8.dp))
+                        LinearProgressIndicator(
+                            modifier = Modifier.width(24.dp),
+                            color = LitterTheme.accent,
+                            trackColor = Color.Transparent,
                         )
+                    }
+
+                    else -> {
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(
+                            onClick = { transcriptionManager.startRecording(context) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Mic,
+                                contentDescription = "Voice",
+                                tint = LitterTheme.textSecondary,
+                            )
+                        }
                     }
                 }
             }
 
             Spacer(Modifier.width(4.dp))
 
-            // Send / stop button
-            val canSend = (text.isNotBlank() || attachedImage != null) && !isThinking
-            IconButton(
-                onClick = {
-                    if (isThinking) {
-                        val turnId = activeTurnId ?: return@IconButton
-                        scope.launch {
-                            try {
-                                appModel.rpc.turnInterrupt(
-                                    threadKey.serverId,
-                                    TurnInterruptParams(threadId = threadKey.threadId, turnId = turnId),
-                                )
-                            } catch (_: Exception) {}
+            if (isThinking) {
+                Text(
+                    text = "Cancel",
+                    color = LitterTheme.textPrimary,
+                    fontSize = LitterTextStyle.caption.scaled,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(LitterTheme.surface)
+                        .clickable {
+                            val turnId = activeTurnId ?: return@clickable
+                            scope.launch {
+                                try {
+                                    appModel.rpc.turnInterrupt(
+                                        threadKey.serverId,
+                                        TurnInterruptParams(threadId = threadKey.threadId, turnId = turnId),
+                                    )
+                                } catch (_: Exception) {}
+                            }
                         }
-                        return@IconButton
-                    }
-                    if (!canSend) return@IconButton
-                    parseSlashCommandInvocation(text)?.let { invocation ->
-                        if (dispatchSlashCommand(invocation.command.name, invocation.args)) {
-                            text = ""
-                            attachedImage = null
-                            return@IconButton
-                        }
-                    }
-                    // Apply pending overrides from HeaderBar
-                    val launchState = appModel.launchState.snapshot.value
-                    val pendingModel = launchState.selectedModel.trim().ifEmpty { null }
-                    val effort = launchState.reasoningEffort.trim().ifEmpty { null }?.let(::reasoningEffortFromServerValue)
-                    val tier = if (HeaderOverrides.pendingFastMode) ServiceTier.FAST else null
-                    val attachmentToSend = attachedImage
-                    val payload = AppComposerPayload(
-                        text = text.trim(),
-                        additionalInputs = listOfNotNull(attachmentToSend?.toUserInput()),
-                        approvalPolicy = appModel.launchState.approvalPolicyValue(),
-                        sandboxPolicy = appModel.launchState.turnSandboxPolicy(),
-                        model = pendingModel,
-                        reasoningEffort = effort,
-                        serviceTier = tier,
-                    )
-                    text = ""
-                    attachedImage = null
-                    scope.launch {
-                        try {
-                            appModel.startTurn(threadKey, payload)
-                        } catch (e: Exception) {
-                            // Restore text on failure
-                            text = payload.text
-                            attachedImage = attachmentToSend
-                        }
-                    }
-                },
-                enabled = isThinking || canSend,
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(
-                        when {
-                            isThinking -> LitterTheme.danger
-                            canSend -> LitterTheme.accent
-                            else -> Color.Transparent
-                        },
-                        CircleShape,
-                    ),
-            ) {
-                Icon(
-                    imageVector = if (isThinking) Icons.Default.Stop else Icons.AutoMirrored.Filled.Send,
-                    contentDescription = if (isThinking) "Interrupt" else "Send",
-                    tint = when {
-                        isThinking -> Color.White
-                        canSend -> Color.Black
-                        else -> LitterTheme.textMuted
-                    },
-                    modifier = Modifier.size(18.dp),
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
                 )
             }
         }
 
-        val hasIndicators = contextPercent > 0 || rateLimits?.primary != null || rateLimits?.secondary != null
+        val hasIndicators = contextPercent != null || rateLimits?.primary != null || rateLimits?.secondary != null
         if (hasIndicators) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, bottom = 6.dp),
-                horizontalArrangement = Arrangement.End,
+                    .padding(start = 12.dp, end = 52.dp, bottom = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 rateLimits?.primary?.let { window ->
                     RateLimitBadge(window)
-                    Spacer(Modifier.width(6.dp))
                 }
                 rateLimits?.secondary?.let { window ->
                     RateLimitBadge(window)
-                    Spacer(Modifier.width(6.dp))
                 }
-                if (contextPercent > 0) {
-                    ContextBadge(contextPercent)
+                contextPercent?.let {
+                    ContextBadge(it)
                 }
             }
         }
@@ -696,7 +786,7 @@ internal fun parseSlashCommandInvocation(text: String): SlashInvocation? {
 
 @Composable
 private fun RateLimitBadge(window: uniffi.codex_mobile_client.RateLimitWindow) {
-    val remaining = 100 - window.usedPercent
+    val remaining = (100 - window.usedPercent.toInt()).coerceIn(0, 100)
     val label = window.windowDurationMins?.let { mins ->
         when {
             mins >= 1440 -> "${mins / 1440}d"
@@ -704,37 +794,39 @@ private fun RateLimitBadge(window: uniffi.codex_mobile_client.RateLimitWindow) {
             else -> "${mins}m"
         }
     } ?: "?"
-    val color = when {
+    val tint = when {
         remaining <= 10 -> LitterTheme.danger
         remaining <= 30 -> LitterTheme.warning
         else -> LitterTheme.textMuted
     }
 
     Row(
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .background(color.copy(alpha = 0.12f), RoundedCornerShape(4.dp))
-            .padding(horizontal = 5.dp, vertical = 2.dp),
     ) {
         Text(
-            text = "$label: $remaining%",
-            color = color,
-            fontSize = 9.sp,
+            text = label,
+            color = LitterTheme.textSecondary,
+            fontSize = 10.sp,
             fontWeight = FontWeight.SemiBold,
             fontFamily = LitterTheme.monoFont,
         )
+        ContextBadge(percent = remaining, tint = tint)
     }
 }
 
 // ── Context Badge (matching iOS ContextBadgeView) ────────────────────────────
 
 @Composable
-private fun ContextBadge(percent: Int) {
-    val tint = when {
+private fun ContextBadge(
+    percent: Int,
+    tint: Color = when {
         percent <= 15 -> LitterTheme.danger
         percent <= 35 -> LitterTheme.warning
         else -> LitterTheme.success
-    }
+    },
+) {
+    val normalizedPercent = percent.coerceIn(0, 100)
 
     Box(
         modifier = Modifier
@@ -747,12 +839,12 @@ private fun ContextBadge(percent: Int) {
         Box(
             modifier = Modifier
                 .fillMaxHeight()
-                .fillMaxWidth(fraction = percent / 100f)
+                .fillMaxWidth(fraction = normalizedPercent / 100f)
                 .background(tint.copy(alpha = 0.25f), RoundedCornerShape(4.dp)),
         )
         // Number overlay
         Text(
-            text = "$percent",
+            text = "$normalizedPercent",
             color = tint,
             fontSize = 9.sp,
             fontWeight = FontWeight.ExtraBold,

@@ -28,8 +28,6 @@ ANDROID_RUST_PROFILE ?= android-dev
 ANDROID_RELEASE_ABIS ?= arm64-v8a,x86_64
 HOST_ARCH := $(shell uname -m)
 ANDROID_EMULATOR_ABIS ?= $(if $(filter arm64 aarch64,$(HOST_ARCH)),arm64-v8a,x86_64)
-LOG_COLLECTOR_BIND ?= 0.0.0.0:8585
-LOG_COLLECTOR_DATA_DIR ?= /tmp/mobile-log-collector-e2e
 
 # Auto-detect Android SDK/NDK/JDK paths (macOS defaults, overridable via env)
 ANDROID_SDK_ROOT ?= $(or $(ANDROID_HOME),$(wildcard $(HOME)/Library/Android/sdk))
@@ -52,11 +50,6 @@ endif
 
 PACKAGE_CARGO_ENV := CARGO_INCREMENTAL=0
 
-# Forward log collector env vars to xcodebuild as build settings
-XCODE_EXTRA_SETTINGS :=
-ifdef LOG_COLLECTOR_URL
-  XCODE_EXTRA_SETTINGS += LOG_COLLECTOR_URL='$(LOG_COLLECTOR_URL)'
-endif
 DEV_CARGO_ENV := env -u CARGO_INCREMENTAL
 
 PATCH_FILES := \
@@ -96,7 +89,6 @@ $(shell mkdir -p $(STAMPS))
 	android android-fast android-emulator-fast android-emulator-run android-device-run android-release android-debug android-install android-emulator-install \
 	rust-ios rust-ios-package rust-ios-device-fast rust-ios-sim-fast rust-android rust-check rust-test rust-host-dev \
 	bindings bindings-swift bindings-kotlin \
-	log-collector \
 	sync patch unpatch xcgen ios-frameworks \
 	ios-build ios-build-sim ios-build-sim-fast ios-build-device ios-build-device-fast \
 	test test-rust test-ios test-android \
@@ -153,7 +145,7 @@ android-emulator-run: android-emulator-fast
 	adb -s "$$EMU" shell am start -n $(ANDROID_PACKAGE)/$(ANDROID_ACTIVITY)
 android-device-run: android-fast
 	@echo "==> Installing and launching on connected device..."
-	@DEVICE=$${ANDROID_DEVICE_SERIAL:-$$(adb devices | awk 'NR>1 && $$2=="device" && $$1 !~ /^emulator-/ {print $$1; exit}')} && \
+	@DEVICE=$${ANDROID_DEVICE_SERIAL:-$$(adb devices | awk -F'\t' 'NR>1 && $$2=="device" && $$1 !~ /^emulator-/ {print $$1; exit}')} && \
 	if [ -z "$$DEVICE" ]; then echo "ERROR: no connected Android device found (set ANDROID_DEVICE_SERIAL=<serial> to override)"; exit 1; fi && \
 	echo "==> Using device $$DEVICE..." && \
 	INSTALL_OUTPUT=$$(adb -s "$$DEVICE" install -r $(ANDROID_APK) 2>&1) && \
@@ -205,11 +197,6 @@ rust-test:
 
 rust-host-dev: rust-check rust-test
 
-log-collector:
-	@echo "==> Starting local mobile log collector on $(LOG_COLLECTOR_BIND)..."
-	@echo "==> Web tail UI will be available at /tail on that server."
-	@cd $(ROOT) && cargo run --manifest-path $(RUST_DIR)/Cargo.toml -p mobile-log-collector -- serve --bind $(LOG_COLLECTOR_BIND) --data-dir $(LOG_COLLECTOR_DATA_DIR)
-
 rust-android: $(STAMP_RUST_ANDROID)
 $(STAMP_RUST_ANDROID): $(STAMP_SYNC) $(STAMP_BINDINGS_K) $(ANDROID_RUST_SOURCES) tools/scripts/build-android-rust.sh Makefile
 	@echo "==> Building Rust for Android..."
@@ -231,7 +218,6 @@ help:
 		'make android-emulator-run  fast emulator build + install + launch on emulator' \
 		'make android-device-run    fast Android dev build + install + launch on connected device (override ANDROID_DEVICE_SERIAL; set ANDROID_REINSTALL_ON_SIGNATURE_MISMATCH=0 to keep installed app)' \
 		'make android-release    Android build using release Rust profile and multi-ABI output' \
-		'make log-collector     start local log collector + web tail UI (override LOG_COLLECTOR_BIND / LOG_COLLECTOR_DATA_DIR)' \
 		'make rust-check         host cargo check for shared crates' \
 		'make rust-test          host cargo test for shared crates'
 
@@ -304,7 +290,7 @@ ios-build-sim: verify-ios-project
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
-		$(XCODE_EXTRA_SETTINGS) build
+		build
 
 ios-build-sim-fast: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), fast simulator)..."
@@ -312,7 +298,7 @@ ios-build-sim-fast: verify-ios-project
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'platform=iOS Simulator,name=$(IOS_SIM_DEVICE)' \
-		$(XCODE_EXTRA_SETTINGS) build
+		build
 
 ios-build-device: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), device)..."
@@ -320,7 +306,7 @@ ios-build-device: verify-ios-project
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'generic/platform=iOS' \
-		$(XCODE_EXTRA_SETTINGS) build
+		build
 
 ios-build-device-fast: verify-ios-project
 	@echo "==> Building iOS ($(XCODE_CONFIG), fast device)..."
@@ -328,7 +314,7 @@ ios-build-device-fast: verify-ios-project
 		-scheme $(IOS_SCHEME) \
 		-configuration $(XCODE_CONFIG) \
 		-destination 'generic/platform=iOS' \
-		$(XCODE_EXTRA_SETTINGS) build
+		build
 
 ios-build: ios-build-sim
 
@@ -338,7 +324,7 @@ android-debug:
 
 android-install: android-debug
 	@echo "==> Installing APK to device..."
-	@DEVICE=$${ANDROID_DEVICE_SERIAL:-$$(adb devices | awk 'NR>1 && $$2=="device" && $$1 !~ /^emulator-/ {print $$1; exit}')} && \
+	@DEVICE=$${ANDROID_DEVICE_SERIAL:-$$(adb devices | awk -F'\t' 'NR>1 && $$2=="device" && $$1 !~ /^emulator-/ {print $$1; exit}')} && \
 	if [ -z "$$DEVICE" ]; then echo "ERROR: no connected Android device found (set ANDROID_DEVICE_SERIAL=<serial> to override)"; exit 1; fi && \
 	echo "==> Using device $$DEVICE..." && \
 	INSTALL_OUTPUT=$$(adb -s "$$DEVICE" install -r $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk 2>&1) && \

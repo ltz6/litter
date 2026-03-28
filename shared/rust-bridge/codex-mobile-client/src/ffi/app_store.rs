@@ -6,6 +6,7 @@ use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};
 use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppUpdate};
 use crate::types::generated;
 use crate::types::models::ThreadKey;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(uniffi::Object)]
@@ -16,14 +17,25 @@ pub struct AppStore {
 
 #[derive(uniffi::Object)]
 pub struct AppStoreSubscription {
-    pub(crate) rx: std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<AppUpdate>>>,
+    pub(crate) state: std::sync::Mutex<Option<AppStoreSubscriptionState>>,
 }
+
+pub(crate) struct AppStoreSubscriptionState {
+    pub(crate) rx: tokio::sync::broadcast::Receiver<AppUpdate>,
+    pub(crate) buffered: VecDeque<AppUpdate>,
+}
+
+const MAX_COALESCED_STREAMING_TEXT_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
 mod tests {
+    use super::{AppStoreSubscription, AppStoreSubscriptionState};
+    use crate::store::{AppStoreReducer, AppStoreUpdateRecord, ThreadStreamingDeltaKind};
+    use crate::types::ThreadKey;
     use crate::types::generated;
     use codex_app_server_protocol as upstream;
     use serde_json::json;
+    use std::collections::VecDeque;
 
     fn convert_generated_thread_item(
         item: generated::ThreadItem,
@@ -87,6 +99,101 @@ mod tests {
         assert_eq!(state.status, upstream::CollabAgentStatus::Running);
         assert_eq!(state.message.as_deref(), Some("Working"));
     }
+
+    #[test]
+    fn app_store_subscription_returns_full_resync_when_updates_lag() {
+        let reducer = AppStoreReducer::new();
+        let subscription = AppStoreSubscription {
+            state: std::sync::Mutex::new(Some(AppStoreSubscriptionState {
+                rx: reducer.subscribe(),
+                buffered: VecDeque::new(),
+            })),
+        };
+
+        for _ in 0..300 {
+            reducer.set_active_thread(Some(ThreadKey {
+                server_id: "srv".to_string(),
+                thread_id: "thread-1".to_string(),
+            }));
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let update = runtime
+            .block_on(subscription.next_update())
+            .expect("next update should succeed");
+        assert!(matches!(update, AppStoreUpdateRecord::FullResync));
+    }
+
+    #[test]
+    fn app_store_subscription_coalesces_contiguous_streaming_deltas() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread-1".to_string(),
+        };
+        let subscription = AppStoreSubscription {
+            state: std::sync::Mutex::new(Some(AppStoreSubscriptionState {
+                rx: reducer.subscribe(),
+                buffered: VecDeque::new(),
+            })),
+        };
+
+        reducer.emit_thread_streaming_delta(
+            &key,
+            "assistant-1",
+            ThreadStreamingDeltaKind::AssistantText,
+            "hel",
+        );
+        reducer.emit_thread_streaming_delta(
+            &key,
+            "assistant-1",
+            ThreadStreamingDeltaKind::AssistantText,
+            "lo",
+        );
+        reducer.emit_thread_streaming_delta(
+            &key,
+            "assistant-1",
+            ThreadStreamingDeltaKind::AssistantText,
+            " world",
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let update = runtime
+            .block_on(subscription.next_update())
+            .expect("next update should succeed");
+
+        assert!(matches!(
+            update,
+            AppStoreUpdateRecord::ThreadStreamingDelta {
+                key: emitted_key,
+                item_id,
+                kind: crate::store::AppThreadStreamingDeltaKind::AssistantText,
+                text,
+            } if emitted_key == key && item_id == "assistant-1" && text == "hello world"
+        ));
+    }
+
+    #[test]
+    fn app_store_subscription_coalesces_refresh_only_updates_into_full_resync() {
+        let reducer = AppStoreReducer::new();
+        let subscription = AppStoreSubscription {
+            state: std::sync::Mutex::new(Some(AppStoreSubscriptionState {
+                rx: reducer.subscribe(),
+                buffered: VecDeque::new(),
+            })),
+        };
+
+        reducer.update_server_health("srv", crate::store::ServerHealthSnapshot::Connected);
+        reducer.replace_pending_approvals(Vec::new());
+        reducer.set_voice_handoff_thread(None);
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let update = runtime
+            .block_on(subscription.next_update())
+            .expect("next update should succeed");
+
+        assert!(matches!(update, AppStoreUpdateRecord::FullResync));
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -141,7 +248,10 @@ impl AppStore {
 
     pub fn subscribe_updates(&self) -> AppStoreSubscription {
         AppStoreSubscription {
-            rx: std::sync::Mutex::new(Some(self.inner.subscribe_app_updates())),
+            state: std::sync::Mutex::new(Some(AppStoreSubscriptionState {
+                rx: self.inner.subscribe_app_updates(),
+                buffered: VecDeque::new(),
+            })),
         }
     }
 
@@ -215,8 +325,8 @@ impl AppStore {
 #[uniffi::export(async_runtime = "tokio")]
 impl AppStoreSubscription {
     pub async fn next_update(&self) -> Result<AppStoreUpdateRecord, ClientError> {
-        let mut rx = {
-            self.rx
+        let mut state = {
+            self.state
                 .lock()
                 .unwrap()
                 .take()
@@ -225,15 +335,186 @@ impl AppStoreSubscription {
                 ))?
         };
         let result = loop {
-            match rx.recv().await {
+            match receive_next_update(&mut state).await {
                 Ok(update) => break Ok(update.into()),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    break Ok(AppStoreUpdateRecord::FullResync);
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break Err(ClientError::EventClosed("closed".to_string()));
                 }
             }
         };
-        *self.rx.lock().unwrap() = Some(rx);
+        *self.state.lock().unwrap() = Some(state);
         result
     }
+}
+
+async fn receive_next_update(
+    state: &mut AppStoreSubscriptionState,
+) -> Result<AppUpdate, tokio::sync::broadcast::error::RecvError> {
+    let first = if let Some(update) = state.buffered.pop_front() {
+        update
+    } else {
+        state.rx.recv().await?
+    };
+
+    coalesce_ready_updates(state, first)
+}
+
+fn coalesce_ready_updates(
+    state: &mut AppStoreSubscriptionState,
+    mut update: AppUpdate,
+) -> Result<AppUpdate, tokio::sync::broadcast::error::RecvError> {
+    loop {
+        let next = if let Some(update) = state.buffered.pop_front() {
+            Some(update)
+        } else {
+            match state.rx.try_recv() {
+                Ok(update) => Some(update),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    return Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => None,
+            }
+        };
+
+        let Some(next) = next else {
+            return Ok(update);
+        };
+
+        if let Err(next) = merge_app_update(&mut update, next) {
+            state.buffered.push_front(next);
+            return Ok(update);
+        }
+    }
+}
+
+fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppUpdate> {
+    if matches!(current, AppUpdate::FullResync) {
+        return Ok(());
+    }
+    if matches!(next, AppUpdate::FullResync) {
+        *current = AppUpdate::FullResync;
+        return Ok(());
+    }
+    if triggers_snapshot_refresh(current) && triggers_snapshot_refresh(&next) {
+        *current = AppUpdate::FullResync;
+        return Ok(());
+    }
+
+    match (current, next) {
+        (
+            AppUpdate::ThreadStreamingDelta {
+                key,
+                item_id,
+                kind,
+                text,
+            },
+            AppUpdate::ThreadStreamingDelta {
+                key: next_key,
+                item_id: next_item_id,
+                kind: next_kind,
+                text: next_text,
+            },
+        ) if *key == next_key
+            && *item_id == next_item_id
+            && *kind == next_kind
+            && text.len().saturating_add(next_text.len()) <= MAX_COALESCED_STREAMING_TEXT_BYTES =>
+        {
+            text.push_str(&next_text);
+            Ok(())
+        }
+        (
+            AppUpdate::ThreadStateUpdated {
+                state,
+                session_summary,
+                agent_directory_version,
+            },
+            AppUpdate::ThreadStateUpdated {
+                state: next_state,
+                session_summary: next_summary,
+                agent_directory_version: next_version,
+            },
+        ) if state.key == next_state.key => {
+            *state = next_state;
+            *session_summary = next_summary;
+            *agent_directory_version = next_version;
+            Ok(())
+        }
+        (
+            AppUpdate::ThreadItemUpserted { key, item },
+            AppUpdate::ThreadItemUpserted {
+                key: next_key,
+                item: next_item,
+            },
+        ) if *key == next_key && item.id == next_item.id => {
+            *item = next_item;
+            Ok(())
+        }
+        (
+            AppUpdate::ThreadCommandExecutionUpdated {
+                key,
+                item_id,
+                status,
+                exit_code,
+                duration_ms,
+                process_id,
+            },
+            AppUpdate::ThreadCommandExecutionUpdated {
+                key: next_key,
+                item_id: next_item_id,
+                status: next_status,
+                exit_code: next_exit_code,
+                duration_ms: next_duration_ms,
+                process_id: next_process_id,
+            },
+        ) if *key == next_key && *item_id == next_item_id => {
+            *status = next_status;
+            *exit_code = next_exit_code;
+            *duration_ms = next_duration_ms;
+            *process_id = next_process_id;
+            Ok(())
+        }
+        (
+            AppUpdate::ThreadUpserted {
+                thread,
+                session_summary,
+                agent_directory_version,
+            },
+            AppUpdate::ThreadUpserted {
+                thread: next_thread,
+                session_summary: next_summary,
+                agent_directory_version: next_version,
+            },
+        ) if thread.key == next_thread.key => {
+            *thread = next_thread;
+            *session_summary = next_summary;
+            *agent_directory_version = next_version;
+            Ok(())
+        }
+        (
+            AppUpdate::ActiveThreadChanged { key },
+            AppUpdate::ActiveThreadChanged { key: next_key },
+        ) => {
+            *key = next_key;
+            Ok(())
+        }
+        (current, next) => Err(next),
+    }
+}
+
+fn triggers_snapshot_refresh(update: &AppUpdate) -> bool {
+    matches!(
+        update,
+        AppUpdate::ServerChanged { .. }
+            | AppUpdate::ServerRemoved { .. }
+            | AppUpdate::PendingApprovalsChanged { .. }
+            | AppUpdate::PendingUserInputsChanged { .. }
+            | AppUpdate::VoiceSessionChanged
+            | AppUpdate::RealtimeStarted { .. }
+            | AppUpdate::RealtimeError { .. }
+            | AppUpdate::RealtimeClosed { .. }
+    )
 }

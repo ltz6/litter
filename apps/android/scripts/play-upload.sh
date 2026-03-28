@@ -9,6 +9,12 @@ GRADLEW="$ANDROID_DIR/gradlew"
 VARIANT="${VARIANT:-Release}"
 UPLOAD="${UPLOAD:-1}"
 TRACK="${LITTER_PLAY_TRACK:-internal}"
+GRADLE_MAX_WORKERS="${GRADLE_MAX_WORKERS:-}"
+
+declare -a GRADLE_ARGS=(--no-daemon)
+if [[ -n "$GRADLE_MAX_WORKERS" ]]; then
+    GRADLE_ARGS+=("--max-workers=$GRADLE_MAX_WORKERS")
+fi
 
 # Source credentials from env file if present and vars are not already set
 ENV_FILE="${HOME}/.config/litter/play-upload.env"
@@ -44,7 +50,7 @@ if [[ "$UPLOAD" == "1" ]]; then
 
     TASK=":app:publish${VARIANT}Bundle"
     echo "==> Publishing $VARIANT bundle to Google Play track '$TRACK'"
-    "$GRADLEW" -p "$ANDROID_DIR" "$TASK" \
+    "$GRADLEW" -p "$ANDROID_DIR" "${GRADLE_ARGS[@]}" "$TASK" \
         -PLITTER_PLAY_SERVICE_ACCOUNT_JSON="$LITTER_PLAY_SERVICE_ACCOUNT_JSON" \
         -PLITTER_PLAY_TRACK="$TRACK" \
         -PLITTER_UPLOAD_STORE_FILE="$LITTER_UPLOAD_STORE_FILE" \
@@ -54,7 +60,7 @@ if [[ "$UPLOAD" == "1" ]]; then
 else
     TASK=":app:bundle${VARIANT}"
     echo "==> Building local AAB for $VARIANT (no upload)"
-    "$GRADLEW" -p "$ANDROID_DIR" "$TASK"
+    "$GRADLEW" -p "$ANDROID_DIR" "${GRADLE_ARGS[@]}" "$TASK"
 fi
 
 echo "==> Done"

@@ -133,7 +133,6 @@ class MainActivity : ComponentActivity() {
                     archived = false, cwd = null, searchTerm = null,
                 ),
             )
-            appModel.refreshSnapshot()
             LLog.i("MainActivity", "Local in-process server connected")
         } catch (e: Exception) {
             LLog.w("MainActivity", "Local server failed", fields = mapOf("error" to e.message))

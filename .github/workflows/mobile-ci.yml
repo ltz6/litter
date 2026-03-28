@@ -249,6 +249,8 @@ jobs:
           fi
 
           tar -xzf "$SHARED_PREP_ROOT/generated-mobile-sources.tgz" -C .
+          mkdir -p .build-stamps
+          touch .build-stamps/sync .build-stamps/bindings-swift
 
       - name: Build Rust for iOS simulator
         env:

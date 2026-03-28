@@ -323,6 +323,7 @@ enum LitterPreviewData {
             model: model,
             reasoningEffort: reasoningEffort,
             hydratedConversationItems: makeHydratedConversationItems(from: messages),
+            queuedFollowUps: [],
             activeTurnId: status == .active ? "turn-preview" : nil,
             contextTokensUsed: 156_000,
             modelContextWindow: 200_000,
