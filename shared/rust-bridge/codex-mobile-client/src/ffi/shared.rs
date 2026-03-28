@@ -7,6 +7,7 @@ static SHARED_MOBILE_CLIENT: OnceLock<Arc<MobileClient>> = OnceLock::new();
 pub(crate) fn shared_runtime() -> Arc<tokio::runtime::Runtime> {
     SHARED_RUNTIME
         .get_or_init(|| {
+            crate::logging::install_tracing_subscriber();
             Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()

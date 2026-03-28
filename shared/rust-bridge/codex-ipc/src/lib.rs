@@ -23,6 +23,7 @@ pub mod error;
 pub mod handler;
 pub mod protocol;
 pub mod transport;
+pub mod wire_trace;
 
 pub use client::handle::{IpcClient, IpcClientConfig};
 pub use client::reconnect::{ReconnectPolicy, ReconnectingIpcClient};
@@ -32,3 +33,4 @@ pub use handler::RequestHandler;
 pub use protocol::envelope::*;
 pub use protocol::method::Method;
 pub use protocol::params::*;
+pub use wire_trace::*;

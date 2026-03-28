@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
+import com.litter.android.ui.rememberStickyFollowTail
 import uniffi.codex_mobile_client.HydratedConversationItemContent
 import uniffi.codex_mobile_client.ThreadKey
 
@@ -45,11 +46,23 @@ fun InlineHandoffView(
     }
 
     val listState = rememberLazyListState()
+    val shouldFollowTail = rememberStickyFollowTail(
+        listState = listState,
+        resetKey = threadKey,
+        bufferItems = 1,
+    )
+    val tailContentSignature = remember(items) {
+        var hash = 17
+        items.takeLast(4).forEach { item ->
+            hash = 31 * hash + item.hashCode()
+        }
+        hash = 31 * hash + items.size
+        hash
+    }
 
-    // Auto-scroll to bottom
-    LaunchedEffect(items.size) {
-        if (items.isNotEmpty()) {
-            listState.animateScrollToItem(items.size - 1)
+    LaunchedEffect(threadKey, tailContentSignature) {
+        if (shouldFollowTail && items.isNotEmpty()) {
+            listState.scrollToItem(items.lastIndex)
         }
     }
 

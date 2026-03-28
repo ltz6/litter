@@ -86,6 +86,7 @@ jobs:
       SCCACHE_REGION: auto
       SCCACHE_S3_USE_SSL: "true"
       SCCACHE_S3_KEY_PREFIX: ci/mobile-release-prep
+      SCCACHE_LOG: info
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
@@ -198,6 +199,7 @@ jobs:
       SCCACHE_S3_USE_SSL: "true"
       SCCACHE_S3_KEY_PREFIX: ci/android
       SCCACHE_LOG: info
+      SCCACHE_ERROR_LOG: ${{ runner.temp }}/sccache-android.log
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
@@ -258,7 +260,6 @@ jobs:
 
       - name: Prime sccache
         run: |
-          export SCCACHE_ERROR_LOG="$RUNNER_TEMP/sccache-android.log"
           rm -f "$SCCACHE_ERROR_LOG"
           sccache --stop-server || true
           sccache --start-server
@@ -318,6 +319,8 @@ jobs:
           JAVA_HOME: ${{ env.JAVA_HOME }}
           ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/30.0.14904198
+          CARGO_BUILD_JOBS: "2"
+          GRADLE_MAX_WORKERS: "2"
           RUSTC_WRAPPER: sccache
           LITTER_UPLOAD_STORE_FILE: ${{ env.LITTER_UPLOAD_STORE_FILE }}
           LITTER_UPLOAD_STORE_PASSWORD: ${{ secrets.LITTER_UPLOAD_STORE_PASSWORD }}
@@ -328,7 +331,6 @@ jobs:
           LITTER_VERSION_CODE_OVERRIDE: ${{ env.LITTER_VERSION_CODE_OVERRIDE }}
         run: |
           set -euo pipefail
-          export SCCACHE_ERROR_LOG="$RUNNER_TEMP/sccache-android.log"
           trap 'status=$?; echo "==> sccache stats"; sccache --show-stats || true; if [ -f "$SCCACHE_ERROR_LOG" ]; then echo "==> sccache error log"; tail -200 "$SCCACHE_ERROR_LOG" || true; fi; exit $status' EXIT
           make play-release
 
@@ -365,6 +367,7 @@ jobs:
       SCCACHE_S3_USE_SSL: "true"
       SCCACHE_S3_KEY_PREFIX: ci/ios
       SCCACHE_LOG: info
+      SCCACHE_ERROR_LOG: ${{ runner.temp }}/sccache-ios.log
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
 
@@ -421,7 +424,6 @@ jobs:
 
       - name: Prime sccache
         run: |
-          export SCCACHE_ERROR_LOG="$RUNNER_TEMP/sccache-ios.log"
           rm -f "$SCCACHE_ERROR_LOG"
           sccache --stop-server || true
           sccache --start-server
@@ -441,6 +443,8 @@ jobs:
           fi
 
           tar -xzf "$SHARED_PREP_ROOT/generated-mobile-sources.tgz" -C .
+          mkdir -p .build-stamps
+          touch .build-stamps/sync .build-stamps/bindings-swift
 
       - name: Decode App Store Connect API key
         env:
@@ -502,6 +506,7 @@ jobs:
 
       - name: Upload to TestFlight
         env:
+          CARGO_BUILD_JOBS: "2"
           RUSTC_WRAPPER: sccache
           SCHEME: ${{ env.SCHEME }}
           APP_BUNDLE_ID: ${{ env.APP_BUNDLE_ID }}
@@ -516,6 +521,5 @@ jobs:
           WAIT_FOR_PROCESSING: ${{ env.WAIT_FOR_PROCESSING }}
         run: |
           set -euo pipefail
-          export SCCACHE_ERROR_LOG="$RUNNER_TEMP/sccache-ios.log"
           trap 'status=$?; echo "==> sccache stats"; sccache --show-stats || true; if [ -f "$SCCACHE_ERROR_LOG" ]; then echo "==> sccache error log"; tail -200 "$SCCACHE_ERROR_LOG" || true; fi; exit $status' EXIT
           make testflight

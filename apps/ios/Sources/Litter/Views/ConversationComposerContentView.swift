@@ -4,6 +4,7 @@ import UIKit
 struct ConversationComposerContentView: View {
     let attachedImage: UIImage?
     let pendingUserInputRequest: PendingUserInputRequest?
+    let queuedFollowUps: [AppQueuedFollowUpPreview]
     let rateLimits: RateLimitSnapshot?
     let contextPercent: Int64?
     let isTurnActive: Bool
@@ -22,6 +23,7 @@ struct ConversationComposerContentView: View {
     init(
         attachedImage: UIImage?,
         pendingUserInputRequest: PendingUserInputRequest?,
+        queuedFollowUps: [AppQueuedFollowUpPreview],
         rateLimits: RateLimitSnapshot?,
         contextPercent: Int64?,
         isTurnActive: Bool,
@@ -39,6 +41,7 @@ struct ConversationComposerContentView: View {
     ) {
         self.attachedImage = attachedImage
         self.pendingUserInputRequest = pendingUserInputRequest
+        self.queuedFollowUps = queuedFollowUps
         self.rateLimits = rateLimits
         self.contextPercent = contextPercent
         self.isTurnActive = isTurnActive
@@ -84,6 +87,12 @@ struct ConversationComposerContentView: View {
             VStack(alignment: .trailing, spacing: 0) {
                 if let pendingUserInputRequest {
                     PendingUserInputPromptView(request: pendingUserInputRequest, onSubmit: onRespondToPendingUserInput)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+                }
+
+                if !queuedFollowUps.isEmpty {
+                    QueuedFollowUpsPreviewView(previews: queuedFollowUps)
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
                 }

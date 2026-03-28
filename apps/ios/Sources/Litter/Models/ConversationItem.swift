@@ -298,6 +298,11 @@ struct ConversationItem: Identifiable, Equatable {
         return nil
     }
 
+    var isExplorationCommandItem: Bool {
+        guard case .commandExecution(let data) = content else { return false }
+        return data.isPureExploration
+    }
+
     var widgetState: WidgetState? {
         if case .widget(let data) = content {
             return data.widgetState

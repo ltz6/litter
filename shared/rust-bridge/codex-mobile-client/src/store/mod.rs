@@ -9,12 +9,13 @@ mod voice;
 pub use boundary::{
     AppServerConnectionProgress, AppServerConnectionStep, AppServerConnectionStepKind,
     AppServerConnectionStepState, AppServerHealth, AppServerSnapshot, AppSessionSummary,
-    AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppVoiceSessionSnapshot,
+    AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppThreadStateRecord,
+    AppThreadStreamingDeltaKind, AppVoiceSessionSnapshot,
 };
 pub use reducer::AppStoreReducer;
 pub use snapshot::{
     AppSnapshot, ServerConnectionProgressSnapshot, ServerConnectionStepKind,
     ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot, ServerSnapshot,
-    ThreadSnapshot, VoiceSessionSnapshot,
+    QueuedFollowUpPreview, ThreadSnapshot, VoiceSessionSnapshot,
 };
-pub use updates::AppUpdate;
+pub use updates::{AppUpdate, ThreadStreamingDeltaKind};

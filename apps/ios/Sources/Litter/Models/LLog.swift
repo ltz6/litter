@@ -1,50 +1,20 @@
 import Foundation
 import OSLog
-import UIKit
 
 enum LLog {
     private static let subsystemRoot = Bundle.main.bundleIdentifier ?? "com.sigkitten.litter"
-    private static let queue = DispatchQueue(label: "com.sigkitten.litter.logging", qos: .utility)
     private nonisolated(unsafe) static var bootstrapped = false
-
-    private static var logs: Logs {
-        LogsHolder.shared
-    }
 
     static func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
 
         let codexHome = resolveCodexHome()
-        FileManager.default.createFile(atPath: codexHome.path, contents: nil)
         setenv("CODEX_HOME", codexHome.path, 1)
-
-        // Propagate collector config from Info.plist → env vars so Rust picks them up directly
-        if let v = Bundle.main.infoDictionary?["LogCollectorURL"] as? String, !v.isEmpty {
-            setenv("LOG_COLLECTOR_URL", v, 0) // don't overwrite if already set
-        }
-
-        // Seed device identity so Rust config can fill in defaults
-        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
-        let deviceName = UIDevice.current.name
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
-
-        logs.configure(
-            config: LogConfig(
-                enabled: false, // Rust will enable based on env vars
-                collectorUrl: nil,
-                minLevel: .debug,
-                deviceId: deviceId,
-                deviceName: deviceName,
-                appVersion: appVersion,
-                build: build
-            )
-        )
     }
 
     static func trace(_ subsystem: String, _ message: String, fields: [String: Any] = [:], payloadJson: String? = nil) {
-        emit(level: .trace, subsystem: subsystem, message: message, fields: fields, payloadJson: payloadJson)
+        emit(level: .debug, subsystem: subsystem, message: message, fields: fields, payloadJson: payloadJson)
     }
 
     static func debug(_ subsystem: String, _ message: String, fields: [String: Any] = [:], payloadJson: String? = nil) {
@@ -56,7 +26,7 @@ enum LLog {
     }
 
     static func warn(_ subsystem: String, _ message: String, fields: [String: Any] = [:], payloadJson: String? = nil) {
-        emit(level: .warn, subsystem: subsystem, message: message, fields: fields, payloadJson: payloadJson)
+        emit(level: .default, subsystem: subsystem, message: message, fields: fields, payloadJson: payloadJson)
     }
 
     static func error(_ subsystem: String, _ message: String, error: Error? = nil, fields: [String: Any] = [:], payloadJson: String? = nil) {
@@ -67,37 +37,31 @@ enum LLog {
         emit(level: .error, subsystem: subsystem, message: message, fields: allFields, payloadJson: payloadJson)
     }
 
-    private static func emit(level: LogLevel, subsystem: String, message: String, fields: [String: Any], payloadJson: String?) {
+    private static func emit(level: OSLogType, subsystem: String, message: String, fields: [String: Any], payloadJson: String?) {
         let logger = Logger(subsystem: subsystemRoot, category: subsystem)
-        switch level {
-        case .trace, .debug:
-            logger.debug("\(message, privacy: .public)")
-        case .info:
-            logger.info("\(message, privacy: .public)")
-        case .warn:
-            logger.warning("\(message, privacy: .public)")
-        case .error:
-            logger.error("\(message, privacy: .public)")
-        }
+        let rendered = render(message: message, fields: fields, payloadJson: payloadJson)
 
-        queue.async {
-            logs.log(
-                event: LogEvent(
-                    timestampMs: nil,
-                    level: level,
-                    source: .ios,
-                    subsystem: subsystem,
-                    category: subsystem,
-                    message: message,
-                    sessionId: nil,
-                    serverId: nil,
-                    threadId: nil,
-                    requestId: nil,
-                    payloadJson: payloadJson,
-                    fieldsJson: jsonString(from: fields)
-                )
-            )
+        switch level {
+        case .debug:
+            logger.debug("\(rendered, privacy: .public)")
+        case .info:
+            logger.info("\(rendered, privacy: .public)")
+        case .error, .fault:
+            logger.error("\(rendered, privacy: .public)")
+        default:
+            logger.log(level: level, "\(rendered, privacy: .public)")
         }
+    }
+
+    private static func render(message: String, fields: [String: Any], payloadJson: String?) -> String {
+        var parts = [message]
+        if let fieldsJson = jsonString(from: fields) {
+            parts.append("fields=\(fieldsJson)")
+        }
+        if let payloadJson, !payloadJson.isEmpty {
+            parts.append("payload=\(payloadJson)")
+        }
+        return parts.joined(separator: " ")
     }
 
     private static func resolveCodexHome() -> URL {
@@ -117,8 +81,4 @@ enum LLog {
         }
         return String(data: data, encoding: .utf8)
     }
-}
-
-private enum LogsHolder {
-    static let shared = Logs()
 }

@@ -7,7 +7,6 @@
 mod app_store;
 mod discovery;
 mod errors;
-mod logs;
 mod parser;
 #[path = "rpc.generated.rs"]
 mod rpc;
@@ -18,7 +17,6 @@ mod ssh;
 pub use app_store::{AppStore, AppStoreSubscription};
 pub use discovery::{DiscoveryBridge, DiscoveryScanSubscription, ServerBridge};
 pub use errors::ClientError;
-pub use logs::{LogConfig, LogEvent, LogLevel, LogSource, Logs};
 pub use parser::MessageParser;
 pub use rpc::AppServerRpc;
 pub use ssh::{FfiSshConnectionResult, FfiSshExecResult, SshBridge};

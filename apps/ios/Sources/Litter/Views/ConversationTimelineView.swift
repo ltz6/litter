@@ -26,9 +26,9 @@ struct ConversationTurnTimeline: View {
     }
 
     private var rowDescriptors: [ConversationTimelineRowDescriptor] {
-        let rows = ConversationTimelineRowDescriptor.build(from: items)
-        guard isLive else { return rows }
-        return ConversationTimelineRowDescriptor.mergeLiveExplorationRows(rows)
+        ConversationTimelineRowDescriptor.mergeConsecutiveExplorationRows(
+            ConversationTimelineRowDescriptor.build(from: items)
+        )
     }
 
     private var streamingAssistantItemId: String? {
@@ -90,12 +90,8 @@ private enum ConversationTimelineRowDescriptor: Identifiable, Equatable {
 
         func flushExplorationBuffer() {
             guard !explorationBuffer.isEmpty else { return }
-            if explorationBuffer.count == 1 {
-                rows.append(.item(explorationBuffer[0]))
-            } else {
-                let seed = explorationBuffer.first?.id ?? UUID().uuidString
-                rows.append(.exploration(id: "exploration-\(seed)", items: explorationBuffer))
-            }
+            let seed = explorationBuffer.first?.id ?? UUID().uuidString
+            rows.append(.exploration(id: "exploration-\(seed)", items: explorationBuffer))
             explorationBuffer.removeAll(keepingCapacity: true)
         }
 
@@ -170,7 +166,7 @@ private enum ConversationTimelineRowDescriptor: Identifiable, Equatable {
         return rows
     }
 
-    static func mergeLiveExplorationRows(
+    static func mergeConsecutiveExplorationRows(
         _ rows: [ConversationTimelineRowDescriptor]
     ) -> [ConversationTimelineRowDescriptor] {
         var mergedRows: [ConversationTimelineRowDescriptor] = []
@@ -528,6 +524,9 @@ private struct ConversationExplorationGroupRow: View {
     @State private var expanded = false
 
     var body: some View {
+        let entries = explorationEntries
+        let visibleEntries = expanded ? entries : Array(entries.prefix(3))
+
         VStack(alignment: .leading, spacing: 8) {
             Button(action: toggleExpanded) {
                 HStack(spacing: 8) {
@@ -537,7 +536,6 @@ private struct ConversationExplorationGroupRow: View {
                     Text(summaryText)
                         .litterFont(.caption)
                         .foregroundColor(LitterTheme.textSystem)
-                        .modifier(ConversationExplorationHeaderShimmer(active: isActive))
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .litterFont(size: 11, weight: .medium)
@@ -546,25 +544,21 @@ private struct ConversationExplorationGroupRow: View {
             }
             .buttonStyle(.plain)
 
-            let visibleItems = expanded ? items : Array(items.prefix(3))
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(visibleItems) { item in
-                    if case .commandExecution(let data) = item.content {
-                        HStack(alignment: .top, spacing: 8) {
-                            Circle()
-                                .fill(data.isInProgress ? LitterTheme.warning : LitterTheme.textMuted)
-                                .frame(width: explorationBulletSize, height: explorationBulletSize)
-                                .padding(.top, explorationBulletTopPadding)
-                            Text(explorationLabel(for: data))
-                                .litterFont(.caption)
-                                .foregroundColor(LitterTheme.textSecondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
+                ForEach(visibleEntries) { entry in
+                    HStack(alignment: .top, spacing: 8) {
+                        Circle()
+                            .fill(entry.isInProgress ? LitterTheme.warning : LitterTheme.textMuted)
+                            .frame(width: explorationBulletSize, height: explorationBulletSize)
+                            .padding(.top, explorationBulletTopPadding)
+                        Text(entry.label)
+                            .litterFont(.caption)
+                            .foregroundColor(LitterTheme.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                if !expanded && items.count > visibleItems.count {
-                    Text("+\(items.count - visibleItems.count) more")
+                if !expanded && entries.count > visibleEntries.count {
+                    Text("+\(entries.count - visibleEntries.count) more")
                         .litterFont(.caption2)
                         .foregroundColor(LitterTheme.textMuted)
                 }
@@ -575,12 +569,8 @@ private struct ConversationExplorationGroupRow: View {
     }
 
     private var summaryText: String {
-        let count = items.count
         let prefix = isActive ? "Exploring" : "Explored"
-        if items.contains(where: \.isExplorationCommandItem) {
-            return count == 1 ? "\(prefix) 1 location" : "\(prefix) \(count) locations"
-        }
-        return count == 1 ? "Exploration" : "\(count) exploration steps"
+        return explorationSummaryText(prefix: prefix)
     }
 
     private var explorationBulletSize: CGFloat {
@@ -592,79 +582,107 @@ private struct ConversationExplorationGroupRow: View {
     }
 
     private var isActive: Bool {
-        items.contains { item in
-            guard case .commandExecution(let data) = item.content else { return false }
-            return data.isInProgress
-        }
+        explorationEntries.contains(where: \.isInProgress)
     }
 
     private func toggleExpanded() {
-        withAnimation(.easeInOut(duration: 0.5)) {
+        withAnimation(.easeInOut(duration: 0.2)) {
             expanded.toggle()
         }
     }
 
-    private func explorationLabel(for data: ConversationCommandExecutionData) -> String {
-        if let action = data.actions.first {
-            switch action.kind {
-            case .read:
-                return action.path.map { "Read \(workspaceTitle(for: $0))" } ?? action.command
-            case .search:
-                if let query = action.query, let path = action.path {
-                    return "Searched for \(query) in \(workspaceTitle(for: path))"
-                }
-                if let query = action.query {
-                    return "Searched for \(query)"
-                }
-                return action.command
-            case .listFiles:
-                return action.path.map { "Listed files in \(workspaceTitle(for: $0))" } ?? action.command
-            case .unknown:
-                break
+    private var explorationEntries: [ExplorationDisplayEntry] {
+        items.flatMap { item -> [ExplorationDisplayEntry] in
+            guard case .commandExecution(let data) = item.content else { return [] }
+            if data.actions.isEmpty {
+                return [
+                    ExplorationDisplayEntry(
+                        id: "\(item.id)-command",
+                        label: data.command,
+                        isInProgress: data.isInProgress
+                    )
+                ]
+            }
+            return data.actions.enumerated().map { index, action in
+                ExplorationDisplayEntry(
+                    id: "\(item.id)-\(index)",
+                    label: explorationLabel(for: action, fallback: data.command),
+                    isInProgress: data.isInProgress
+                )
             }
         }
-        return data.command
+    }
+
+    private func explorationSummaryText(prefix: String) -> String {
+        var readCount = 0
+        var searchCount = 0
+        var listingCount = 0
+        var fallbackCount = 0
+
+        for item in items {
+            guard case .commandExecution(let data) = item.content else { continue }
+            if data.actions.isEmpty {
+                fallbackCount += 1
+                continue
+            }
+            for action in data.actions {
+                switch action.kind {
+                case .read:
+                    readCount += 1
+                case .search:
+                    searchCount += 1
+                case .listFiles:
+                    listingCount += 1
+                case .unknown:
+                    fallbackCount += 1
+                }
+            }
+        }
+
+        var parts: [String] = []
+        if readCount > 0 {
+            parts.append("\(readCount) \(readCount == 1 ? "file" : "files")")
+        }
+        if searchCount > 0 {
+            parts.append("\(searchCount) \(searchCount == 1 ? "search" : "searches")")
+        }
+        if listingCount > 0 {
+            parts.append("\(listingCount) \(listingCount == 1 ? "listing" : "listings")")
+        }
+        if fallbackCount > 0 {
+            parts.append("\(fallbackCount) \(fallbackCount == 1 ? "step" : "steps")")
+        }
+        if parts.isEmpty {
+            let count = explorationEntries.count
+            return count == 1 ? "\(prefix) 1 exploration step" : "\(prefix) \(count) exploration steps"
+        }
+        return "\(prefix) \(parts.joined(separator: ", "))"
+    }
+
+    private func explorationLabel(for action: ConversationCommandAction, fallback: String) -> String {
+        switch action.kind {
+        case .read:
+            return action.path.map { "Read \(workspaceTitle(for: $0))" } ?? fallback
+        case .search:
+            if let query = action.query, let path = action.path {
+                return "Searched for \(query) in \(workspaceTitle(for: path))"
+            }
+            if let query = action.query {
+                return "Searched for \(query)"
+            }
+            return fallback
+        case .listFiles:
+            return action.path.map { "Listed files in \(workspaceTitle(for: $0))" } ?? fallback
+        case .unknown:
+            return fallback
+        }
     }
 }
 
-private extension ConversationItem {
-    var isExplorationCommandItem: Bool {
-        guard case .commandExecution(let data) = content else { return false }
-        return data.isPureExploration
-    }
-}
-
-private struct ConversationExplorationHeaderShimmer: ViewModifier {
-    let active: Bool
-
-    func body(content: Content) -> some View {
-        if active {
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                let t = timeline.date.timeIntervalSinceReferenceDate
-                let phase = CGFloat(t.truncatingRemainder(dividingBy: 2.0) / 2.0)
-
-                content
-                    .overlay {
-                        GeometryReader { geo in
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .white.opacity(0), location: max(0, phase - 0.2)),
-                                    .init(color: .white.opacity(0.35), location: phase),
-                                    .init(color: .white.opacity(0), location: min(1, phase + 0.2))
-                                ],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                            .frame(width: geo.size.width, height: geo.size.height)
-                        }
-                        .blendMode(.sourceAtop)
-                    }
-                    .compositingGroup()
-            }
-        } else {
-            content
-        }
-    }
+private struct ExplorationDisplayEntry: Identifiable {
+    let id: String
+    let label: String
+    let isInProgress: Bool
 }
 
 private struct ConversationReasoningRow: View {
@@ -1233,7 +1251,16 @@ struct ConversationPinnedContextStrip: View {
 
     private var pinnedDiff: ConversationItem? {
         items.last(where: {
-            if case .turnDiff = $0.content { return true }
+            if case .fileChange(let data) = $0.content {
+                return data.changes.contains {
+                    !$0.diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+            }
+            return false
+        }) ?? items.last(where: {
+            if case .turnDiff(let data) = $0.content {
+                return !data.diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
             return false
         })
     }
@@ -1322,17 +1349,40 @@ struct ConversationPinnedContextStrip: View {
 
     @ViewBuilder
     private func diffIndicatorButton(for item: ConversationItem) -> some View {
-        if case .turnDiff(let data) = item.content {
+        if let presented = presentedPinnedDiff(for: item) {
             Button {
-                selectedDiff = PresentedDiff(
-                    id: item.id,
-                    title: "Turn Diff",
-                    diff: data.diff
-                )
+                selectedDiff = presented
             } label: {
-                DiffIndicatorLabel(diff: data.diff)
+                DiffIndicatorLabel(diff: presented.diff)
             }
             .buttonStyle(.plain)
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private func presentedPinnedDiff(for item: ConversationItem) -> PresentedDiff? {
+        switch item.content {
+        case .fileChange(let data):
+            let diffs = data.changes
+                .map(\.diff)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !diffs.isEmpty else { return nil }
+            return PresentedDiff(
+                id: item.id,
+                title: "File Diff",
+                diff: diffs.joined(separator: "\n\n")
+            )
+        case .turnDiff(let data):
+            let diff = data.diff.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !diff.isEmpty else { return nil }
+            return PresentedDiff(
+                id: item.id,
+                title: "Turn Diff",
+                diff: diff
+            )
+        default:
+            return nil
         }
     }
 }
@@ -1423,8 +1473,8 @@ private struct DiffIndicatorLabel: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(LitterTheme.surface.opacity(0.72))
-        .clipShape(Capsule())
+        .background(LitterTheme.surface.opacity(0.72), in: Capsule())
+        .fixedSize(horizontal: true, vertical: false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }

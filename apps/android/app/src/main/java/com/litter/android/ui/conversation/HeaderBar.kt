@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
@@ -92,6 +93,30 @@ fun HeaderBar(
         ?.displayName
         ?.ifBlank { pendingModelId }
         ?: pendingModelId.ifBlank { null }
+    val currentModelId = pendingModelId.ifBlank {
+        (thread?.model ?: thread?.info?.model ?: "").trim()
+    }
+    val selectedModelDefinition = remember(server?.availableModels, currentModelId) {
+        server?.availableModels?.firstOrNull { it.id == currentModelId }
+            ?: server?.availableModels?.firstOrNull { it.isDefault }
+            ?: server?.availableModels?.firstOrNull()
+    }
+    val reasoningLabel = remember(launchState.reasoningEffort, thread?.reasoningEffort, selectedModelDefinition) {
+        val pendingReasoning = launchState.reasoningEffort.trim()
+        if (pendingReasoning.isNotEmpty()) {
+            pendingReasoning
+        } else {
+            val threadReasoning = thread?.reasoningEffort?.trim().orEmpty()
+            if (threadReasoning.isNotEmpty()) {
+                threadReasoning
+            } else {
+                selectedModelDefinition?.defaultReasoningEffort?.let(::effortLabel) ?: "default"
+            }
+        }
+    }
+    val modelLabel = remember(pendingModelLabel, thread?.resolvedModel) {
+        (pendingModelLabel ?: thread?.resolvedModel).orEmpty().ifBlank { "litter" }
+    }
 
     Column(
         modifier = Modifier
@@ -147,7 +172,7 @@ fun HeaderBar(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = pendingModelLabel ?: thread?.resolvedModel.orEmpty(),
+                        text = modelLabel,
                         color = LitterTheme.textPrimary,
                         fontSize = 13.sp,
                         maxLines = 1,
@@ -157,10 +182,25 @@ fun HeaderBar(
                         Spacer(Modifier.width(4.dp))
                         Text(
                             text = "\u26A1",
-                            color = LitterTheme.accent,
-                            fontSize = 13.sp,
+                            color = LitterTheme.warning,
+                            fontSize = 11.sp,
                         )
                     }
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = reasoningLabel,
+                        color = LitterTheme.textSecondary,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.width(2.dp))
+                    Icon(
+                        Icons.Default.KeyboardArrowDown,
+                        contentDescription = "Open model selector",
+                        tint = LitterTheme.textSecondary,
+                        modifier = Modifier.size(14.dp),
+                    )
                 }
                 val cwd = thread?.info?.cwd
                 if (cwd != null) {
@@ -291,7 +331,7 @@ fun HeaderBar(
  * Launch model/effort state lives in [AppLaunchState].
  */
 object HeaderOverrides {
-    var pendingFastMode: Boolean = false
+    var pendingFastMode by mutableStateOf(false)
 }
 
 @Composable
@@ -306,7 +346,7 @@ private fun ModelSelectorPanel(
         ?: thread?.model
         ?: availableModels.firstOrNull { it.isDefault }?.id
         ?: availableModels.firstOrNull()?.id
-    var fastMode by remember { mutableStateOf(HeaderOverrides.pendingFastMode) }
+    val fastMode = HeaderOverrides.pendingFastMode
     val selectedModelDefinition by remember(selectedModel, availableModels) {
         derivedStateOf {
             availableModels.firstOrNull { it.id == selectedModel }
@@ -421,7 +461,6 @@ private fun ModelSelectorPanel(
             Switch(
                 checked = fastMode,
                 onCheckedChange = {
-                    fastMode = it
                     HeaderOverrides.pendingFastMode = it
                 },
                 colors = SwitchDefaults.colors(

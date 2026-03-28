@@ -102,8 +102,6 @@
 		<string>fetch</string>
 		<string>remote-notification</string>
 	</array>
-	<key>LogCollectorURL</key>
-	<string>$(LOG_COLLECTOR_URL)</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

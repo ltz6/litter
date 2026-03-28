@@ -1,5 +1,17 @@
+use crate::conversation_uniffi::HydratedConversationItem;
 use crate::types::{PendingApproval, PendingUserInputRequest, ThreadKey, generated};
-use crate::uniffi_shared::{AppVoiceHandoffRequest, AppVoiceTranscriptUpdate};
+use crate::uniffi_shared::{AppOperationStatus, AppVoiceHandoffRequest, AppVoiceTranscriptUpdate};
+
+use super::boundary::{AppSessionSummary, AppThreadSnapshot, AppThreadStateRecord};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStreamingDeltaKind {
+    AssistantText,
+    ReasoningText,
+    PlanText,
+    CommandOutput,
+    McpProgress,
+}
 
 #[derive(Debug, Clone)]
 pub enum AppUpdate {
@@ -10,11 +22,37 @@ pub enum AppUpdate {
     ServerRemoved {
         server_id: String,
     },
-    ThreadChanged {
+    ThreadUpserted {
+        thread: AppThreadSnapshot,
+        session_summary: AppSessionSummary,
+        agent_directory_version: u64,
+    },
+    ThreadStateUpdated {
+        state: AppThreadStateRecord,
+        session_summary: AppSessionSummary,
+        agent_directory_version: u64,
+    },
+    ThreadItemUpserted {
         key: ThreadKey,
+        item: HydratedConversationItem,
+    },
+    ThreadCommandExecutionUpdated {
+        key: ThreadKey,
+        item_id: String,
+        status: AppOperationStatus,
+        exit_code: Option<i32>,
+        duration_ms: Option<i64>,
+        process_id: Option<String>,
+    },
+    ThreadStreamingDelta {
+        key: ThreadKey,
+        item_id: String,
+        kind: ThreadStreamingDeltaKind,
+        text: String,
     },
     ThreadRemoved {
         key: ThreadKey,
+        agent_directory_version: u64,
     },
     ActiveThreadChanged {
         key: Option<ThreadKey>,

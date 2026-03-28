@@ -25,6 +25,12 @@ pub struct ProjectedConversationState {
     pub pending_user_inputs: Vec<ProjectedUserInputRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedConversationRequestState {
+    pub pending_approvals: Vec<ProjectedApprovalRequest>,
+    pub pending_user_inputs: Vec<ProjectedUserInputRequest>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectedApprovalKind {
     Command,
@@ -103,8 +109,6 @@ pub enum ConversationStreamPatchError {
 pub enum ConversationStreamApplyError {
     #[error("no cached state")]
     NoCachedState,
-    #[error("version gap (expected {expected}, got {actual})")]
-    VersionGap { expected: u32, actual: u32 },
     #[error("patch apply failed: {0}")]
     PatchFailed(#[from] ConversationStreamPatchError),
 }
@@ -142,6 +146,17 @@ struct DesktopConversationState {
     latest_reasoning_effort: Option<String>,
     #[serde(default)]
     cli_version: Option<String>,
+    #[serde(default)]
+    agent_nickname: Option<String>,
+    #[serde(default)]
+    agent_role: Option<String>,
+    #[serde(default)]
+    requests: Vec<DesktopPendingRequest>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopConversationRequestState {
     #[serde(default)]
     agent_nickname: Option<String>,
     #[serde(default)]
@@ -284,6 +299,32 @@ pub fn project_conversation_state(
     })
 }
 
+pub fn project_conversation_request_state(
+    conversation_state: &Value,
+) -> Result<ProjectedConversationRequestState, ConversationProjectionError> {
+    let conversation: DesktopConversationRequestState =
+        serde_json::from_value(conversation_state.clone())
+            .map_err(ConversationProjectionError::ConversationState)?;
+
+    Ok(ProjectedConversationRequestState {
+        pending_approvals: project_pending_approvals(&conversation.requests),
+        pending_user_inputs: project_pending_user_inputs(
+            &conversation.requests,
+            conversation.agent_nickname,
+            conversation.agent_role,
+        ),
+    })
+}
+
+pub fn project_conversation_turn(
+    raw_turn: &Value,
+    turn_index: usize,
+) -> Result<upstream::Turn, ConversationProjectionError> {
+    let turn: DesktopTurn = serde_json::from_value(raw_turn.clone())
+        .map_err(ConversationProjectionError::ConversationState)?;
+    project_turn(&turn, turn_index)
+}
+
 pub fn seed_conversation_state_from_thread(thread: &upstream::Thread) -> Value {
     serde_json::json!({
         "title": thread.name.clone(),
@@ -309,29 +350,23 @@ pub fn seed_conversation_state_from_thread(thread: &upstream::Thread) -> Value {
 }
 
 pub fn apply_stream_change_to_conversation_state(
-    cached_state: &mut Option<(u32, Value)>,
+    cached_state: &mut Option<Value>,
     params: &ThreadStreamStateChangedParams,
 ) -> Result<(), ConversationStreamApplyError> {
+    // Desktop currently sends the IPC method/schema version here, not a
+    // monotonic per-thread stream revision, so ordering recovery has to rely
+    // on whether a snapshot exists and whether the patch still applies cleanly.
     match &params.change {
         StreamChange::Snapshot { conversation_state } => {
-            *cached_state = Some((params.version, conversation_state.clone()));
+            *cached_state = Some(conversation_state.clone());
             Ok(())
         }
         StreamChange::Patches { patches } => {
-            let Some((cached_version, cached_json)) = cached_state.as_mut() else {
+            let Some(cached_json) = cached_state.as_mut() else {
                 return Err(ConversationStreamApplyError::NoCachedState);
             };
 
-            let expected = *cached_version + 1;
-            if params.version != expected {
-                return Err(ConversationStreamApplyError::VersionGap {
-                    expected,
-                    actual: params.version,
-                });
-            }
-
             apply_immer_patches(cached_json, patches)?;
-            *cached_version = params.version;
             Ok(())
         }
     }
@@ -1304,8 +1339,8 @@ mod tests {
             }],
         };
 
-        let mut cached_state = Some((1, seed_conversation_state_from_thread(&thread)));
-        let seeded_state = &cached_state.as_ref().unwrap().1;
+        let mut cached_state = Some(seed_conversation_state_from_thread(&thread));
+        let seeded_state = cached_state.as_ref().unwrap();
         assert_eq!(
             seeded_state["turns"][0]["params"]["input"][0]["text"],
             "hello"
@@ -1332,9 +1367,97 @@ mod tests {
         apply_stream_change_to_conversation_state(&mut cached_state, &text_patch).unwrap();
 
         let projected =
-            project_conversation_state("conversation-1", &cached_state.as_ref().unwrap().1)
-                .unwrap();
+            project_conversation_state("conversation-1", cached_state.as_ref().unwrap()).unwrap();
         assert_eq!(projected.active_turn_id.as_deref(), Some("turn-1"));
+        match &projected.thread.turns[0].items[1] {
+            upstream::ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "hello"),
+            other => panic!("expected agent message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn applies_same_protocol_version_patch_bursts() {
+        let thread = upstream::Thread {
+            id: "thread-1".to_string(),
+            preview: "hello".to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 2,
+            status: upstream::ThreadStatus::Active {
+                active_flags: Vec::new(),
+            },
+            path: Some(PathBuf::from("/tmp/thread.jsonl")),
+            cwd: PathBuf::from("/tmp"),
+            cli_version: "1.0.0".to_string(),
+            source: upstream::SessionSource::default(),
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: Some("Thread".to_string()),
+            turns: vec![upstream::Turn {
+                id: "turn-1".to_string(),
+                status: upstream::TurnStatus::InProgress,
+                error: None,
+                items: vec![
+                    upstream::ThreadItem::UserMessage {
+                        id: "user-1".to_string(),
+                        content: vec![upstream::UserInput::Text {
+                            text: "hello".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    upstream::ThreadItem::AgentMessage {
+                        id: "assistant-1".to_string(),
+                        text: "hel".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+            }],
+        };
+
+        let mut cached_state = Some(seed_conversation_state_from_thread(&thread));
+        let first_text_patch = ThreadStreamStateChangedParams {
+            conversation_id: "conversation-1".to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![crate::protocol::params::ImmerPatch {
+                    op: crate::protocol::params::ImmerOp::Replace,
+                    path: vec![
+                        crate::protocol::params::ImmerPathSegment::Key("turns".to_string()),
+                        crate::protocol::params::ImmerPathSegment::Index(0),
+                        crate::protocol::params::ImmerPathSegment::Key("items".to_string()),
+                        crate::protocol::params::ImmerPathSegment::Index(0),
+                        crate::protocol::params::ImmerPathSegment::Key("text".to_string()),
+                    ],
+                    value: Some(json!("hell")),
+                }],
+            },
+        };
+        let second_text_patch = ThreadStreamStateChangedParams {
+            conversation_id: "conversation-1".to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![crate::protocol::params::ImmerPatch {
+                    op: crate::protocol::params::ImmerOp::Replace,
+                    path: vec![
+                        crate::protocol::params::ImmerPathSegment::Key("turns".to_string()),
+                        crate::protocol::params::ImmerPathSegment::Index(0),
+                        crate::protocol::params::ImmerPathSegment::Key("items".to_string()),
+                        crate::protocol::params::ImmerPathSegment::Index(0),
+                        crate::protocol::params::ImmerPathSegment::Key("text".to_string()),
+                    ],
+                    value: Some(json!("hello")),
+                }],
+            },
+        };
+
+        apply_stream_change_to_conversation_state(&mut cached_state, &first_text_patch).unwrap();
+        apply_stream_change_to_conversation_state(&mut cached_state, &second_text_patch).unwrap();
+
+        let state = cached_state.expect("state after same-version patches");
+        let projected = project_conversation_state("conversation-1", &state).unwrap();
         match &projected.thread.turns[0].items[1] {
             upstream::ThreadItem::AgentMessage { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected agent message, got {other:?}"),

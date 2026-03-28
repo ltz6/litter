@@ -1,6 +1,6 @@
 #[cfg(target_os = "android")]
 use futures::FutureExt;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 #[cfg(target_os = "android")]
 use std::panic::AssertUnwindSafe;
@@ -16,21 +16,27 @@ use crate::session::connection::{
 };
 use crate::session::events::{EventProcessor, UiEvent};
 use crate::ssh::{SshBootstrapResult, SshClient, SshCredentials};
-use crate::store::{AppSnapshot, AppStoreReducer, AppUpdate, ServerHealthSnapshot, ThreadSnapshot};
+use crate::store::updates::ThreadStreamingDeltaKind;
+use crate::store::{
+    AppSnapshot, AppStoreReducer, AppUpdate, QueuedFollowUpPreview, ServerHealthSnapshot,
+    ThreadSnapshot,
+};
 use crate::transport::{RpcError, TransportError};
 use crate::types::{
     ApprovalDecisionValue, PendingApproval, PendingUserInputAnswer, PendingUserInputRequest,
-    ThreadInfo, ThreadKey, generated,
+    ThreadInfo, ThreadKey, ThreadSummaryStatus, generated,
 };
+use crate::uniffi_shared::AppOperationStatus;
 use codex_app_server_protocol as upstream;
 use codex_ipc::{
     ClientStatus, CommandExecutionApprovalDecision, ConversationStreamApplyError,
-    ExternalResumeThreadParams, FileChangeApprovalDecision, IpcClient, IpcClientConfig,
-    ProjectedApprovalKind, ProjectedApprovalRequest, ProjectedUserInputRequest, StreamChange,
-    ThreadFollowerCommandApprovalDecisionParams, ThreadFollowerFileApprovalDecisionParams,
-    ThreadFollowerStartTurnParams, ThreadFollowerSubmitUserInputParams,
-    ThreadStreamStateChangedParams, TypedBroadcast, apply_stream_change_to_conversation_state,
-    project_conversation_state, seed_conversation_state_from_thread,
+    ExternalResumeThreadParams, FileChangeApprovalDecision, ImmerOp, ImmerPatch, ImmerPathSegment,
+    IpcClient, IpcClientConfig, ProjectedApprovalKind, ProjectedApprovalRequest,
+    ProjectedUserInputRequest, StreamChange, ThreadFollowerCommandApprovalDecisionParams,
+    ThreadFollowerFileApprovalDecisionParams, ThreadFollowerStartTurnParams,
+    ThreadFollowerSubmitUserInputParams, ThreadStreamStateChangedParams, TypedBroadcast,
+    apply_stream_change_to_conversation_state, project_conversation_request_state,
+    project_conversation_state, project_conversation_turn, seed_conversation_state_from_thread,
 };
 
 /// Top-level entry point for platform code (iOS / Android).
@@ -55,6 +61,7 @@ struct OAuthCallbackTunnel {
 impl MobileClient {
     /// Create a new `MobileClient`.
     pub fn new() -> Self {
+        crate::logging::install_ipc_wire_trace_logger();
         let event_processor = Arc::new(EventProcessor::new());
         let app_store = Arc::new(AppStoreReducer::new());
         spawn_store_listener(Arc::clone(&app_store), event_processor.subscribe());
@@ -616,6 +623,21 @@ impl MobileClient {
         params: generated::TurnStartParams,
     ) -> Result<(), RpcError> {
         let session = self.get_session(server_id)?;
+        let thread_key = ThreadKey {
+            server_id: server_id.to_string(),
+            thread_id: params.thread_id.clone(),
+        };
+        let queued_preview = self
+            .snapshot_thread(&thread_key)
+            .ok()
+            .filter(|thread| {
+                thread.active_turn_id.is_some() || thread.info.status == ThreadSummaryStatus::Active
+            })
+            .and_then(|_| queued_follow_up_preview_from_inputs(&params.input));
+        if let Some(preview) = queued_preview.clone() {
+            self.app_store
+                .enqueue_thread_follow_up_preview(&thread_key, preview);
+        }
         let direct_params = params.clone();
 
         if let Some(ipc_client) = session.ipc_client() {
@@ -649,6 +671,10 @@ impl MobileClient {
                     return Ok(());
                 }
                 Err(error) => {
+                    if let Some(preview) = queued_preview.as_ref() {
+                        self.app_store
+                            .remove_thread_follow_up_preview(&thread_key, &preview.id);
+                    }
                     warn!(
                         "MobileClient: IPC follower start turn failed for {} thread {}: {}",
                         server_id, thread_id, error
@@ -662,7 +688,13 @@ impl MobileClient {
         let response = self
             .generated_turn_start(server_id, direct_params)
             .await
-            .map_err(|error| RpcError::Deserialization(error.to_string()))?;
+            .map_err(|error| {
+                if let Some(preview) = queued_preview.as_ref() {
+                    self.app_store
+                        .remove_thread_follow_up_preview(&thread_key, &preview.id);
+                }
+                RpcError::Deserialization(error.to_string())
+            })?;
         self.reconcile_public_rpc("turn/start", server_id, Some(&reconcile_params), &response)
             .await
     }
@@ -1066,7 +1098,7 @@ impl MobileClient {
         let app_store = Arc::clone(&self.app_store);
         let loop_server_id = server_id.clone();
         Self::spawn_detached(async move {
-            let mut stream_cache: HashMap<String, (u32, serde_json::Value)> = HashMap::new();
+            let mut stream_cache: HashMap<String, serde_json::Value> = HashMap::new();
             loop {
                 match broadcasts.recv().await {
                     Ok(TypedBroadcast::ThreadStreamStateChanged(params)) => {
@@ -1075,7 +1107,7 @@ impl MobileClient {
                             StreamChange::Patches { .. } => "patches",
                         };
                         debug!(
-                            "IPC in: ThreadStreamStateChanged server={} thread={} version={} change={}",
+                            "IPC in: ThreadStreamStateChanged server={} thread={} protocol_version={} change={}",
                             loop_server_id, params.conversation_id, params.version, change_type
                         );
 
@@ -1086,28 +1118,6 @@ impl MobileClient {
                             &params,
                         ) {
                             Ok(()) => {}
-                            Err(StreamHandleError::VersionGap) => {
-                                debug!(
-                                    "IPC: version gap for thread={}, reseeding stream cache from RPC",
-                                    params.conversation_id
-                                );
-                                stream_cache.remove(&params.conversation_id);
-                                if let Err(e) = recover_ipc_stream_cache_from_app_server(
-                                    Arc::clone(&session),
-                                    Arc::clone(&app_store),
-                                    &mut stream_cache,
-                                    &loop_server_id,
-                                    &params.conversation_id,
-                                    params.version,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        "IPC: RPC cache recovery failed for thread {}: {}",
-                                        params.conversation_id, e
-                                    );
-                                }
-                            }
                             Err(StreamHandleError::NoCachedState) => {
                                 debug!(
                                     "IPC: no cached state for thread={}, seeding stream cache from RPC",
@@ -1119,7 +1129,6 @@ impl MobileClient {
                                     &mut stream_cache,
                                     &loop_server_id,
                                     &params.conversation_id,
-                                    params.version,
                                 )
                                 .await
                                 {
@@ -1141,7 +1150,6 @@ impl MobileClient {
                                     &mut stream_cache,
                                     &loop_server_id,
                                     &params.conversation_id,
-                                    params.version,
                                 )
                                 .await
                                 {
@@ -1163,7 +1171,6 @@ impl MobileClient {
                                     &mut stream_cache,
                                     &loop_server_id,
                                     &params.conversation_id,
-                                    params.version,
                                 )
                                 .await
                                 {
@@ -1934,10 +1941,52 @@ pub fn copy_thread_runtime_fields(source: &ThreadSnapshot, target: &mut ThreadSn
     if target.reasoning_effort.is_none() {
         target.reasoning_effort = source.reasoning_effort.clone();
     }
+    if target.queued_follow_ups.is_empty() {
+        target.queued_follow_ups = source.queued_follow_ups.clone();
+    }
     target.context_tokens_used = source.context_tokens_used;
     target.model_context_window = source.model_context_window;
     target.rate_limits = source.rate_limits.clone();
     target.realtime_session_id = source.realtime_session_id.clone();
+}
+
+fn queued_follow_up_preview_from_inputs(
+    inputs: &[generated::UserInput],
+) -> Option<QueuedFollowUpPreview> {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut attachment_count = 0usize;
+
+    for input in inputs {
+        match input {
+            generated::UserInput::Text { text, .. } => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    text_parts.push(trimmed.to_string());
+                }
+            }
+            generated::UserInput::Image { .. } | generated::UserInput::LocalImage { .. } => {
+                attachment_count += 1;
+            }
+            generated::UserInput::Skill { .. } | generated::UserInput::Mention { .. } => {}
+        }
+    }
+
+    let text = if !text_parts.is_empty() {
+        text_parts.join("\n")
+    } else if attachment_count > 0 {
+        if attachment_count == 1 {
+            "1 image attachment".to_string()
+        } else {
+            format!("{attachment_count} image attachments")
+        }
+    } else {
+        return None;
+    };
+
+    Some(QueuedFollowUpPreview {
+        id: uuid::Uuid::new_v4().to_string(),
+        text,
+    })
 }
 
 fn remote_oauth_callback_port(auth_url: &str) -> Result<u16, RpcError> {
@@ -2140,10 +2189,9 @@ fn upsert_thread_snapshot_from_app_server_thread(
 async fn recover_ipc_stream_cache_from_app_server(
     session: Arc<ServerSession>,
     app_store: Arc<AppStoreReducer>,
-    cache: &mut HashMap<String, (u32, serde_json::Value)>,
+    cache: &mut HashMap<String, serde_json::Value>,
     server_id: &str,
     thread_id: &str,
-    version: u32,
 ) -> Result<(), RpcError> {
     let key = ThreadKey {
         server_id: server_id.to_string(),
@@ -2177,7 +2225,7 @@ async fn recover_ipc_stream_cache_from_app_server(
         &pending_approvals,
         &pending_user_inputs,
     );
-    cache.insert(thread_id.to_string(), (version, conversation_state));
+    cache.insert(thread_id.to_string(), conversation_state);
     Ok(())
 }
 
@@ -2489,16 +2537,790 @@ fn seed_ipc_user_input_request(request: &PendingUserInputRequest) -> serde_json:
 
 // -- IPC stream state change handler --
 
+#[derive(Debug, Default)]
+struct IncrementalIpcPatchSummary {
+    affected_turn_indices: Vec<usize>,
+    requests_changed: bool,
+    latest_model_changed: bool,
+    latest_reasoning_effort_changed: bool,
+    updated_at_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalProjectedTurn {
+    turn_index: usize,
+    items: Vec<crate::conversation::ConversationItem>,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalStreamingDelta {
+    item_id: String,
+    kind: ThreadStreamingDeltaKind,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalCommandExecutionUpdate {
+    item_id: String,
+    status: AppOperationStatus,
+    exit_code: Option<i32>,
+    duration_ms: Option<i64>,
+    process_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum IncrementalThreadEvent {
+    Streaming(IncrementalStreamingDelta),
+    CommandExecutionUpdated(IncrementalCommandExecutionUpdate),
+    ItemUpsert(crate::conversation::ConversationItem),
+}
+
+#[derive(Debug, Clone)]
+enum IncrementalTurnMutation {
+    Unchanged,
+    Patched {
+        projected_turn: IncrementalProjectedTurn,
+        events: Vec<IncrementalThreadEvent>,
+    },
+    Replace(IncrementalProjectedTurn),
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalThreadMutation {
+    turn_mutations: Vec<IncrementalTurnMutation>,
+    active_turn_id: Option<String>,
+    updated_at: Option<i64>,
+    latest_model: Option<String>,
+    latest_reasoning_effort: Option<String>,
+    thread_status: ThreadSummaryStatus,
+}
+
+#[derive(Debug)]
+struct IncrementalMutationResult {
+    requires_thread_upsert: bool,
+    emitted_deltas: Vec<IncrementalStreamingDelta>,
+    emitted_command_updates: Vec<IncrementalCommandExecutionUpdate>,
+    emitted_item_upserts: Vec<crate::conversation::ConversationItem>,
+    emit_thread_state_update: bool,
+}
+
+fn summarize_incremental_ipc_patches(patches: &[ImmerPatch]) -> Option<IncrementalIpcPatchSummary> {
+    let mut affected_turn_indices = BTreeSet::new();
+    let mut summary = IncrementalIpcPatchSummary::default();
+
+    for patch in patches {
+        match patch.path.as_slice() {
+            [ImmerPathSegment::Key(key)] if key == "requests" => {
+                summary.requests_changed = true;
+            }
+            [ImmerPathSegment::Key(key)] if key == "latestModel" => {
+                summary.latest_model_changed = true;
+            }
+            [ImmerPathSegment::Key(key)] if key == "latestReasoningEffort" => {
+                summary.latest_reasoning_effort_changed = true;
+            }
+            [ImmerPathSegment::Key(key)] if key == "updatedAt" => {
+                summary.updated_at_changed = true;
+            }
+            [
+                ImmerPathSegment::Key(key),
+                ImmerPathSegment::Index(turn_index),
+            ] if key == "turns" => {
+                if matches!(&patch.op, ImmerOp::Remove) {
+                    return None;
+                }
+                affected_turn_indices.insert(*turn_index);
+            }
+            [
+                ImmerPathSegment::Key(key),
+                ImmerPathSegment::Index(turn_index),
+                ..,
+            ] if key == "turns" => {
+                affected_turn_indices.insert(*turn_index);
+            }
+            _ => return None,
+        }
+    }
+
+    summary.affected_turn_indices = affected_turn_indices.into_iter().collect();
+    Some(summary)
+}
+
+fn incremental_ipc_thread_status(
+    existing: ThreadSummaryStatus,
+    active_turn_id: &Option<String>,
+    pending_approvals: &[PendingApproval],
+    pending_user_inputs: &[PendingUserInputRequest],
+) -> ThreadSummaryStatus {
+    if active_turn_id.is_some() || !pending_approvals.is_empty() || !pending_user_inputs.is_empty()
+    {
+        ThreadSummaryStatus::Active
+    } else {
+        match existing {
+            ThreadSummaryStatus::SystemError => ThreadSummaryStatus::SystemError,
+            ThreadSummaryStatus::NotLoaded => ThreadSummaryStatus::Idle,
+            ThreadSummaryStatus::Idle | ThreadSummaryStatus::Active => ThreadSummaryStatus::Idle,
+        }
+    }
+}
+
+fn active_turn_id_from_ipc_conversation_state(
+    conversation_state: &serde_json::Value,
+) -> Option<String> {
+    let turns = conversation_state.get("turns")?.as_array()?;
+    turns
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(turn_index, turn)| {
+            (turn.get("status").and_then(serde_json::Value::as_str) == Some("inProgress")).then(
+                || {
+                    turn.get("turnId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("ipc-turn-{turn_index}"))
+                },
+            )
+        })
+}
+
+fn updated_at_from_ipc_conversation_state(conversation_state: &serde_json::Value) -> Option<i64> {
+    match conversation_state.get("updatedAt") {
+        Some(serde_json::Value::Number(number)) => number.as_i64(),
+        Some(serde_json::Value::String(text)) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn project_incremental_turn(
+    conversation_state: &serde_json::Value,
+    turn_index: usize,
+) -> Result<Option<IncrementalProjectedTurn>, String> {
+    let Some(raw_turn) = conversation_state
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|turns| turns.get(turn_index))
+    else {
+        return Ok(None);
+    };
+
+    let turn = project_conversation_turn(raw_turn, turn_index)
+        .map_err(|error| format!("project turn {turn_index}: {error}"))?;
+    let items = turn
+        .items
+        .iter()
+        .filter_map(|item| {
+            crate::conversation::hydrate_thread_item(
+                item,
+                Some(&turn.id),
+                Some(turn_index),
+                &Default::default(),
+            )
+        })
+        .collect();
+
+    Ok(Some(IncrementalProjectedTurn { turn_index, items }))
+}
+
+fn replace_items_for_turn(
+    thread: &mut ThreadSnapshot,
+    turn_index: usize,
+    items: Vec<crate::conversation::ConversationItem>,
+) {
+    let insertion_index = thread
+        .items
+        .iter()
+        .position(|item| item.source_turn_index == Some(turn_index))
+        .unwrap_or_else(|| {
+            thread
+                .items
+                .iter()
+                .position(|item| {
+                    item.source_turn_index
+                        .is_some_and(|index| index > turn_index)
+                })
+                .unwrap_or(thread.items.len())
+        });
+
+    thread
+        .items
+        .retain(|item| item.source_turn_index != Some(turn_index));
+
+    let mut insertion_index = insertion_index.min(thread.items.len());
+    for item in items {
+        thread.items.insert(insertion_index, item);
+        insertion_index += 1;
+    }
+}
+
+fn appended_text_delta(existing: &str, projected: &str) -> Option<String> {
+    projected
+        .starts_with(existing)
+        .then(|| projected[existing.len()..].to_string())
+}
+
+fn appended_optional_text_delta(
+    existing: &Option<String>,
+    projected: &Option<String>,
+) -> Option<String> {
+    match (existing.as_deref(), projected.as_deref()) {
+        (None, None) => Some(String::new()),
+        (None, Some(projected)) => Some(projected.to_string()),
+        (Some(existing), Some(projected)) => appended_text_delta(existing, projected),
+        (Some(_), None) => None,
+    }
+}
+
+fn appended_reasoning_delta(existing: &[String], projected: &[String]) -> Option<String> {
+    match (existing, projected) {
+        ([], []) => Some(String::new()),
+        ([], [first]) => Some(first.clone()),
+        ([..], [..]) if existing == projected => Some(String::new()),
+        ([existing_last], [projected_last]) => appended_text_delta(existing_last, projected_last),
+        _ if existing.len() == projected.len() && !existing.is_empty() => {
+            let prefix_len = existing.len() - 1;
+            if existing[..prefix_len] != projected[..prefix_len] {
+                return None;
+            }
+            appended_text_delta(
+                existing[prefix_len].as_str(),
+                projected[prefix_len].as_str(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn diff_incremental_projected_item(
+    existing: &crate::conversation::ConversationItem,
+    projected: &crate::conversation::ConversationItem,
+) -> Option<Vec<IncrementalThreadEvent>> {
+    use crate::conversation::ConversationItemContent;
+
+    if existing.id != projected.id
+        || existing.source_turn_id != projected.source_turn_id
+        || existing.source_turn_index != projected.source_turn_index
+        || existing.timestamp != projected.timestamp
+        || existing.is_from_user_turn_boundary != projected.is_from_user_turn_boundary
+    {
+        return None;
+    }
+
+    match (&existing.content, &projected.content) {
+        (
+            ConversationItemContent::Assistant(existing_data),
+            ConversationItemContent::Assistant(projected_data),
+        ) => {
+            if existing_data.agent_nickname != projected_data.agent_nickname
+                || existing_data.agent_role != projected_data.agent_role
+                || existing_data.phase != projected_data.phase
+            {
+                return None;
+            }
+            let delta =
+                appended_text_delta(existing_data.text.as_str(), projected_data.text.as_str())?;
+            Some(if delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![IncrementalThreadEvent::Streaming(
+                    IncrementalStreamingDelta {
+                        item_id: existing.id.clone(),
+                        kind: ThreadStreamingDeltaKind::AssistantText,
+                        text: delta,
+                    },
+                )]
+            })
+        }
+        (
+            ConversationItemContent::Reasoning(existing_data),
+            ConversationItemContent::Reasoning(projected_data),
+        ) => {
+            if existing_data.summary != projected_data.summary {
+                return None;
+            }
+            let delta = appended_reasoning_delta(&existing_data.content, &projected_data.content)?;
+            Some(if delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![IncrementalThreadEvent::Streaming(
+                    IncrementalStreamingDelta {
+                        item_id: existing.id.clone(),
+                        kind: ThreadStreamingDeltaKind::ReasoningText,
+                        text: delta,
+                    },
+                )]
+            })
+        }
+        (
+            ConversationItemContent::ProposedPlan(existing_data),
+            ConversationItemContent::ProposedPlan(projected_data),
+        ) => {
+            let delta = appended_text_delta(
+                existing_data.content.as_str(),
+                projected_data.content.as_str(),
+            )?;
+            Some(if delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![IncrementalThreadEvent::Streaming(
+                    IncrementalStreamingDelta {
+                        item_id: existing.id.clone(),
+                        kind: ThreadStreamingDeltaKind::PlanText,
+                        text: delta,
+                    },
+                )]
+            })
+        }
+        (
+            ConversationItemContent::CommandExecution(existing_data),
+            ConversationItemContent::CommandExecution(projected_data),
+        ) => {
+            if existing_data.command != projected_data.command
+                || existing_data.cwd != projected_data.cwd
+                || existing_data.actions != projected_data.actions
+            {
+                return None;
+            }
+            let delta =
+                appended_optional_text_delta(&existing_data.output, &projected_data.output)?;
+            let mut events = Vec::new();
+            if !delta.is_empty() {
+                events.push(IncrementalThreadEvent::Streaming(
+                    IncrementalStreamingDelta {
+                        item_id: existing.id.clone(),
+                        kind: ThreadStreamingDeltaKind::CommandOutput,
+                        text: delta,
+                    },
+                ));
+            }
+            if existing_data.status != projected_data.status
+                || existing_data.exit_code != projected_data.exit_code
+                || existing_data.duration_ms != projected_data.duration_ms
+                || existing_data.process_id != projected_data.process_id
+            {
+                events.push(IncrementalThreadEvent::CommandExecutionUpdated(
+                    IncrementalCommandExecutionUpdate {
+                        item_id: existing.id.clone(),
+                        status: AppOperationStatus::from_raw(projected_data.status.as_str()),
+                        exit_code: projected_data.exit_code,
+                        duration_ms: projected_data.duration_ms,
+                        process_id: projected_data.process_id.clone(),
+                    },
+                ));
+            }
+            Some(events)
+        }
+        (
+            ConversationItemContent::McpToolCall(existing_data),
+            ConversationItemContent::McpToolCall(projected_data),
+        ) => {
+            if existing_data.server != projected_data.server
+                || existing_data.tool != projected_data.tool
+                || existing_data.status != projected_data.status
+                || existing_data.duration_ms != projected_data.duration_ms
+                || existing_data.arguments_json != projected_data.arguments_json
+                || existing_data.content_summary != projected_data.content_summary
+                || existing_data.structured_content_json != projected_data.structured_content_json
+                || existing_data.raw_output_json != projected_data.raw_output_json
+                || existing_data.error_message != projected_data.error_message
+            {
+                return None;
+            }
+            if !projected_data
+                .progress_messages
+                .starts_with(&existing_data.progress_messages)
+            {
+                return None;
+            }
+
+            let appended =
+                &projected_data.progress_messages[existing_data.progress_messages.len()..];
+            if appended.iter().any(|message| message.trim().is_empty()) {
+                return None;
+            }
+
+            Some(
+                appended
+                    .iter()
+                    .map(|message| {
+                        IncrementalThreadEvent::Streaming(IncrementalStreamingDelta {
+                            item_id: existing.id.clone(),
+                            kind: ThreadStreamingDeltaKind::McpProgress,
+                            text: message.clone(),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        _ if existing.content == projected.content => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+fn diff_incremental_projected_turn(
+    existing_thread: &ThreadSnapshot,
+    projected_turn: IncrementalProjectedTurn,
+) -> IncrementalTurnMutation {
+    let existing_items = existing_thread
+        .items
+        .iter()
+        .filter(|item| item.source_turn_index == Some(projected_turn.turn_index))
+        .collect::<Vec<_>>();
+
+    if existing_items.len() > projected_turn.items.len() {
+        return IncrementalTurnMutation::Replace(projected_turn);
+    }
+
+    let mut events = Vec::new();
+    for (existing_item, projected_item) in existing_items.iter().zip(projected_turn.items.iter()) {
+        let Some(mut item_events) = diff_incremental_projected_item(existing_item, projected_item)
+        else {
+            return IncrementalTurnMutation::Replace(projected_turn);
+        };
+        events.append(&mut item_events);
+    }
+
+    if projected_turn.items.len() > existing_items.len() {
+        for projected_item in projected_turn.items.iter().skip(existing_items.len()) {
+            events.push(IncrementalThreadEvent::ItemUpsert(projected_item.clone()));
+        }
+    }
+
+    if events.is_empty() {
+        IncrementalTurnMutation::Unchanged
+    } else {
+        IncrementalTurnMutation::Patched {
+            projected_turn,
+            events,
+        }
+    }
+}
+
+fn apply_incremental_thread_event(
+    thread: &mut ThreadSnapshot,
+    event: &IncrementalThreadEvent,
+) -> bool {
+    use crate::conversation::ConversationItemContent;
+
+    match event {
+        IncrementalThreadEvent::Streaming(delta) => {
+            let Some(item) = thread
+                .items
+                .iter_mut()
+                .find(|item| item.id == delta.item_id)
+            else {
+                return false;
+            };
+
+            match (&mut item.content, &delta.kind) {
+                (
+                    ConversationItemContent::Assistant(data),
+                    ThreadStreamingDeltaKind::AssistantText,
+                ) => {
+                    data.text.push_str(delta.text.as_str());
+                    true
+                }
+                (
+                    ConversationItemContent::Reasoning(data),
+                    ThreadStreamingDeltaKind::ReasoningText,
+                ) => {
+                    if let Some(last) = data.content.last_mut() {
+                        last.push_str(delta.text.as_str());
+                    } else {
+                        data.content.push(delta.text.clone());
+                    }
+                    true
+                }
+                (
+                    ConversationItemContent::ProposedPlan(data),
+                    ThreadStreamingDeltaKind::PlanText,
+                ) => {
+                    data.content.push_str(delta.text.as_str());
+                    true
+                }
+                (
+                    ConversationItemContent::CommandExecution(data),
+                    ThreadStreamingDeltaKind::CommandOutput,
+                ) => {
+                    data.output
+                        .get_or_insert_with(String::new)
+                        .push_str(delta.text.as_str());
+                    true
+                }
+                (
+                    ConversationItemContent::McpToolCall(data),
+                    ThreadStreamingDeltaKind::McpProgress,
+                ) => {
+                    if !delta.text.trim().is_empty() {
+                        data.progress_messages.push(delta.text.clone());
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        IncrementalThreadEvent::CommandExecutionUpdated(update) => {
+            let Some(item) = thread
+                .items
+                .iter_mut()
+                .find(|item| item.id == update.item_id)
+            else {
+                return false;
+            };
+            let ConversationItemContent::CommandExecution(data) = &mut item.content else {
+                return false;
+            };
+            data.status = match update.status {
+                AppOperationStatus::Pending => "pending".to_string(),
+                AppOperationStatus::InProgress => "inProgress".to_string(),
+                AppOperationStatus::Completed => "completed".to_string(),
+                AppOperationStatus::Failed => "failed".to_string(),
+                AppOperationStatus::Declined => "declined".to_string(),
+                AppOperationStatus::Unknown => data.status.clone(),
+            };
+            data.exit_code = update.exit_code;
+            data.duration_ms = update.duration_ms;
+            data.process_id = update.process_id.clone();
+            true
+        }
+        IncrementalThreadEvent::ItemUpsert(item) => {
+            if let Some(existing) = thread
+                .items
+                .iter_mut()
+                .find(|existing| existing.id == item.id)
+            {
+                *existing = item.clone();
+            } else {
+                thread.items.push(item.clone());
+            }
+            true
+        }
+    }
+}
+
+fn try_apply_incremental_ipc_patch_burst(
+    app_store: &AppStoreReducer,
+    server_id: &str,
+    thread_id: &str,
+    conversation_state: &serde_json::Value,
+    summary: &IncrementalIpcPatchSummary,
+) -> Result<bool, String> {
+    let key = ThreadKey {
+        server_id: server_id.to_string(),
+        thread_id: thread_id.to_string(),
+    };
+    let snapshot = app_store.snapshot();
+    let Some(existing_thread) = snapshot.threads.get(&key).cloned() else {
+        return Ok(false);
+    };
+
+    let mut pending_approvals = snapshot
+        .pending_approvals
+        .iter()
+        .filter(|approval| {
+            approval.server_id == server_id && approval.thread_id.as_deref() == Some(thread_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut pending_user_inputs = snapshot
+        .pending_user_inputs
+        .iter()
+        .filter(|request| request.server_id == server_id && request.thread_id == thread_id)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if summary.requests_changed {
+        let projected = project_conversation_request_state(conversation_state)
+            .map_err(|error| format!("project request state: {error}"))?;
+        pending_approvals = projected
+            .pending_approvals
+            .into_iter()
+            .map(|approval| pending_approval_from_ipc_projection(server_id, approval))
+            .collect();
+        pending_user_inputs = projected
+            .pending_user_inputs
+            .into_iter()
+            .map(|request| pending_user_input_from_ipc_projection(server_id, request))
+            .collect();
+    }
+
+    let mut projected_turns = Vec::with_capacity(summary.affected_turn_indices.len());
+    for &turn_index in &summary.affected_turn_indices {
+        if let Some(projected_turn) = project_incremental_turn(conversation_state, turn_index)? {
+            projected_turns.push(projected_turn);
+        }
+    }
+
+    let turn_mutations = projected_turns
+        .into_iter()
+        .map(|projected_turn| diff_incremental_projected_turn(&existing_thread, projected_turn))
+        .collect::<Vec<_>>();
+
+    let active_turn_id = if summary.affected_turn_indices.is_empty() && !summary.requests_changed {
+        existing_thread.active_turn_id.clone()
+    } else {
+        active_turn_id_from_ipc_conversation_state(conversation_state)
+    };
+    let updated_at = if summary.updated_at_changed {
+        updated_at_from_ipc_conversation_state(conversation_state)
+    } else {
+        existing_thread.info.updated_at
+    };
+    let latest_model = if summary.latest_model_changed {
+        conversation_state
+            .get("latestModel")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        existing_thread.model.clone()
+    };
+    let latest_reasoning_effort = if summary.latest_reasoning_effort_changed {
+        conversation_state
+            .get("latestReasoningEffort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        existing_thread.reasoning_effort.clone()
+    };
+    let thread_status = incremental_ipc_thread_status(
+        existing_thread.info.status.clone(),
+        &active_turn_id,
+        &pending_approvals,
+        &pending_user_inputs,
+    );
+    let meta_changed = existing_thread.active_turn_id != active_turn_id
+        || existing_thread.info.status != thread_status
+        || existing_thread.info.updated_at != updated_at
+        || existing_thread.model != latest_model
+        || existing_thread.reasoning_effort != latest_reasoning_effort;
+
+    let mutation = IncrementalThreadMutation {
+        turn_mutations,
+        active_turn_id,
+        updated_at,
+        latest_model,
+        latest_reasoning_effort,
+        thread_status,
+    };
+
+    let Some(mutation_result) = app_store.mutate_thread_with_result(&key, |thread| {
+        let mut emitted_deltas = Vec::new();
+        let mut emitted_command_updates = Vec::new();
+        let mut emitted_item_upserts = Vec::new();
+        let mut requires_thread_upsert = false;
+
+        for turn_mutation in &mutation.turn_mutations {
+            match turn_mutation {
+                IncrementalTurnMutation::Unchanged => {}
+                IncrementalTurnMutation::Replace(projected_turn) => {
+                    replace_items_for_turn(
+                        thread,
+                        projected_turn.turn_index,
+                        projected_turn.items.clone(),
+                    );
+                    requires_thread_upsert = true;
+                }
+                IncrementalTurnMutation::Patched {
+                    projected_turn,
+                    events,
+                } => {
+                    let mut applied = true;
+                    for event in events {
+                        if !apply_incremental_thread_event(thread, event) {
+                            applied = false;
+                            break;
+                        }
+                    }
+
+                    if applied {
+                        for event in events {
+                            match event {
+                                IncrementalThreadEvent::Streaming(delta) => {
+                                    emitted_deltas.push(delta.clone());
+                                }
+                                IncrementalThreadEvent::CommandExecutionUpdated(update) => {
+                                    emitted_command_updates.push(update.clone());
+                                }
+                                IncrementalThreadEvent::ItemUpsert(item) => {
+                                    emitted_item_upserts.push(item.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        replace_items_for_turn(
+                            thread,
+                            projected_turn.turn_index,
+                            projected_turn.items.clone(),
+                        );
+                        requires_thread_upsert = true;
+                    }
+                }
+            }
+        }
+
+        thread.active_turn_id = mutation.active_turn_id.clone();
+        thread.info.status = mutation.thread_status.clone();
+        thread.info.updated_at = mutation.updated_at;
+        thread.model = mutation.latest_model.clone();
+        thread.reasoning_effort = mutation.latest_reasoning_effort.clone();
+
+        IncrementalMutationResult {
+            requires_thread_upsert,
+            emitted_deltas,
+            emitted_command_updates,
+            emitted_item_upserts,
+            emit_thread_state_update: meta_changed,
+        }
+    }) else {
+        return Ok(false);
+    };
+
+    if mutation_result.requires_thread_upsert {
+        app_store.emit_thread_upsert(&key);
+    } else {
+        if mutation_result.emit_thread_state_update {
+            app_store.emit_thread_state_update(&key);
+        }
+        for item in mutation_result.emitted_item_upserts {
+            app_store.emit_thread_item_upsert(&key, &item);
+        }
+        for update in mutation_result.emitted_command_updates {
+            app_store.emit_thread_command_execution_updated(
+                &key,
+                &update.item_id,
+                update.status,
+                update.exit_code,
+                update.duration_ms,
+                update.process_id,
+            );
+        }
+        for delta in mutation_result.emitted_deltas {
+            app_store.emit_thread_streaming_delta(&key, &delta.item_id, delta.kind, &delta.text);
+        }
+    }
+
+    if summary.requests_changed {
+        sync_ipc_thread_requests(
+            app_store,
+            server_id,
+            thread_id,
+            pending_approvals,
+            pending_user_inputs,
+        );
+    }
+
+    Ok(true)
+}
+
 #[derive(Debug)]
 enum StreamHandleError {
-    VersionGap,
     NoCachedState,
     DeserializeFailed(String),
     PatchFailed(String),
 }
 
 fn handle_stream_state_change(
-    cache: &mut HashMap<String, (u32, serde_json::Value)>,
+    cache: &mut HashMap<String, serde_json::Value>,
     app_store: &AppStoreReducer,
     server_id: &str,
     params: &ThreadStreamStateChangedParams,
@@ -2507,16 +3329,47 @@ fn handle_stream_state_change(
     apply_stream_change_to_conversation_state(&mut cached_state, params).map_err(|error| {
         match error {
             ConversationStreamApplyError::NoCachedState => StreamHandleError::NoCachedState,
-            ConversationStreamApplyError::VersionGap { .. } => StreamHandleError::VersionGap,
             ConversationStreamApplyError::PatchFailed(error) => {
                 StreamHandleError::PatchFailed(error.to_string())
             }
         }
     })?;
 
-    let (_, conversation_state) = cached_state
+    let conversation_state = cached_state
         .as_ref()
         .expect("cached state should exist after successful stream apply");
+
+    if let StreamChange::Patches { patches } = &params.change
+        && let Some(summary) = summarize_incremental_ipc_patches(patches)
+    {
+        match try_apply_incremental_ipc_patch_burst(
+            app_store,
+            server_id,
+            &params.conversation_id,
+            conversation_state,
+            &summary,
+        ) {
+            Ok(true) => {
+                trace!(
+                    "IPC: applied incremental patch burst for thread={} turns={:?} requests_changed={}",
+                    params.conversation_id, summary.affected_turn_indices, summary.requests_changed
+                );
+                cache.insert(
+                    params.conversation_id.clone(),
+                    cached_state.expect("cached state should exist after successful stream apply"),
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                debug!(
+                    "IPC: incremental patch burst fallback for thread={}: {}",
+                    params.conversation_id, error
+                );
+            }
+        }
+    }
+
     let ThreadProjection {
         mut snapshot,
         pending_approvals,
@@ -2730,9 +3583,24 @@ fn approval_response_json(
 mod mobile_client_tests {
     use super::*;
     use crate::conversation::ConversationItemContent;
+    use crate::store::AppUpdate;
+    use crate::store::updates::ThreadStreamingDeltaKind;
     use crate::types::ThreadSummaryStatus;
     use serde_json::json;
     use std::path::PathBuf;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    fn drain_app_updates(rx: &mut tokio::sync::broadcast::Receiver<AppUpdate>) -> Vec<AppUpdate> {
+        let mut updates = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        updates
+    }
 
     fn make_thread_info(id: &str) -> ThreadInfo {
         ThreadInfo {
@@ -2782,6 +3650,10 @@ mod mobile_client_tests {
             reasoning_effort: Some("high".to_string()),
             items: Vec::new(),
             local_overlay_items: Vec::new(),
+            queued_follow_ups: vec![QueuedFollowUpPreview {
+                id: "queued-1".to_string(),
+                text: "follow-up".to_string(),
+            }],
             active_turn_id: Some("turn-1".to_string()),
             context_tokens_used: Some(12_345),
             model_context_window: Some(200_000),
@@ -2798,6 +3670,7 @@ mod mobile_client_tests {
 
         assert_eq!(target.model.as_deref(), Some("gpt-5"));
         assert_eq!(target.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(target.queued_follow_ups, source.queued_follow_ups);
         assert_eq!(target.active_turn_id, None);
         assert_eq!(target.context_tokens_used, Some(12_345));
         assert_eq!(target.model_context_window, Some(200_000));
@@ -2820,6 +3693,7 @@ mod mobile_client_tests {
     #[test]
     fn handle_stream_state_change_streams_patches_and_updates_ipc_request_state() {
         let app_store = AppStoreReducer::new();
+        let mut updates = app_store.subscribe();
         let mut cache = HashMap::new();
         let thread_id = "thread-1";
         let server_id = "srv";
@@ -2830,7 +3704,7 @@ mod mobile_client_tests {
 
         let snapshot_params = ThreadStreamStateChangedParams {
             conversation_id: thread_id.to_string(),
-            version: 1,
+            version: 5,
             change: StreamChange::Snapshot {
                 conversation_state: json!({
                     "latestModel": "gpt-5.4",
@@ -2867,6 +3741,7 @@ mod mobile_client_tests {
         };
 
         handle_stream_state_change(&mut cache, &app_store, server_id, &snapshot_params).unwrap();
+        drain_app_updates(&mut updates);
 
         let snapshot = app_store.snapshot();
         let thread = snapshot.threads.get(&key).unwrap();
@@ -2884,7 +3759,7 @@ mod mobile_client_tests {
 
         let text_patch = ThreadStreamStateChangedParams {
             conversation_id: thread_id.to_string(),
-            version: 2,
+            version: 5,
             change: StreamChange::Patches {
                 patches: vec![
                     codex_ipc::ImmerPatch {
@@ -2909,6 +3784,21 @@ mod mobile_client_tests {
 
         handle_stream_state_change(&mut cache, &app_store, server_id, &text_patch).unwrap();
 
+        let emitted = drain_app_updates(&mut updates);
+        assert!(emitted.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadStreamingDelta {
+                key: emitted_key,
+                item_id,
+                kind: ThreadStreamingDeltaKind::AssistantText,
+                text,
+            } if emitted_key == &key && item_id == "assistant-1" && text == "lo"
+        )));
+        assert!(!emitted.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadUpserted { thread, .. } if thread.key == key
+        )));
+
         let snapshot = app_store.snapshot();
         let thread = snapshot.threads.get(&key).unwrap();
         assert_eq!(thread.active_turn_id.as_deref(), Some("turn-1"));
@@ -2923,7 +3813,7 @@ mod mobile_client_tests {
 
         let completion_patch = ThreadStreamStateChangedParams {
             conversation_id: thread_id.to_string(),
-            version: 3,
+            version: 5,
             change: StreamChange::Patches {
                 patches: vec![codex_ipc::ImmerPatch {
                     op: codex_ipc::ImmerOp::Replace,
@@ -2938,6 +3828,12 @@ mod mobile_client_tests {
         };
 
         handle_stream_state_change(&mut cache, &app_store, server_id, &completion_patch).unwrap();
+
+        let completion_updates = drain_app_updates(&mut updates);
+        assert!(completion_updates.iter().any(|update| matches!(
+            update,
+            AppUpdate::ThreadStateUpdated { state, .. } if state.key == key
+        )));
 
         let snapshot = app_store.snapshot();
         let thread = snapshot.threads.get(&key).unwrap();
@@ -2994,12 +3890,12 @@ mod mobile_client_tests {
         };
         let mut cache = HashMap::from([(
             thread_id.to_string(),
-            (1, seed_conversation_state_from_thread(&thread)),
+            seed_conversation_state_from_thread(&thread),
         )]);
 
         let text_patch = ThreadStreamStateChangedParams {
             conversation_id: thread_id.to_string(),
-            version: 2,
+            version: 5,
             change: StreamChange::Patches {
                 patches: vec![codex_ipc::ImmerPatch {
                     op: codex_ipc::ImmerOp::Replace,
@@ -3026,6 +3922,191 @@ mod mobile_client_tests {
                 _ => None,
             }),
             Some("hello")
+        );
+    }
+
+    #[test]
+    fn handle_stream_state_change_applies_same_protocol_version_patch_bursts() {
+        let app_store = AppStoreReducer::new();
+        let mut cache = HashMap::new();
+        let thread_id = "thread-1";
+        let server_id = "srv";
+        let key = ThreadKey {
+            server_id: server_id.to_string(),
+            thread_id: thread_id.to_string(),
+        };
+
+        let snapshot_params = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Snapshot {
+                conversation_state: json!({
+                    "turns": [
+                        {
+                            "turnId": "turn-1",
+                            "status": "inProgress",
+                            "params": {
+                                "input": [
+                                    { "type": "text", "text": "hello", "textElements": [] }
+                                ]
+                            },
+                            "items": [
+                                { "id": "assistant-1", "type": "agentMessage", "text": "hel" }
+                            ]
+                        }
+                    ],
+                    "requests": []
+                }),
+            },
+        };
+        handle_stream_state_change(&mut cache, &app_store, server_id, &snapshot_params).unwrap();
+
+        let first_text_patch = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![codex_ipc::ImmerPatch {
+                    op: codex_ipc::ImmerOp::Replace,
+                    path: vec![
+                        codex_ipc::ImmerPathSegment::Key("turns".to_string()),
+                        codex_ipc::ImmerPathSegment::Index(0),
+                        codex_ipc::ImmerPathSegment::Key("items".to_string()),
+                        codex_ipc::ImmerPathSegment::Index(0),
+                        codex_ipc::ImmerPathSegment::Key("text".to_string()),
+                    ],
+                    value: Some(json!("hell")),
+                }],
+            },
+        };
+        let second_text_patch = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![codex_ipc::ImmerPatch {
+                    op: codex_ipc::ImmerOp::Replace,
+                    path: vec![
+                        codex_ipc::ImmerPathSegment::Key("turns".to_string()),
+                        codex_ipc::ImmerPathSegment::Index(0),
+                        codex_ipc::ImmerPathSegment::Key("items".to_string()),
+                        codex_ipc::ImmerPathSegment::Index(0),
+                        codex_ipc::ImmerPathSegment::Key("text".to_string()),
+                    ],
+                    value: Some(json!("hello")),
+                }],
+            },
+        };
+        handle_stream_state_change(&mut cache, &app_store, server_id, &first_text_patch).unwrap();
+        handle_stream_state_change(&mut cache, &app_store, server_id, &second_text_patch).unwrap();
+
+        let snapshot = app_store.snapshot();
+        let thread = snapshot.threads.get(&key).unwrap();
+        assert_eq!(
+            thread.items.iter().find_map(|item| match &item.content {
+                ConversationItemContent::Assistant(data) => Some(data.text.as_str()),
+                _ => None,
+            }),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn handle_stream_state_change_marks_shell_turn_active_before_real_turn_id_arrives() {
+        let app_store = AppStoreReducer::new();
+        let mut cache = HashMap::new();
+        let thread_id = "thread-1";
+        let server_id = "srv";
+        let key = ThreadKey {
+            server_id: server_id.to_string(),
+            thread_id: thread_id.to_string(),
+        };
+
+        let snapshot_params = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Snapshot {
+                conversation_state: json!({
+                    "turns": [],
+                    "requests": []
+                }),
+            },
+        };
+        handle_stream_state_change(&mut cache, &app_store, server_id, &snapshot_params).unwrap();
+
+        let add_shell_turn_patch = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![codex_ipc::ImmerPatch {
+                    op: codex_ipc::ImmerOp::Add,
+                    path: vec![
+                        codex_ipc::ImmerPathSegment::Key("turns".to_string()),
+                        codex_ipc::ImmerPathSegment::Index(0),
+                    ],
+                    value: Some(json!({
+                        "status": "inProgress",
+                        "items": [],
+                        "params": { "input": [] },
+                        "interruptedCommandExecutionItemIds": []
+                    })),
+                }],
+            },
+        };
+        handle_stream_state_change(&mut cache, &app_store, server_id, &add_shell_turn_patch)
+            .unwrap();
+
+        let snapshot = app_store.snapshot();
+        let thread = snapshot.threads.get(&key).unwrap();
+        assert_eq!(thread.active_turn_id.as_deref(), Some("ipc-turn-0"));
+        assert_eq!(thread.info.status, ThreadSummaryStatus::Active);
+
+        let finalize_turn_identity_patch = ThreadStreamStateChangedParams {
+            conversation_id: thread_id.to_string(),
+            version: 5,
+            change: StreamChange::Patches {
+                patches: vec![
+                    codex_ipc::ImmerPatch {
+                        op: codex_ipc::ImmerOp::Replace,
+                        path: vec![
+                            codex_ipc::ImmerPathSegment::Key("turns".to_string()),
+                            codex_ipc::ImmerPathSegment::Index(0),
+                            codex_ipc::ImmerPathSegment::Key("turnId".to_string()),
+                        ],
+                        value: Some(json!("turn-1")),
+                    },
+                    codex_ipc::ImmerPatch {
+                        op: codex_ipc::ImmerOp::Add,
+                        path: vec![
+                            codex_ipc::ImmerPathSegment::Key("turns".to_string()),
+                            codex_ipc::ImmerPathSegment::Index(0),
+                            codex_ipc::ImmerPathSegment::Key("items".to_string()),
+                            codex_ipc::ImmerPathSegment::Index(0),
+                        ],
+                        value: Some(json!({
+                            "id": "assistant-1",
+                            "type": "agentMessage",
+                            "text": "h"
+                        })),
+                    },
+                ],
+            },
+        };
+        handle_stream_state_change(
+            &mut cache,
+            &app_store,
+            server_id,
+            &finalize_turn_identity_patch,
+        )
+        .unwrap();
+
+        let snapshot = app_store.snapshot();
+        let thread = snapshot.threads.get(&key).unwrap();
+        assert_eq!(thread.active_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            thread.items.iter().find_map(|item| match &item.content {
+                ConversationItemContent::Assistant(data) => Some(data.text.as_str()),
+                _ => None,
+            }),
+            Some("h")
         );
     }
 }

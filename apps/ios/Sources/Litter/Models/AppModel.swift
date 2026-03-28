@@ -148,10 +148,46 @@ final class AppModel {
 
     private func handleStoreUpdate(_ update: AppStoreUpdateRecord) async {
         switch update {
-        case .threadChanged(let key):
-            await refreshThreadSnapshot(key: key)
-        case .threadRemoved(let key):
-            removeThreadSnapshot(for: key)
+        case .threadUpserted(let thread, let sessionSummary, let agentDirectoryVersion):
+            applyThreadUpsert(
+                thread,
+                sessionSummary: sessionSummary,
+                agentDirectoryVersion: agentDirectoryVersion
+            )
+        case .threadStateUpdated(let state, let sessionSummary, let agentDirectoryVersion):
+            applyThreadStateUpdated(
+                state,
+                sessionSummary: sessionSummary,
+                agentDirectoryVersion: agentDirectoryVersion
+            )
+        case .threadItemUpserted(let key, let item):
+            if !applyThreadItemUpsert(key: key, item: item) {
+                await refreshThreadSnapshot(key: key)
+            }
+        case .threadCommandExecutionUpdated(
+            let key,
+            let itemId,
+            let status,
+            let exitCode,
+            let durationMs,
+            let processId
+        ):
+            if !applyThreadCommandExecutionUpdated(
+                key: key,
+                itemId: itemId,
+                status: status,
+                exitCode: exitCode,
+                durationMs: durationMs,
+                processId: processId
+            ) {
+                await refreshThreadSnapshot(key: key)
+            }
+        case .threadStreamingDelta(let key, let itemId, let kind, let text):
+            if !applyThreadStreamingDelta(key: key, itemId: itemId, kind: kind, text: text) {
+                await refreshThreadSnapshot(key: key)
+            }
+        case .threadRemoved(let key, let agentDirectoryVersion):
+            removeThreadSnapshot(for: key, agentDirectoryVersion: agentDirectoryVersion)
         case .activeThreadChanged(let key):
             updateActiveThread(key)
             if let key, snapshot?.threadSnapshot(for: key) == nil {
@@ -219,11 +255,149 @@ final class AppModel {
         lastError = nil
     }
 
-    private func removeThreadSnapshot(for key: ThreadKey) {
+    private func applyThreadUpsert(
+        _ thread: AppThreadSnapshot,
+        sessionSummary: AppSessionSummary,
+        agentDirectoryVersion: UInt64
+    ) {
+        guard var snapshot else { return }
+
+        if let index = snapshot.threads.firstIndex(where: { $0.key == thread.key }) {
+            snapshot.threads[index] = thread
+        } else {
+            snapshot.threads.append(thread)
+        }
+
+        if let index = snapshot.sessionSummaries.firstIndex(where: { $0.key == sessionSummary.key }) {
+            snapshot.sessionSummaries[index] = sessionSummary
+        } else {
+            snapshot.sessionSummaries.append(sessionSummary)
+        }
+        snapshot.sessionSummaries.sort(by: Self.sessionSummarySort(lhs:rhs:))
+        snapshot.agentDirectoryVersion = agentDirectoryVersion
+        self.snapshot = snapshot
+        lastError = nil
+    }
+
+    private func applyThreadStateUpdated(
+        _ state: AppThreadStateRecord,
+        sessionSummary: AppSessionSummary,
+        agentDirectoryVersion: UInt64
+    ) {
+        guard var snapshot else { return }
+        guard let threadIndex = snapshot.threads.firstIndex(where: { $0.key == state.key }) else {
+            return
+        }
+
+        var thread = snapshot.threads[threadIndex]
+        thread.info = state.info
+        thread.model = state.model
+        thread.reasoningEffort = state.reasoningEffort
+        thread.activeTurnId = state.activeTurnId
+        thread.contextTokensUsed = state.contextTokensUsed
+        thread.modelContextWindow = state.modelContextWindow
+        thread.rateLimitsJson = state.rateLimitsJson
+        thread.realtimeSessionId = state.realtimeSessionId
+        snapshot.threads[threadIndex] = thread
+
+        if let index = snapshot.sessionSummaries.firstIndex(where: { $0.key == sessionSummary.key }) {
+            snapshot.sessionSummaries[index] = sessionSummary
+        } else {
+            snapshot.sessionSummaries.append(sessionSummary)
+        }
+        snapshot.sessionSummaries.sort(by: Self.sessionSummarySort(lhs:rhs:))
+        snapshot.agentDirectoryVersion = agentDirectoryVersion
+        self.snapshot = snapshot
+        lastError = nil
+    }
+
+    private func applyThreadItemUpsert(
+        key: ThreadKey,
+        item: HydratedConversationItem
+    ) -> Bool {
+        guard var snapshot else { return false }
+        guard let threadIndex = snapshot.threads.firstIndex(where: { $0.key == key }) else {
+            return false
+        }
+
+        var thread = snapshot.threads[threadIndex]
+        if let itemIndex = thread.hydratedConversationItems.firstIndex(where: { $0.id == item.id }) {
+            thread.hydratedConversationItems[itemIndex] = item
+        } else {
+            let insertionIndex = Self.insertionIndex(for: item, in: thread.hydratedConversationItems)
+            thread.hydratedConversationItems.insert(item, at: insertionIndex)
+        }
+        snapshot.threads[threadIndex] = thread
+        self.snapshot = snapshot
+        lastError = nil
+        return true
+    }
+
+    private func applyThreadCommandExecutionUpdated(
+        key: ThreadKey,
+        itemId: String,
+        status: AppOperationStatus,
+        exitCode: Int32?,
+        durationMs: Int64?,
+        processId: String?
+    ) -> Bool {
+        guard var snapshot else { return false }
+        guard let threadIndex = snapshot.threads.firstIndex(where: { $0.key == key }) else {
+            return false
+        }
+        guard let itemIndex = snapshot.threads[threadIndex].hydratedConversationItems.firstIndex(where: { $0.id == itemId }) else {
+            return false
+        }
+
+        var item = snapshot.threads[threadIndex].hydratedConversationItems[itemIndex]
+        guard case .commandExecution(var data) = item.content else {
+            return false
+        }
+        data.status = status
+        data.exitCode = exitCode
+        data.durationMs = durationMs
+        data.processId = processId
+        item.content = .commandExecution(data)
+        snapshot.threads[threadIndex].hydratedConversationItems[itemIndex] = item
+        self.snapshot = snapshot
+        lastError = nil
+        return true
+    }
+
+    private func applyThreadStreamingDelta(
+        key: ThreadKey,
+        itemId: String,
+        kind: AppThreadStreamingDeltaKind,
+        text: String
+    ) -> Bool {
+        guard var snapshot else { return false }
+        guard let threadIndex = snapshot.threads.firstIndex(where: { $0.key == key }) else {
+            return false
+        }
+        guard let itemIndex = snapshot.threads[threadIndex].hydratedConversationItems.firstIndex(where: { $0.id == itemId }) else {
+            return false
+        }
+
+        var item = snapshot.threads[threadIndex].hydratedConversationItems[itemIndex]
+        guard let updatedContent = Self.applyingStreamingDelta(kind: kind, text: text, to: item.content) else {
+            return false
+        }
+        item.content = updatedContent
+        snapshot.threads[threadIndex].hydratedConversationItems[itemIndex] = item
+        self.snapshot = snapshot
+        lastError = nil
+        return true
+    }
+
+    private func removeThreadSnapshot(for key: ThreadKey, agentDirectoryVersion: UInt64? = nil) {
         guard var snapshot else { return }
         snapshot.threads.removeAll { $0.key == key }
+        snapshot.sessionSummaries.removeAll { $0.key == key }
         if snapshot.activeThread == key {
             snapshot.activeThread = nil
+        }
+        if let agentDirectoryVersion {
+            snapshot.agentDirectoryVersion = agentDirectoryVersion
         }
         self.snapshot = snapshot
     }
@@ -232,6 +406,69 @@ final class AppModel {
         guard var snapshot else { return }
         snapshot.activeThread = key
         self.snapshot = snapshot
+    }
+
+    private static func applyingStreamingDelta(
+        kind: AppThreadStreamingDeltaKind,
+        text: String,
+        to content: HydratedConversationItemContent
+    ) -> HydratedConversationItemContent? {
+        switch (kind, content) {
+        case (.assistantText, .assistant(var data)):
+            data.text += text
+            return .assistant(data)
+        case (.reasoningText, .reasoning(var data)):
+            if data.content.isEmpty {
+                data.content.append(text)
+            } else {
+                data.content[data.content.count - 1] += text
+            }
+            return .reasoning(data)
+        case (.planText, .proposedPlan(var data)):
+            data.content += text
+            return .proposedPlan(data)
+        case (.commandOutput, .commandExecution(var data)):
+            data.output = (data.output ?? "") + text
+            return .commandExecution(data)
+        case (.mcpProgress, .mcpToolCall(var data)):
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                data.progressMessages.append(text)
+            }
+            return .mcpToolCall(data)
+        default:
+            return nil
+        }
+    }
+
+    private static func sessionSummarySort(lhs: AppSessionSummary, rhs: AppSessionSummary) -> Bool {
+        let lhsUpdatedAt = lhs.updatedAt ?? Int64.min
+        let rhsUpdatedAt = rhs.updatedAt ?? Int64.min
+        if lhsUpdatedAt != rhsUpdatedAt {
+            return lhsUpdatedAt > rhsUpdatedAt
+        }
+        if lhs.key.serverId != rhs.key.serverId {
+            return lhs.key.serverId < rhs.key.serverId
+        }
+        return lhs.key.threadId < rhs.key.threadId
+    }
+
+    private static func insertionIndex(
+        for item: HydratedConversationItem,
+        in items: [HydratedConversationItem]
+    ) -> Int {
+        guard let targetTurnIndex = item.sourceTurnIndex.map(Int.init) else {
+            return items.count
+        }
+        if let lastSameTurnIndex = items.lastIndex(where: { $0.sourceTurnIndex.map(Int.init) == targetTurnIndex }) {
+            return lastSameTurnIndex + 1
+        }
+        if let nextTurnIndex = items.firstIndex(where: {
+            guard let sourceTurnIndex = $0.sourceTurnIndex.map(Int.init) else { return false }
+            return sourceTurnIndex > targetTurnIndex
+        }) {
+            return nextTurnIndex
+        }
+        return items.count
     }
 
     func queueComposerPrefill(threadKey: ThreadKey, text: String) {

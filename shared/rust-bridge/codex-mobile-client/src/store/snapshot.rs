@@ -148,11 +148,18 @@ pub struct ThreadSnapshot {
     pub reasoning_effort: Option<String>,
     pub items: Vec<ConversationItem>,
     pub local_overlay_items: Vec<ConversationItem>,
+    pub queued_follow_ups: Vec<QueuedFollowUpPreview>,
     pub active_turn_id: Option<String>,
     pub context_tokens_used: Option<u64>,
     pub model_context_window: Option<u64>,
     pub rate_limits: Option<RateLimits>,
     pub realtime_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedFollowUpPreview {
+    pub id: String,
+    pub text: String,
 }
 
 impl ThreadSnapshot {
@@ -168,6 +175,7 @@ impl ThreadSnapshot {
             reasoning_effort: None,
             items: Vec::new(),
             local_overlay_items: Vec::new(),
+            queued_follow_ups: Vec::new(),
             active_turn_id: None,
             context_tokens_used: None,
             model_context_window: None,
