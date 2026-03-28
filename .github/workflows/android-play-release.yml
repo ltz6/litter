@@ -1,16 +1,6 @@
 name: Android Play Release
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - Makefile
-      - .github/workflows/android-play-release.yml
-      - apps/android/**
-      - shared/rust-bridge/**
-      - patches/codex/**
-      - tools/scripts/build-android-rust.sh
   workflow_dispatch:
 
 permissions:

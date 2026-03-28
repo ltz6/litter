@@ -1,15 +1,6 @@
 name: iOS TestFlight Release
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - Makefile
-      - .github/workflows/ios-testflight.yml
-      - apps/ios/**
-      - shared/rust-bridge/**
-      - patches/codex/**
   workflow_dispatch:
     inputs:
       beta_group_names:
