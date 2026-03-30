@@ -7,15 +7,13 @@ pub mod updates;
 mod voice;
 
 pub use boundary::{
-    AppServerConnectionProgress, AppServerConnectionStep, AppServerConnectionStepKind,
-    AppServerConnectionStepState, AppServerHealth, AppServerSnapshot, AppSessionSummary,
-    AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppThreadStateRecord,
-    AppThreadStreamingDeltaKind, AppVoiceSessionSnapshot,
+    AppServerHealth, AppServerSnapshot, AppSessionSummary, AppSnapshotRecord,
+    AppThreadSnapshot, AppThreadStateRecord,
 };
 pub use reducer::AppStoreReducer;
 pub use snapshot::{
-    AppSnapshot, ServerConnectionProgressSnapshot, ServerConnectionStepKind,
-    ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot, ServerSnapshot,
-    QueuedFollowUpPreview, ThreadSnapshot, VoiceSessionSnapshot,
+    AppSnapshot, AppConnectionProgressSnapshot, AppConnectionStepKind,
+    AppConnectionStepSnapshot, AppConnectionStepState, AppQueuedFollowUpPreview,
+    AppVoiceSessionSnapshot, ServerHealthSnapshot, ServerSnapshot, ThreadSnapshot,
 };
-pub use updates::{AppUpdate, ThreadStreamingDeltaKind};
+pub use updates::{AppStoreUpdateRecord, ThreadStreamingDeltaKind};

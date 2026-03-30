@@ -1,10 +1,10 @@
 use crate::conversation_uniffi::HydratedConversationItem;
-use crate::types::{PendingApproval, PendingUserInputRequest, ThreadKey, generated};
-use crate::uniffi_shared::{AppOperationStatus, AppVoiceHandoffRequest, AppVoiceTranscriptUpdate};
+use crate::types::{PendingApproval, PendingUserInputRequest, ThreadKey};
+use crate::types::{AppOperationStatus, AppVoiceHandoffRequest, AppVoiceTranscriptUpdate};
 
 use super::boundary::{AppSessionSummary, AppThreadSnapshot, AppThreadStateRecord};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ThreadStreamingDeltaKind {
     AssistantText,
     ReasoningText,
@@ -13,8 +13,8 @@ pub enum ThreadStreamingDeltaKind {
     McpProgress,
 }
 
-#[derive(Debug, Clone)]
-pub enum AppUpdate {
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AppStoreUpdateRecord {
     FullResync,
     ServerChanged {
         server_id: String,
@@ -77,18 +77,18 @@ pub enum AppUpdate {
     },
     RealtimeStarted {
         key: ThreadKey,
-        notification: generated::ThreadRealtimeStartedNotification,
+        notification: crate::types::AppRealtimeStartedNotification,
     },
     RealtimeOutputAudioDelta {
         key: ThreadKey,
-        notification: generated::ThreadRealtimeOutputAudioDeltaNotification,
+        notification: crate::types::AppRealtimeOutputAudioDeltaNotification,
     },
     RealtimeError {
         key: ThreadKey,
-        notification: generated::ThreadRealtimeErrorNotification,
+        notification: crate::types::AppRealtimeErrorNotification,
     },
     RealtimeClosed {
         key: ThreadKey,
-        notification: generated::ThreadRealtimeClosedNotification,
+        notification: crate::types::AppRealtimeClosedNotification,
     },
 }

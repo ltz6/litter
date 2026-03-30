@@ -2,51 +2,12 @@ use std::hash::{Hash, Hasher};
 
 use crate::conversation_uniffi::HydratedConversationItem;
 use crate::types::{PendingApproval, PendingUserInputRequest, ThreadInfo, ThreadKey};
-use crate::uniffi_shared::{
-    AppOperationStatus, AppSubagentStatus, AppVoiceHandoffRequest, AppVoiceSessionPhase,
-    AppVoiceTranscriptEntry, AppVoiceTranscriptUpdate,
-};
+use crate::types::AppSubagentStatus;
 
 use super::snapshot::{
-    AppSnapshot, ServerConnectionProgressSnapshot, ServerConnectionStepKind,
-    ServerConnectionStepSnapshot, ServerConnectionStepState, ServerHealthSnapshot, ServerSnapshot,
-    ThreadSnapshot,
+    AppSnapshot, AppQueuedFollowUpPreview, AppConnectionProgressSnapshot, ServerHealthSnapshot,
+    ServerSnapshot, ThreadSnapshot, AppVoiceSessionSnapshot,
 };
-use super::updates::{AppUpdate, ThreadStreamingDeltaKind};
-
-#[derive(Debug, Clone, uniffi::Enum)]
-pub enum AppServerConnectionStepKind {
-    ConnectingToSsh,
-    FindingCodex,
-    InstallingCodex,
-    StartingAppServer,
-    OpeningTunnel,
-    Connected,
-}
-
-#[derive(Debug, Clone, uniffi::Enum)]
-pub enum AppServerConnectionStepState {
-    Pending,
-    InProgress,
-    Completed,
-    Failed,
-    AwaitingUserInput,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct AppServerConnectionStep {
-    pub kind: AppServerConnectionStepKind,
-    pub state: AppServerConnectionStepState,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct AppServerConnectionProgress {
-    pub steps: Vec<AppServerConnectionStep>,
-    pub pending_install: bool,
-    pub terminal_message: Option<String>,
-}
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AppServerSnapshot {
@@ -57,11 +18,11 @@ pub struct AppServerSnapshot {
     pub is_local: bool,
     pub has_ipc: bool,
     pub health: AppServerHealth,
-    pub account: Option<crate::types::generated::Account>,
+    pub account: Option<crate::types::Account>,
     pub requires_openai_auth: bool,
-    pub rate_limits: Option<crate::types::generated::RateLimitSnapshot>,
-    pub available_models: Option<Vec<crate::types::generated::Model>>,
-    pub connection_progress: Option<AppServerConnectionProgress>,
+    pub rate_limits: Option<crate::types::RateLimitSnapshot>,
+    pub available_models: Option<Vec<crate::types::ModelInfo>>,
+    pub connection_progress: Option<AppConnectionProgressSnapshot>,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -71,12 +32,6 @@ pub enum AppServerHealth {
     Connected,
     Unresponsive,
     Unknown,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct AppQueuedFollowUpPreview {
-    pub id: String,
-    pub text: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -90,7 +45,7 @@ pub struct AppThreadSnapshot {
     pub active_turn_id: Option<String>,
     pub context_tokens_used: Option<u64>,
     pub model_context_window: Option<u64>,
-    pub rate_limits_json: Option<String>,
+    pub rate_limits: Option<crate::types::RateLimits>,
     pub realtime_session_id: Option<String>,
 }
 
@@ -104,7 +59,7 @@ pub struct AppThreadStateRecord {
     pub active_turn_id: Option<String>,
     pub context_tokens_used: Option<u64>,
     pub model_context_window: Option<u64>,
-    pub rate_limits_json: Option<String>,
+    pub rate_limits: Option<crate::types::RateLimits>,
     pub realtime_session_id: Option<String>,
 }
 
@@ -121,7 +76,7 @@ impl TryFrom<&super::snapshot::ThreadSnapshot> for AppThreadSnapshot {
 
     fn try_from(thread: &super::snapshot::ThreadSnapshot) -> Result<Self, Self::Error> {
         let hydrated_conversation_items =
-            merged_hydrated_items(thread.items.clone(), thread.local_overlay_items.clone());
+            merged_hydrated_items(&thread.items, &thread.local_overlay_items);
         Ok(Self {
             key: thread.key.clone(),
             info: thread.info.clone(),
@@ -139,12 +94,7 @@ impl TryFrom<&super::snapshot::ThreadSnapshot> for AppThreadSnapshot {
             active_turn_id: thread.active_turn_id.clone(),
             context_tokens_used: thread.context_tokens_used,
             model_context_window: thread.model_context_window,
-            rate_limits_json: thread
-                .rate_limits
-                .clone()
-                .map(|limits| serde_json::to_string(&limits))
-                .transpose()
-                .map_err(|error| format!("serialize rate limits: {error}"))?,
+            rate_limits: thread.rate_limits.clone(),
             realtime_session_id: thread.realtime_session_id.clone(),
         })
     }
@@ -170,36 +120,38 @@ impl TryFrom<&super::snapshot::ThreadSnapshot> for AppThreadStateRecord {
             active_turn_id: thread.active_turn_id.clone(),
             context_tokens_used: thread.context_tokens_used,
             model_context_window: thread.model_context_window,
-            rate_limits_json: thread
-                .rate_limits
-                .clone()
-                .map(|limits| serde_json::to_string(&limits))
-                .transpose()
-                .map_err(|error| format!("serialize rate limits: {error}"))?,
+            rate_limits: thread.rate_limits.clone(),
             realtime_session_id: thread.realtime_session_id.clone(),
         })
     }
 }
 
 fn merged_hydrated_items(
-    items: Vec<crate::conversation::ConversationItem>,
-    local_overlay_items: Vec<crate::conversation::ConversationItem>,
+    items: &[crate::conversation_uniffi::HydratedConversationItem],
+    local_overlay_items: &[crate::conversation_uniffi::HydratedConversationItem],
 ) -> Vec<HydratedConversationItem> {
-    let mut merged = items;
+    let mut merged = Vec::with_capacity(items.len() + local_overlay_items.len());
+    merged.extend(items.iter().cloned().map(Into::into));
+
+    let mut selected_overlays: Vec<&crate::conversation_uniffi::HydratedConversationItem> = Vec::new();
     for overlay in local_overlay_items {
-        if merged
+        if items
             .iter()
-            .all(|existing| !same_overlay_semantics(&overlay, existing))
+            .all(|existing| !same_overlay_semantics(overlay, existing))
+            && selected_overlays
+                .iter()
+                .all(|existing| !same_overlay_semantics(overlay, existing))
         {
-            merged.push(overlay);
+            selected_overlays.push(overlay);
         }
     }
-    merged.into_iter().map(Into::into).collect()
+    merged.extend(selected_overlays.into_iter().cloned().map(Into::into));
+    merged
 }
 
 fn same_overlay_semantics(
-    lhs: &crate::conversation::ConversationItem,
-    rhs: &crate::conversation::ConversationItem,
+    lhs: &crate::conversation_uniffi::HydratedConversationItem,
+    rhs: &crate::conversation_uniffi::HydratedConversationItem,
 ) -> bool {
     if lhs.id == rhs.id {
         return true;
@@ -207,8 +159,8 @@ fn same_overlay_semantics(
 
     match (&lhs.content, &rhs.content) {
         (
-            crate::conversation::ConversationItemContent::UserInputResponse(lhs_data),
-            crate::conversation::ConversationItemContent::UserInputResponse(rhs_data),
+            crate::conversation_uniffi::HydratedConversationItemContent::UserInputResponse(lhs_data),
+            crate::conversation_uniffi::HydratedConversationItemContent::UserInputResponse(rhs_data),
         ) => lhs.source_turn_id == rhs.source_turn_id && lhs_data == rhs_data,
         _ => false,
     }
@@ -233,16 +185,6 @@ pub struct AppSessionSummary {
     pub has_active_turn: bool,
     pub is_subagent: bool,
     pub is_fork: bool,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct AppVoiceSessionSnapshot {
-    pub active_thread: Option<ThreadKey>,
-    pub session_id: Option<String>,
-    pub phase: Option<AppVoiceSessionPhase>,
-    pub last_error: Option<String>,
-    pub transcript_entries: Vec<AppVoiceTranscriptEntry>,
-    pub handoff_thread_key: Option<ThreadKey>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -279,7 +221,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
                 requires_openai_auth: server.requires_openai_auth,
                 rate_limits: server.rate_limits,
                 available_models: server.available_models,
-                connection_progress: server.connection_progress.map(Into::into),
+                connection_progress: server.connection_progress,
             })
             .collect::<Vec<_>>();
         servers.sort_by(|lhs, rhs| lhs.server_id.cmp(&rhs.server_id));
@@ -299,14 +241,7 @@ impl TryFrom<AppSnapshot> for AppSnapshotRecord {
             active_thread: snapshot.active_thread,
             pending_approvals: snapshot.pending_approvals,
             pending_user_inputs: snapshot.pending_user_inputs,
-            voice_session: AppVoiceSessionSnapshot {
-                active_thread: snapshot.voice_session.active_thread,
-                session_id: snapshot.voice_session.session_id,
-                phase: snapshot.voice_session.phase,
-                last_error: snapshot.voice_session.last_error,
-                transcript_entries: snapshot.voice_session.transcript_entries,
-                handoff_thread_key: snapshot.voice_session.handoff_thread_key,
-            },
+            voice_session: snapshot.voice_session,
         })
     }
 }
@@ -325,25 +260,28 @@ pub(crate) fn app_session_summary(
     thread: &ThreadSnapshot,
     server: Option<&ServerSnapshot>,
 ) -> AppSessionSummary {
-    let preview = thread.info.preview.clone().unwrap_or_default();
+    let preview = thread.info.preview.as_deref().unwrap_or_default();
     let title = {
-        let explicit_title = thread.info.title.clone().unwrap_or_default();
-        let trimmed_title = explicit_title.trim();
-        if !trimmed_title.is_empty() {
-            trimmed_title.to_string()
-        } else {
-            let trimmed_preview = preview.trim();
-            if !trimmed_preview.is_empty() {
-                trimmed_preview.to_string()
-            } else {
-                "Untitled session".to_string()
-            }
-        }
+        thread
+            .info
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let trimmed_preview = preview.trim();
+                (!trimmed_preview.is_empty()).then(|| trimmed_preview.to_string())
+            })
+            .unwrap_or_else(|| "Untitled session".to_string())
     };
-    let parent_thread_id = thread.info.parent_thread_id.clone().and_then(|value| {
-        let trimmed = value.trim().to_string();
-        (!trimmed.is_empty()).then_some(trimmed)
-    });
+    let parent_thread_id = thread
+        .info
+        .parent_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let has_agent_label = thread
         .info
         .agent_nickname
@@ -365,7 +303,7 @@ pub(crate) fn app_session_summary(
             .map(|server| server.host.clone())
             .unwrap_or_else(|| thread.key.server_id.clone()),
         title,
-        preview,
+        preview: preview.to_string(),
         cwd: thread.info.cwd.clone().unwrap_or_default(),
         model: thread
             .info
@@ -413,8 +351,7 @@ pub(crate) fn project_thread_update(
     };
     let thread_snapshot = AppThreadSnapshot::try_from(thread)?;
     let session_summary = app_session_summary(thread, snapshot.servers.get(&key.server_id));
-    let agent_directory_version =
-        agent_directory_version(&session_summaries_from_snapshot(snapshot));
+    let agent_directory_version = current_agent_directory_version(snapshot);
     Ok(Some((
         thread_snapshot,
         session_summary,
@@ -431,8 +368,7 @@ pub(crate) fn project_thread_state_update(
     };
     let thread_state = AppThreadStateRecord::try_from(thread)?;
     let session_summary = app_session_summary(thread, snapshot.servers.get(&key.server_id));
-    let agent_directory_version =
-        agent_directory_version(&session_summaries_from_snapshot(snapshot));
+    let agent_directory_version = current_agent_directory_version(snapshot);
     Ok(Some((
         thread_state,
         session_summary,
@@ -441,7 +377,45 @@ pub(crate) fn project_thread_state_update(
 }
 
 pub(crate) fn current_agent_directory_version(snapshot: &AppSnapshot) -> u64 {
-    agent_directory_version(&session_summaries_from_snapshot(snapshot))
+    let mut threads = snapshot.threads.values().collect::<Vec<_>>();
+    threads.sort_by(|lhs, rhs| {
+        rhs.info
+            .updated_at
+            .cmp(&lhs.info.updated_at)
+            .then_with(|| lhs.key.server_id.cmp(&rhs.key.server_id))
+            .then_with(|| lhs.key.thread_id.cmp(&rhs.key.thread_id))
+    });
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for thread in threads {
+        thread.key.server_id.hash(&mut hasher);
+        thread.key.thread_id.hash(&mut hasher);
+        thread
+            .info
+            .parent_thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .hash(&mut hasher);
+        thread.info.agent_nickname.hash(&mut hasher);
+        thread.info.agent_role.hash(&mut hasher);
+        agent_display_label(
+            thread.info.agent_nickname.as_deref(),
+            thread.info.agent_role.as_deref(),
+            None,
+        )
+        .hash(&mut hasher);
+        thread
+            .info
+            .agent_status
+            .as_deref()
+            .map(AppSubagentStatus::from_raw)
+            .unwrap_or(AppSubagentStatus::Unknown)
+            .hash(&mut hasher);
+        thread.info.updated_at.hash(&mut hasher);
+        thread.active_turn_id.is_some().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl From<ServerHealthSnapshot> for AppServerHealth {
@@ -452,52 +426,6 @@ impl From<ServerHealthSnapshot> for AppServerHealth {
             ServerHealthSnapshot::Connected => Self::Connected,
             ServerHealthSnapshot::Unresponsive => Self::Unresponsive,
             ServerHealthSnapshot::Unknown(_) => Self::Unknown,
-        }
-    }
-}
-
-impl From<ServerConnectionStepKind> for AppServerConnectionStepKind {
-    fn from(value: ServerConnectionStepKind) -> Self {
-        match value {
-            ServerConnectionStepKind::ConnectingToSsh => Self::ConnectingToSsh,
-            ServerConnectionStepKind::FindingCodex => Self::FindingCodex,
-            ServerConnectionStepKind::InstallingCodex => Self::InstallingCodex,
-            ServerConnectionStepKind::StartingAppServer => Self::StartingAppServer,
-            ServerConnectionStepKind::OpeningTunnel => Self::OpeningTunnel,
-            ServerConnectionStepKind::Connected => Self::Connected,
-        }
-    }
-}
-
-impl From<ServerConnectionStepState> for AppServerConnectionStepState {
-    fn from(value: ServerConnectionStepState) -> Self {
-        match value {
-            ServerConnectionStepState::Pending => Self::Pending,
-            ServerConnectionStepState::InProgress => Self::InProgress,
-            ServerConnectionStepState::Completed => Self::Completed,
-            ServerConnectionStepState::Failed => Self::Failed,
-            ServerConnectionStepState::AwaitingUserInput => Self::AwaitingUserInput,
-            ServerConnectionStepState::Cancelled => Self::Cancelled,
-        }
-    }
-}
-
-impl From<ServerConnectionStepSnapshot> for AppServerConnectionStep {
-    fn from(value: ServerConnectionStepSnapshot) -> Self {
-        Self {
-            kind: value.kind.into(),
-            state: value.state.into(),
-            detail: value.detail,
-        }
-    }
-}
-
-impl From<ServerConnectionProgressSnapshot> for AppServerConnectionProgress {
-    fn from(value: ServerConnectionProgressSnapshot) -> Self {
-        Self {
-            steps: value.steps.into_iter().map(Into::into).collect(),
-            pending_install: value.pending_install,
-            terminal_message: value.terminal_message,
         }
     }
 }
@@ -540,184 +468,80 @@ fn sanitized_label_field(raw: Option<&str>) -> Option<&str> {
     })
 }
 
-#[derive(Debug, Clone, Copy, uniffi::Enum)]
-pub enum AppThreadStreamingDeltaKind {
-    AssistantText,
-    ReasoningText,
-    PlanText,
-    CommandOutput,
-    McpProgress,
-}
+#[cfg(test)]
+mod tests {
+    use super::{
+        agent_directory_version, current_agent_directory_version, session_summaries_from_snapshot,
+    };
+    use crate::store::{AppSnapshot, ThreadSnapshot};
+    use crate::types::{ThreadInfo, ThreadKey, ThreadSummaryStatus};
 
-#[derive(Debug, Clone, uniffi::Enum)]
-pub enum AppStoreUpdateRecord {
-    FullResync,
-    ServerChanged {
-        server_id: String,
-    },
-    ServerRemoved {
-        server_id: String,
-    },
-    ThreadUpserted {
-        thread: AppThreadSnapshot,
-        session_summary: AppSessionSummary,
-        agent_directory_version: u64,
-    },
-    ThreadStateUpdated {
-        state: AppThreadStateRecord,
-        session_summary: AppSessionSummary,
-        agent_directory_version: u64,
-    },
-    ThreadItemUpserted {
-        key: ThreadKey,
-        item: HydratedConversationItem,
-    },
-    ThreadCommandExecutionUpdated {
-        key: ThreadKey,
-        item_id: String,
-        status: AppOperationStatus,
-        exit_code: Option<i32>,
-        duration_ms: Option<i64>,
-        process_id: Option<String>,
-    },
-    ThreadStreamingDelta {
-        key: ThreadKey,
-        item_id: String,
-        kind: AppThreadStreamingDeltaKind,
-        text: String,
-    },
-    ThreadRemoved {
-        key: ThreadKey,
-        agent_directory_version: u64,
-    },
-    ActiveThreadChanged {
-        key: Option<ThreadKey>,
-    },
-    PendingApprovalsChanged,
-    PendingUserInputsChanged,
-    VoiceSessionChanged,
-    RealtimeTranscriptUpdated {
-        key: ThreadKey,
-        update: AppVoiceTranscriptUpdate,
-    },
-    RealtimeHandoffRequested {
-        key: ThreadKey,
-        request: AppVoiceHandoffRequest,
-    },
-    RealtimeSpeechStarted {
-        key: ThreadKey,
-    },
-    RealtimeStarted {
-        key: ThreadKey,
-        notification: crate::types::generated::ThreadRealtimeStartedNotification,
-    },
-    RealtimeOutputAudioDelta {
-        key: ThreadKey,
-        notification: crate::types::generated::ThreadRealtimeOutputAudioDeltaNotification,
-    },
-    RealtimeError {
-        key: ThreadKey,
-        notification: crate::types::generated::ThreadRealtimeErrorNotification,
-    },
-    RealtimeClosed {
-        key: ThreadKey,
-        notification: crate::types::generated::ThreadRealtimeClosedNotification,
-    },
-}
+    #[test]
+    fn current_agent_directory_version_matches_summary_hash() {
+        let mut snapshot = AppSnapshot::default();
 
-impl From<AppUpdate> for AppStoreUpdateRecord {
-    fn from(value: AppUpdate) -> Self {
-        match value {
-            AppUpdate::FullResync => Self::FullResync,
-            AppUpdate::ServerChanged { server_id } => Self::ServerChanged { server_id },
-            AppUpdate::ServerRemoved { server_id } => Self::ServerRemoved { server_id },
-            AppUpdate::ThreadUpserted {
-                thread,
-                session_summary,
-                agent_directory_version,
-            } => Self::ThreadUpserted {
-                thread,
-                session_summary,
-                agent_directory_version,
+        let mut parent = ThreadSnapshot::from_info(
+            "srv",
+            ThreadInfo {
+                id: "thread-a".to_string(),
+                title: Some("Parent".to_string()),
+                model: None,
+                preview: Some("Preview".to_string()),
+                cwd: None,
+                path: None,
+                model_provider: None,
+                agent_nickname: None,
+                agent_role: None,
+                parent_thread_id: None,
+                agent_status: None,
+                created_at: None,
+                status: ThreadSummaryStatus::Idle,
+                updated_at: Some(20),
             },
-            AppUpdate::ThreadStateUpdated {
-                state,
-                session_summary,
-                agent_directory_version,
-            } => Self::ThreadStateUpdated {
-                state,
-                session_summary,
-                agent_directory_version,
+        );
+        parent.active_turn_id = Some("turn-a".to_string());
+        snapshot.threads.insert(parent.key.clone(), parent);
+
+        let child_key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread-b".to_string(),
+        };
+        snapshot.threads.insert(
+            child_key.clone(),
+            ThreadSnapshot {
+                key: child_key,
+                info: ThreadInfo {
+                    id: "thread-b".to_string(),
+                    title: None,
+                    model: None,
+                    preview: None,
+                    cwd: None,
+                    path: None,
+                    model_provider: None,
+                    parent_thread_id: Some(" thread-a ".to_string()),
+                    agent_nickname: Some("assistant".to_string()),
+                    agent_role: Some("coder".to_string()),
+                    agent_status: Some("running".to_string()),
+                    created_at: None,
+                    status: ThreadSummaryStatus::Active,
+                    updated_at: Some(10),
+                },
+                model: None,
+                reasoning_effort: None,
+                items: Vec::new(),
+                local_overlay_items: Vec::new(),
+                queued_follow_ups: Vec::new(),
+                active_turn_id: None,
+                context_tokens_used: None,
+                model_context_window: None,
+                rate_limits: None,
+                realtime_session_id: None,
             },
-            AppUpdate::ThreadItemUpserted { key, item } => Self::ThreadItemUpserted { key, item },
-            AppUpdate::ThreadCommandExecutionUpdated {
-                key,
-                item_id,
-                status,
-                exit_code,
-                duration_ms,
-                process_id,
-            } => Self::ThreadCommandExecutionUpdated {
-                key,
-                item_id,
-                status,
-                exit_code,
-                duration_ms,
-                process_id,
-            },
-            AppUpdate::ThreadStreamingDelta {
-                key,
-                item_id,
-                kind,
-                text,
-            } => Self::ThreadStreamingDelta {
-                key,
-                item_id,
-                kind: kind.into(),
-                text,
-            },
-            AppUpdate::ThreadRemoved {
-                key,
-                agent_directory_version,
-            } => Self::ThreadRemoved {
-                key,
-                agent_directory_version,
-            },
-            AppUpdate::ActiveThreadChanged { key } => Self::ActiveThreadChanged { key },
-            AppUpdate::PendingApprovalsChanged { .. } => Self::PendingApprovalsChanged,
-            AppUpdate::PendingUserInputsChanged { .. } => Self::PendingUserInputsChanged,
-            AppUpdate::VoiceSessionChanged => Self::VoiceSessionChanged,
-            AppUpdate::RealtimeTranscriptUpdated { key, update } => {
-                Self::RealtimeTranscriptUpdated { key, update }
-            }
-            AppUpdate::RealtimeHandoffRequested { key, request } => {
-                Self::RealtimeHandoffRequested { key, request }
-            }
-            AppUpdate::RealtimeSpeechStarted { key } => Self::RealtimeSpeechStarted { key },
-            AppUpdate::RealtimeStarted { key, notification } => {
-                Self::RealtimeStarted { key, notification }
-            }
-            AppUpdate::RealtimeOutputAudioDelta { key, notification } => {
-                Self::RealtimeOutputAudioDelta { key, notification }
-            }
-            AppUpdate::RealtimeError { key, notification } => {
-                Self::RealtimeError { key, notification }
-            }
-            AppUpdate::RealtimeClosed { key, notification } => {
-                Self::RealtimeClosed { key, notification }
-            }
-        }
+        );
+
+        let expected = agent_directory_version(&session_summaries_from_snapshot(&snapshot));
+        assert_eq!(current_agent_directory_version(&snapshot), expected);
     }
 }
 
-impl From<ThreadStreamingDeltaKind> for AppThreadStreamingDeltaKind {
-    fn from(value: ThreadStreamingDeltaKind) -> Self {
-        match value {
-            ThreadStreamingDeltaKind::AssistantText => Self::AssistantText,
-            ThreadStreamingDeltaKind::ReasoningText => Self::ReasoningText,
-            ThreadStreamingDeltaKind::PlanText => Self::PlanText,
-            ThreadStreamingDeltaKind::CommandOutput => Self::CommandOutput,
-            ThreadStreamingDeltaKind::McpProgress => Self::McpProgress,
-        }
-    }
-}
+

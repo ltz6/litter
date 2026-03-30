@@ -3,6 +3,16 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := all
 
+# Prefer rustup-managed toolchain over Homebrew Rust for cross-compilation targets.
+# Also include ~/.cargo/bin for cargo-installed tools like cargo-ndk.
+RUSTUP_TOOLCHAIN_BIN := $(shell rustup which cargo 2>/dev/null | xargs dirname 2>/dev/null)
+CARGO_BIN := $(HOME)/.cargo/bin
+ifneq ($(RUSTUP_TOOLCHAIN_BIN),)
+  export PATH := $(RUSTUP_TOOLCHAIN_BIN):$(CARGO_BIN):$(PATH)
+else ifneq ($(wildcard $(CARGO_BIN)),)
+  export PATH := $(CARGO_BIN):$(PATH)
+endif
+
 ROOT := $(shell pwd)
 STAMPS := $(ROOT)/.build-stamps
 RUST_DIR := $(ROOT)/shared/rust-bridge
@@ -42,10 +52,26 @@ ANDROID_ACTIVITY := com.litter.android.MainActivity
 ANDROID_DEVICE_SERIAL ?=
 ANDROID_REINSTALL_ON_SIGNATURE_MISMATCH ?= 1
 
+# Source local env (credentials, SDK paths) if present
+-include .env
+export ANDROID_SDK_ROOT
+export ANDROID_NDK_HOME
+export JAVA_HOME
+
 SCCACHE := $(shell command -v sccache 2>/dev/null)
 ifneq ($(SCCACHE),)
   export RUSTC_WRAPPER := $(SCCACHE)
-  $(info [cache] Using sccache: $(SCCACHE))
+  ifdef SCCACHE_BUCKET
+    export SCCACHE_BUCKET
+    export SCCACHE_ENDPOINT
+    export SCCACHE_REGION
+    export SCCACHE_S3_KEY_PREFIX
+    export AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY
+    $(info [cache] Using sccache: $(SCCACHE) → s3://$(SCCACHE_BUCKET))
+  else
+    $(info [cache] Using sccache: $(SCCACHE) (local only))
+  endif
 endif
 
 PACKAGE_CARGO_ENV := CARGO_INCREMENTAL=0
@@ -54,18 +80,17 @@ DEV_CARGO_ENV := env -u CARGO_INCREMENTAL
 
 PATCH_FILES := \
 	$(PATCHES_DIR)/ios-exec-hook.patch \
-	$(PATCHES_DIR)/client-controlled-handoff.patch
+	$(PATCHES_DIR)/client-controlled-handoff.patch \
+	$(PATCHES_DIR)/mobile-code-mode-stub.patch
 
 BOUNDARY_SOURCES := \
-	$(RUST_DIR)/codegen/src/main.rs \
 	$(RUST_DIR)/codex-mobile-client/Cargo.toml \
 	$(RUST_DIR)/codex-mobile-client/src/lib.rs \
 	$(RUST_DIR)/codex-mobile-client/src/conversation_uniffi.rs \
 	$(RUST_DIR)/codex-mobile-client/src/discovery_uniffi.rs \
-	$(RUST_DIR)/codex-mobile-client/src/uniffi_shared.rs \
 	$(RUST_DIR)/codex-mobile-client/src/mobile_client_impl.rs
 
-BOUNDARY_SOURCES += $(shell find $(RUST_DIR)/codex-mobile-client/src/ffi -type f -name '*.rs' 2>/dev/null)
+BOUNDARY_SOURCES += $(shell find $(RUST_DIR)/codex-mobile-client/src -type f -name '*.rs' 2>/dev/null)
 
 STAMP_SYNC := $(STAMPS)/sync
 STAMP_BINDINGS_S := $(STAMPS)/bindings-swift

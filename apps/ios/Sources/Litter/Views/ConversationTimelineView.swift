@@ -897,7 +897,7 @@ private struct ConversationTurnDiffRow: View {
         Button {
             showingDetails = true
         } label: {
-            DiffIndicatorLabel(diff: data.diff)
+            DiffIndicatorLabel(additions: data.additions, deletions: data.deletions)
         }
         .buttonStyle(.plain)
         .sheet(isPresented: $showingDetails) {
@@ -1451,83 +1451,93 @@ private struct PresentedDiff: Identifiable {
     let diff: String
 }
 
-private struct DiffStats {
+struct DiffStats: Equatable {
     let additions: Int
     let deletions: Int
 
     var hasChanges: Bool {
         additions > 0 || deletions > 0
     }
+
+    init(additions: Int, deletions: Int) {
+        self.additions = additions
+        self.deletions = deletions
+    }
+
+    /// Cheap stats-only parse — no per-line allocation.
+    init(diff: String) {
+        var adds = 0
+        var dels = 0
+        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("+"), !line.hasPrefix("+++") { adds += 1 }
+            else if line.hasPrefix("-"), !line.hasPrefix("---") { dels += 1 }
+        }
+        self.additions = adds
+        self.deletions = dels
+    }
 }
 
-private struct ConversationDiffPresentation {
+/// Builds a single styled `AttributedString` for the entire diff instead of
+/// one SwiftUI `Text` view per line — avoids the layout explosion that
+/// `.fixedSize` + horizontal `ScrollView` causes with hundreds of child views.
+struct DiffAttributedContent {
+    let attributedString: AttributedString
     let stats: DiffStats
-    let lines: [ConversationDiffDisplayLine]
 
     init(diff: String) {
+        var result = AttributedString()
         var additions = 0
         var deletions = 0
-        var parsedLines: [ConversationDiffDisplayLine] = []
-        parsedLines.reserveCapacity(max(diff.count / 48, 16))
+        let monoFont = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 
-        for (index, rawLine) in diff.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        ).enumerated() {
+        for rawLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
             let text = rawLine.last == "\r" ? String(rawLine.dropLast()) : String(rawLine)
-            let kind = ConversationDiffDisplayLine.Kind(text: text)
-            switch kind {
-            case .addition:
-                additions += 1
-            case .deletion:
-                deletions += 1
-            case .hunk, .context:
-                break
-            }
-            parsedLines.append(
-                ConversationDiffDisplayLine(
-                    id: index,
-                    text: text,
-                    kind: kind
-                )
-            )
-        }
+            let displayText = text.isEmpty ? " " : text
 
-        self.stats = DiffStats(additions: additions, deletions: deletions)
-        self.lines = parsedLines
-    }
-}
-
-private struct ConversationDiffDisplayLine: Identifiable, Equatable {
-    enum Kind: Equatable {
-        case addition
-        case deletion
-        case hunk
-        case context
-
-        init(text: String) {
+            let fg: UIColor
+            let bg: UIColor
             if text.hasPrefix("+"), !text.hasPrefix("+++") {
-                self = .addition
+                additions += 1
+                fg = UIColor(LitterTheme.success)
+                bg = UIColor(LitterTheme.success).withAlphaComponent(0.12)
             } else if text.hasPrefix("-"), !text.hasPrefix("---") {
-                self = .deletion
+                deletions += 1
+                fg = UIColor(LitterTheme.danger)
+                bg = UIColor(LitterTheme.danger).withAlphaComponent(0.12)
             } else if text.hasPrefix("@@") {
-                self = .hunk
+                fg = UIColor(LitterTheme.accentStrong)
+                bg = UIColor(LitterTheme.accentStrong).withAlphaComponent(0.12)
             } else {
-                self = .context
+                fg = UIColor(LitterTheme.textBody)
+                bg = UIColor(LitterTheme.codeBackground).withAlphaComponent(0.72)
             }
+
+            var line = AttributedString(displayText + "\n")
+            line.font = monoFont
+            line.foregroundColor = Color(fg)
+            line.backgroundColor = Color(bg)
+            result.append(line)
         }
+
+        self.attributedString = result
+        self.stats = DiffStats(additions: additions, deletions: deletions)
     }
 
-    let id: Int
-    let text: String
-    let kind: Kind
+    private init(additions: Int, deletions: Int) {
+        self.attributedString = AttributedString()
+        self.stats = DiffStats(additions: additions, deletions: deletions)
+    }
 }
 
 private struct DiffIndicatorLabel: View {
     private let stats: DiffStats
 
     init(diff: String) {
-        self.stats = ConversationDiffPresentation(diff: diff).stats
+        self.stats = DiffStats(diff: diff)
+    }
+
+    init(additions: Int, deletions: Int) {
+        self.stats = DiffStats(additions: additions, deletions: deletions)
     }
 
     var body: some View {
@@ -1567,25 +1577,66 @@ private struct DiffIndicatorLabel: View {
     }
 }
 
+private struct DiffLine: Identifiable {
+    enum Kind {
+        case addition, deletion, hunk, context
+
+        var foregroundColor: Color {
+            switch self {
+            case .addition: LitterTheme.success
+            case .deletion: LitterTheme.danger
+            case .hunk: LitterTheme.accentStrong
+            case .context: LitterTheme.textBody
+            }
+        }
+
+        var backgroundColor: Color {
+            switch self {
+            case .addition: LitterTheme.success.opacity(0.12)
+            case .deletion: LitterTheme.danger.opacity(0.12)
+            case .hunk: LitterTheme.accentStrong.opacity(0.12)
+            case .context: LitterTheme.codeBackground.opacity(0.72)
+            }
+        }
+    }
+
+    let id: Int
+    let text: String
+    let kind: Kind
+}
+
 private struct ConversationDiffDetailSheet: View {
     let title: String
-    private let presentation: ConversationDiffPresentation
+    let stats: DiffStats
+    let lines: [DiffLine]
     @Environment(ThemeManager.self) private var themeManager
     @Environment(\.dismiss) private var dismiss
 
     init(title: String, diff: String) {
         self.title = title
-        self.presentation = ConversationDiffPresentation(diff: diff)
+        var adds = 0, dels = 0
+        var parsed: [DiffLine] = []
+        for (i, raw) in diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let text = raw.last == "\r" ? String(raw.dropLast()) : String(raw)
+            let kind: DiffLine.Kind
+            if text.hasPrefix("+"), !text.hasPrefix("+++") { kind = .addition; adds += 1 }
+            else if text.hasPrefix("-"), !text.hasPrefix("---") { kind = .deletion; dels += 1 }
+            else if text.hasPrefix("@@") { kind = .hunk }
+            else { kind = .context }
+            parsed.append(DiffLine(id: i, text: text, kind: kind))
+        }
+        self.stats = DiffStats(additions: adds, deletions: dels)
+        self.lines = parsed
     }
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
-                    Text("+\(presentation.stats.additions)")
+                    Text("+\(stats.additions)")
                         .litterFont(.caption2, weight: .semibold)
                         .foregroundColor(LitterTheme.success)
-                    Text("-\(presentation.stats.deletions)")
+                    Text("-\(stats.deletions)")
                         .litterFont(.caption2, weight: .semibold)
                         .foregroundColor(LitterTheme.danger)
                 }
@@ -1593,15 +1644,22 @@ private struct ConversationDiffDetailSheet: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
-                ScrollView([.vertical, .horizontal]) {
+                ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(presentation.lines) { line in
-                            ConversationDiffLineView(line: line)
+                        ForEach(lines) { line in
+                            Text(verbatim: line.text.isEmpty ? " " : line.text)
+                                .litterMonoFont(size: 12)
+                                .foregroundStyle(line.kind.foregroundColor)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(line.kind.backgroundColor)
                         }
                     }
                     .padding(.horizontal, 16)
                     .padding(.bottom, 16)
-                    .textSelection(.enabled)
                 }
             }
             .background(LitterTheme.backgroundGradient.ignoresSafeArea())
@@ -1617,47 +1675,6 @@ private struct ConversationDiffDetailSheet: View {
         }
         .presentationDetents([.medium, .large])
         .id(themeManager.themeVersion)
-    }
-}
-
-private struct ConversationDiffLineView: View {
-    let line: ConversationDiffDisplayLine
-
-    var body: some View {
-        Text(verbatim: line.text.isEmpty ? " " : line.text)
-            .litterMonoFont(size: 12)
-            .foregroundStyle(foregroundColor)
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(backgroundColor)
-    }
-
-    private var foregroundColor: Color {
-        switch line.kind {
-        case .addition:
-            return LitterTheme.success
-        case .deletion:
-            return LitterTheme.danger
-        case .hunk:
-            return LitterTheme.accentStrong
-        case .context:
-            return LitterTheme.textBody
-        }
-    }
-
-    private var backgroundColor: Color {
-        switch line.kind {
-        case .addition:
-            return LitterTheme.success.opacity(0.12)
-        case .deletion:
-            return LitterTheme.danger.opacity(0.12)
-        case .hunk:
-            return LitterTheme.accentStrong.opacity(0.12)
-        case .context:
-            return LitterTheme.codeBackground.opacity(0.72)
-        }
     }
 }
 

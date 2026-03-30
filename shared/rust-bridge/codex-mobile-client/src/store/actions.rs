@@ -1,6 +1,7 @@
 use codex_app_server_protocol as upstream;
 
-use crate::conversation::{ConversationItem, hydrate_thread_item};
+use crate::conversation::hydrate_thread_item;
+use crate::conversation_uniffi::HydratedConversationItem;
 use crate::types::ThreadInfo;
 
 pub(crate) fn thread_info_from_upstream(thread: upstream::Thread) -> ThreadInfo {
@@ -31,6 +32,6 @@ pub(crate) fn thread_info_from_upstream_status_change(
 
 pub(crate) fn conversation_item_from_upstream(
     item: upstream::ThreadItem,
-) -> Option<ConversationItem> {
+) -> Option<HydratedConversationItem> {
     hydrate_thread_item(&item, None, None, &Default::default())
 }

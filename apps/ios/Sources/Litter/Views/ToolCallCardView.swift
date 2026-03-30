@@ -219,47 +219,37 @@ struct ToolCallCardView: View {
 
         return VStack(alignment: .leading, spacing: 6) {
             sectionLabel(label)
-            VStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(verbatim: line.isEmpty ? " " : line)
                         .litterMonoFont(size: 12)
-                        .foregroundStyle(diffForegroundColor(for: line))
+                        .foregroundStyle(diffLineColor(for: line))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
-                        .background(diffBackgroundColor(for: line))
+                        .background(diffLineBgColor(for: line))
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
     }
 
-    private func diffForegroundColor(for line: String) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") {
-            return LitterTheme.success
-        }
-        if line.hasPrefix("-"), !line.hasPrefix("---") {
-            return LitterTheme.danger
-        }
-        if line.hasPrefix("@@") {
-            return LitterTheme.accentStrong
-        }
+    private func diffLineColor(for line: String) -> Color {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") { return LitterTheme.success }
+        if line.hasPrefix("-"), !line.hasPrefix("---") { return LitterTheme.danger }
+        if line.hasPrefix("@@") { return LitterTheme.accentStrong }
         return LitterTheme.textBody
     }
 
-    private func diffBackgroundColor(for line: String) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") {
-            return LitterTheme.success.opacity(0.12)
-        }
-        if line.hasPrefix("-"), !line.hasPrefix("---") {
-            return LitterTheme.danger.opacity(0.12)
-        }
-        if line.hasPrefix("@@") {
-            return LitterTheme.accentStrong.opacity(0.12)
-        }
+    private func diffLineBgColor(for line: String) -> Color {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") { return LitterTheme.success.opacity(0.12) }
+        if line.hasPrefix("-"), !line.hasPrefix("---") { return LitterTheme.danger.opacity(0.12) }
+        if line.hasPrefix("@@") { return LitterTheme.accentStrong.opacity(0.12) }
         return LitterTheme.codeBackground.opacity(0.72)
     }
+
 
     private var identifiedSections: [IndexedValue<ToolCallSection>] {
         identifiedValues(model.sections, prefix: "section") { section in

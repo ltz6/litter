@@ -2,101 +2,80 @@ import Foundation
 
 struct AppThreadLaunchConfig: Equatable, Sendable {
     var model: String?
-    var approvalPolicy: AskForApproval?
-    var sandbox: SandboxMode?
+    var approvalPolicy: AppAskForApproval?
+    var sandbox: AppSandboxMode?
     var developerInstructions: String?
     var persistExtendedHistory: Bool = true
 
-    func threadStartParams(cwd: String) -> ThreadStartParams {
-        ThreadStartParams(
+    func threadStartRequest(cwd: String) -> AppStartThreadRequest {
+        AppStartThreadRequest(
             model: model,
-            modelProvider: nil,
-            serviceTier: nil,
             cwd: cwd,
             approvalPolicy: approvalPolicy,
-            approvalsReviewer: nil,
             sandbox: sandbox,
-            config: nil,
-            serviceName: nil,
-            baseInstructions: nil,
             developerInstructions: developerInstructions,
-            personality: nil,
-            ephemeral: nil,
-            dynamicTools: nil,
-            mockExperimentalField: nil,
-            experimentalRawEvents: false,
-            persistExtendedHistory: true
+            persistExtendedHistory: persistExtendedHistory
         )
     }
 
-    func threadResumeParams(threadId: String, cwdOverride: String?) -> ThreadResumeParams {
-        ThreadResumeParams(
+    func threadResumeRequest(threadId: String, cwdOverride: String?) -> AppResumeThreadRequest {
+        AppResumeThreadRequest(
             threadId: threadId,
-            history: nil,
-            path: nil,
             model: model,
-            modelProvider: nil,
-            serviceTier: nil,
             cwd: cwdOverride,
             approvalPolicy: approvalPolicy,
-            approvalsReviewer: nil,
             sandbox: sandbox,
-            config: nil,
-            baseInstructions: nil,
             developerInstructions: developerInstructions,
-            personality: nil,
-            persistExtendedHistory: true
+            persistExtendedHistory: persistExtendedHistory
         )
     }
 
-    func threadForkParams(threadId: String, cwdOverride: String?) -> ThreadForkParams {
-        ThreadForkParams(
+    func threadForkRequest(threadId: String, cwdOverride: String?) -> AppForkThreadRequest {
+        AppForkThreadRequest(
             threadId: threadId,
-            path: nil,
             model: model,
-            modelProvider: nil,
-            serviceTier: nil,
             cwd: cwdOverride,
             approvalPolicy: approvalPolicy,
-            approvalsReviewer: nil,
             sandbox: sandbox,
-            config: nil,
-            baseInstructions: nil,
             developerInstructions: developerInstructions,
-            ephemeral: false,
-            persistExtendedHistory: true
+            persistExtendedHistory: persistExtendedHistory
+        )
+    }
+
+    func forkThreadFromMessageRequest(cwdOverride: String?) -> AppForkThreadFromMessageRequest {
+        AppForkThreadFromMessageRequest(
+            model: model,
+            cwd: cwdOverride,
+            approvalPolicy: approvalPolicy,
+            sandbox: sandbox,
+            developerInstructions: developerInstructions,
+            persistExtendedHistory: persistExtendedHistory
         )
     }
 }
 
 struct AppComposerPayload: Equatable, Sendable {
     var text: String
-    var additionalInputs: [UserInput]
-    var approvalPolicy: AskForApproval?
-    var sandboxPolicy: SandboxPolicy?
+    var additionalInputs: [AppUserInput]
+    var approvalPolicy: AppAskForApproval?
+    var sandboxPolicy: AppSandboxPolicy?
     var model: String?
     var effort: ReasoningEffort?
     var serviceTier: ServiceTier?
 
-    func turnStartParams(threadId: String) -> TurnStartParams {
+    func turnStartRequest(threadId: String) -> AppStartTurnRequest {
         var inputs = additionalInputs
         if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             inputs.insert(.text(text: text, textElements: []), at: 0)
         }
-        return TurnStartParams(
+        return AppStartTurnRequest(
             threadId: threadId,
             input: inputs,
-            cwd: nil,
             approvalPolicy: approvalPolicy,
-            approvalsReviewer: nil,
             sandboxPolicy: sandboxPolicy,
             model: model,
-            serviceTier: serviceTier.map(Optional.some),
-            effort: effort,
-            summary: nil,
-            personality: nil,
-            outputSchema: nil,
-            collaborationMode: nil
+            serviceTier: serviceTier,
+            effort: effort
         )
     }
 }

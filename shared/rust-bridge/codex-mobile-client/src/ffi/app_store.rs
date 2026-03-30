@@ -3,9 +3,8 @@
 use crate::MobileClient;
 use crate::ffi::ClientError;
 use crate::ffi::shared::{blocking_async, shared_mobile_client, shared_runtime};
-use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot, AppUpdate};
-use crate::types::generated;
-use crate::types::models::ThreadKey;
+use crate::store::{AppSnapshotRecord, AppStoreUpdateRecord, AppThreadSnapshot};
+use crate::types::{AppForkThreadFromMessageRequest, AppStartTurnRequest, ThreadKey};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -21,8 +20,8 @@ pub struct AppStoreSubscription {
 }
 
 pub(crate) struct AppStoreSubscriptionState {
-    pub(crate) rx: tokio::sync::broadcast::Receiver<AppUpdate>,
-    pub(crate) buffered: VecDeque<AppUpdate>,
+    pub(crate) rx: tokio::sync::broadcast::Receiver<AppStoreUpdateRecord>,
+    pub(crate) buffered: VecDeque<AppStoreUpdateRecord>,
 }
 
 const MAX_COALESCED_STREAMING_TEXT_BYTES: usize = 8 * 1024;
@@ -32,24 +31,17 @@ mod tests {
     use super::{AppStoreSubscription, AppStoreSubscriptionState};
     use crate::store::{AppStoreReducer, AppStoreUpdateRecord, ThreadStreamingDeltaKind};
     use crate::types::ThreadKey;
-    use crate::types::generated;
     use codex_app_server_protocol as upstream;
     use serde_json::json;
-    use std::collections::VecDeque;
-
-    fn convert_generated_thread_item(
-        item: generated::ThreadItem,
-    ) -> Result<upstream::ThreadItem, super::ClientError> {
-        crate::rpc::convert_generated_field(item).map_err(Into::into)
-    }
+    use std::collections::{HashMap, VecDeque};
 
     #[test]
-    fn generated_thread_item_parses_mcp_arguments_json() {
-        let item = generated::ThreadItem::McpToolCall {
+    fn thread_item_parses_mcp_arguments_json() {
+        let item = upstream::ThreadItem::McpToolCall {
             id: "mcp-1".into(),
             server: "filesystem".into(),
             tool: "read_file".into(),
-            status: generated::McpToolCallStatus::Completed,
+            status: upstream::McpToolCallStatus::Completed,
             arguments: serde_json::from_value(json!({"path": "/tmp/file.txt"}))
                 .expect("json value should convert"),
             result: None,
@@ -57,9 +49,7 @@ mod tests {
             duration_ms: Some(42),
         };
 
-        let upstream_item =
-            convert_generated_thread_item(item).expect("mcp tool item should convert");
-        let upstream::ThreadItem::McpToolCall { arguments, .. } = upstream_item else {
+        let upstream::ThreadItem::McpToolCall { arguments, .. } = item else {
             panic!("expected mcp tool call");
         };
         assert_eq!(
@@ -69,28 +59,26 @@ mod tests {
     }
 
     #[test]
-    fn generated_thread_item_parses_collab_agent_states_json() {
-        let item = generated::ThreadItem::CollabAgentToolCall {
+    fn thread_item_parses_collab_agent_states_json() {
+        let item = upstream::ThreadItem::CollabAgentToolCall {
             id: "collab-1".into(),
-            tool: generated::CollabAgentTool::SpawnAgent,
-            status: generated::CollabAgentToolCallStatus::Completed,
+            tool: upstream::CollabAgentTool::SpawnAgent,
+            status: upstream::CollabAgentToolCallStatus::Completed,
             sender_thread_id: "parent-thread".into(),
             receiver_thread_ids: vec!["sub-thread-1".into()],
             prompt: Some("Review the changes".into()),
             model: None,
             reasoning_effort: None,
-            agents_states: vec![generated::ThreadItemAgentsStatesEntry {
-                key: "sub-thread-1".into(),
-                value: generated::CollabAgentState {
-                    status: generated::CollabAgentStatus::Running,
+            agents_states: HashMap::from([(
+                "sub-thread-1".into(),
+                upstream::CollabAgentState {
+                    status: upstream::CollabAgentStatus::Running,
                     message: Some("Working".into()),
                 },
-            }],
+            )]),
         };
 
-        let upstream_item =
-            convert_generated_thread_item(item).expect("collab agent item should convert");
-        let upstream::ThreadItem::CollabAgentToolCall { agents_states, .. } = upstream_item else {
+        let upstream::ThreadItem::CollabAgentToolCall { agents_states, .. } = item else {
             panic!("expected collab agent tool call");
         };
         let state = agents_states
@@ -167,7 +155,7 @@ mod tests {
             AppStoreUpdateRecord::ThreadStreamingDelta {
                 key: emitted_key,
                 item_id,
-                kind: crate::store::AppThreadStreamingDeltaKind::AssistantText,
+                kind: crate::store::ThreadStreamingDeltaKind::AssistantText,
                 text,
             } if emitted_key == key && item_id == "assistant-1" && text == "hello world"
         ));
@@ -225,9 +213,14 @@ impl AppStore {
     pub async fn start_turn(
         &self,
         key: ThreadKey,
-        params: generated::TurnStartParams,
+        params: AppStartTurnRequest,
     ) -> Result<(), ClientError> {
         blocking_async!(self.rt, self.inner, |c| {
+            let params = params
+                .try_into()
+                .map_err(|error: crate::RpcClientError| {
+                    ClientError::Serialization(error.to_string())
+                })?;
             c.start_turn(&key.server_id, params)
                 .await
                 .map_err(|e| ClientError::Rpc(e.to_string()))
@@ -271,7 +264,7 @@ impl AppStore {
         &self,
         key: ThreadKey,
         selected_turn_index: u32,
-        params: generated::ThreadForkParams,
+        params: AppForkThreadFromMessageRequest,
     ) -> Result<ThreadKey, ClientError> {
         blocking_async!(self.rt, self.inner, |c| {
             c.fork_thread_from_message(
@@ -352,7 +345,7 @@ impl AppStoreSubscription {
 
 async fn receive_next_update(
     state: &mut AppStoreSubscriptionState,
-) -> Result<AppUpdate, tokio::sync::broadcast::error::RecvError> {
+) -> Result<AppStoreUpdateRecord, tokio::sync::broadcast::error::RecvError> {
     let first = if let Some(update) = state.buffered.pop_front() {
         update
     } else {
@@ -364,8 +357,8 @@ async fn receive_next_update(
 
 fn coalesce_ready_updates(
     state: &mut AppStoreSubscriptionState,
-    mut update: AppUpdate,
-) -> Result<AppUpdate, tokio::sync::broadcast::error::RecvError> {
+    mut update: AppStoreUpdateRecord,
+) -> Result<AppStoreUpdateRecord, tokio::sync::broadcast::error::RecvError> {
     loop {
         let next = if let Some(update) = state.buffered.pop_front() {
             Some(update)
@@ -391,28 +384,28 @@ fn coalesce_ready_updates(
     }
 }
 
-fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppUpdate> {
-    if matches!(current, AppUpdate::FullResync) {
+fn merge_app_update(current: &mut AppStoreUpdateRecord, next: AppStoreUpdateRecord) -> Result<(), AppStoreUpdateRecord> {
+    if matches!(current, AppStoreUpdateRecord::FullResync) {
         return Ok(());
     }
-    if matches!(next, AppUpdate::FullResync) {
-        *current = AppUpdate::FullResync;
+    if matches!(next, AppStoreUpdateRecord::FullResync) {
+        *current = AppStoreUpdateRecord::FullResync;
         return Ok(());
     }
     if triggers_snapshot_refresh(current) && triggers_snapshot_refresh(&next) {
-        *current = AppUpdate::FullResync;
+        *current = AppStoreUpdateRecord::FullResync;
         return Ok(());
     }
 
     match (current, next) {
         (
-            AppUpdate::ThreadStreamingDelta {
+            AppStoreUpdateRecord::ThreadStreamingDelta {
                 key,
                 item_id,
                 kind,
                 text,
             },
-            AppUpdate::ThreadStreamingDelta {
+            AppStoreUpdateRecord::ThreadStreamingDelta {
                 key: next_key,
                 item_id: next_item_id,
                 kind: next_kind,
@@ -427,12 +420,12 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
             Ok(())
         }
         (
-            AppUpdate::ThreadStateUpdated {
+            AppStoreUpdateRecord::ThreadStateUpdated {
                 state,
                 session_summary,
                 agent_directory_version,
             },
-            AppUpdate::ThreadStateUpdated {
+            AppStoreUpdateRecord::ThreadStateUpdated {
                 state: next_state,
                 session_summary: next_summary,
                 agent_directory_version: next_version,
@@ -444,8 +437,8 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
             Ok(())
         }
         (
-            AppUpdate::ThreadItemUpserted { key, item },
-            AppUpdate::ThreadItemUpserted {
+            AppStoreUpdateRecord::ThreadItemUpserted { key, item },
+            AppStoreUpdateRecord::ThreadItemUpserted {
                 key: next_key,
                 item: next_item,
             },
@@ -454,7 +447,7 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
             Ok(())
         }
         (
-            AppUpdate::ThreadCommandExecutionUpdated {
+            AppStoreUpdateRecord::ThreadCommandExecutionUpdated {
                 key,
                 item_id,
                 status,
@@ -462,7 +455,7 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
                 duration_ms,
                 process_id,
             },
-            AppUpdate::ThreadCommandExecutionUpdated {
+            AppStoreUpdateRecord::ThreadCommandExecutionUpdated {
                 key: next_key,
                 item_id: next_item_id,
                 status: next_status,
@@ -478,12 +471,12 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
             Ok(())
         }
         (
-            AppUpdate::ThreadUpserted {
+            AppStoreUpdateRecord::ThreadUpserted {
                 thread,
                 session_summary,
                 agent_directory_version,
             },
-            AppUpdate::ThreadUpserted {
+            AppStoreUpdateRecord::ThreadUpserted {
                 thread: next_thread,
                 session_summary: next_summary,
                 agent_directory_version: next_version,
@@ -495,26 +488,26 @@ fn merge_app_update(current: &mut AppUpdate, next: AppUpdate) -> Result<(), AppU
             Ok(())
         }
         (
-            AppUpdate::ActiveThreadChanged { key },
-            AppUpdate::ActiveThreadChanged { key: next_key },
+            AppStoreUpdateRecord::ActiveThreadChanged { key },
+            AppStoreUpdateRecord::ActiveThreadChanged { key: next_key },
         ) => {
             *key = next_key;
             Ok(())
         }
-        (current, next) => Err(next),
+        (_current, next) => Err(next),
     }
 }
 
-fn triggers_snapshot_refresh(update: &AppUpdate) -> bool {
+fn triggers_snapshot_refresh(update: &AppStoreUpdateRecord) -> bool {
     matches!(
         update,
-        AppUpdate::ServerChanged { .. }
-            | AppUpdate::ServerRemoved { .. }
-            | AppUpdate::PendingApprovalsChanged { .. }
-            | AppUpdate::PendingUserInputsChanged { .. }
-            | AppUpdate::VoiceSessionChanged
-            | AppUpdate::RealtimeStarted { .. }
-            | AppUpdate::RealtimeError { .. }
-            | AppUpdate::RealtimeClosed { .. }
+        AppStoreUpdateRecord::ServerChanged { .. }
+            | AppStoreUpdateRecord::ServerRemoved { .. }
+            | AppStoreUpdateRecord::PendingApprovalsChanged { .. }
+            | AppStoreUpdateRecord::PendingUserInputsChanged { .. }
+            | AppStoreUpdateRecord::VoiceSessionChanged
+            | AppStoreUpdateRecord::RealtimeStarted { .. }
+            | AppStoreUpdateRecord::RealtimeError { .. }
+            | AppStoreUpdateRecord::RealtimeClosed { .. }
     )
 }

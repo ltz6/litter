@@ -11,11 +11,11 @@ struct DynamicToolSpecParams: Encodable {
         case name, description, inputSchema
     }
 
-    func rpcSpec(deferLoading: Bool = false) throws -> DynamicToolSpec {
-        try DynamicToolSpec(
+    func rpcSpec(deferLoading: Bool = false) throws -> AppDynamicToolSpec {
+        try AppDynamicToolSpec(
             name: name,
             description: description,
-            inputSchema: JsonValue(encodable: inputSchema),
+            inputSchemaJson: String(data: try JSONEncoder().encode(inputSchema), encoding: .utf8) ?? "{}",
             deferLoading: deferLoading
         )
     }

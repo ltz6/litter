@@ -1,7 +1,7 @@
 //! Shared mobile client library for iOS / Android.
 //!
 //! This crate owns the single public UniFFI surface for mobile. Keep shared
-//! business logic here so Swift/Kotlin only compile one generated binding set.
+//! business logic here so Swift/Kotlin only compile one binding set.
 
 #[cfg(target_os = "ios")]
 mod aec;
@@ -15,16 +15,31 @@ pub mod hydration;
 pub mod immer_patch;
 pub mod logging;
 pub mod parser;
-pub mod rpc;
 pub mod session;
 pub mod ssh;
 pub mod store;
 pub mod transport;
 pub mod types;
-pub mod uniffi_shared;
-
 mod mobile_client_impl;
 
 pub use mobile_client_impl::*;
+
+// ── Shared infra ─────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicI64, Ordering};
+
+static REQUEST_COUNTER: AtomicI64 = AtomicI64::new(1);
+
+pub(crate) fn next_request_id() -> i64 {
+    REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcClientError {
+    #[error("RPC: {0}")]
+    Rpc(String),
+    #[error("Serialization: {0}")]
+    Serialization(String),
+}
 
 uniffi::setup_scaffolding!();

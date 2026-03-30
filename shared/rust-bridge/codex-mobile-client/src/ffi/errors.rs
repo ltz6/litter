@@ -12,11 +12,11 @@ pub enum ClientError {
     EventClosed(String),
 }
 
-impl From<crate::rpc::RpcClientError> for ClientError {
-    fn from(value: crate::rpc::RpcClientError) -> Self {
+impl From<crate::RpcClientError> for ClientError {
+    fn from(value: crate::RpcClientError) -> Self {
         match value {
-            crate::rpc::RpcClientError::Rpc(message) => ClientError::Rpc(message),
-            crate::rpc::RpcClientError::Serialization(message) => {
+            crate::RpcClientError::Rpc(message) => ClientError::Rpc(message),
+            crate::RpcClientError::Serialization(message) => {
                 ClientError::Serialization(message)
             }
         }

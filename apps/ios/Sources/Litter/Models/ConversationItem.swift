@@ -23,7 +23,7 @@ struct ConversationAssistantMessageData: Equatable {
     var text: String
     var agentNickname: String?
     var agentRole: String?
-    var phase: MessagePhase?
+    var phase: AppMessagePhase?
 }
 
 struct ConversationReasoningData: Equatable {
@@ -88,6 +88,8 @@ struct ConversationFileChangeData: Equatable {
 
 struct ConversationTurnDiffData: Equatable {
     var diff: String
+    var additions: Int
+    var deletions: Int
 }
 
 struct ConversationMcpToolCallData: Equatable {
@@ -564,9 +566,12 @@ private extension HydratedConversationItemContent {
                 )
             )
         case .turnDiff(let data):
+            let stats = DiffStats(diff: data.diff)
             return .turnDiff(
                 ConversationTurnDiffData(
-                    diff: data.diff
+                    diff: data.diff,
+                    additions: stats.additions,
+                    deletions: stats.deletions
                 )
             )
         case .mcpToolCall(let data):

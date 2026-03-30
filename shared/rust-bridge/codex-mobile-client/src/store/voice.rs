@@ -3,8 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::types::ThreadKey;
-use crate::types::generated::{JsonObjectEntry, JsonValue, JsonValueKind};
-use crate::uniffi_shared::{AppVoiceHandoffRequest, AppVoiceSpeaker, AppVoiceTranscriptUpdate};
+use crate::types::{AppVoiceHandoffRequest, AppVoiceSpeaker, AppVoiceTranscriptUpdate};
 
 #[derive(Debug, Clone)]
 pub enum VoiceDerivedUpdate {
@@ -67,7 +66,11 @@ impl VoiceRealtimeState {
         thread.handle_transcript_delta_str(text, speaker)
     }
 
-    pub fn handle_item(&self, key: &ThreadKey, item: &JsonValue) -> Vec<VoiceDerivedUpdate> {
+    pub fn handle_item(
+        &self,
+        key: &ThreadKey,
+        item: &serde_json::Value,
+    ) -> Vec<VoiceDerivedUpdate> {
         let mut threads = self.threads.lock().expect("voice state lock poisoned");
         let thread = threads.entry(key.clone()).or_default();
         thread.handle_item(item)
@@ -75,24 +78,26 @@ impl VoiceRealtimeState {
 }
 
 impl VoiceRealtimeThreadState {
-    fn handle_item(&mut self, item: &JsonValue) -> Vec<VoiceDerivedUpdate> {
-        let item_type = json_string_for_keys(item, &["type"]).unwrap_or_default();
-        match item_type.as_str() {
-            "handoff_request" => vec![VoiceDerivedUpdate::HandoffRequest(AppVoiceHandoffRequest {
-                handoff_id: json_string_for_keys(item, &["handoff_id", "handoffId", "id"])
-                    .unwrap_or_else(|| self.next_virtual_item_id("handoff")),
-                input_transcript: json_string_for_keys(
-                    item,
-                    &["input_transcript", "inputTranscript"],
-                )
-                .unwrap_or_default(),
-                active_transcript: parse_active_transcript(item),
-                server_hint: json_string_for_keys(item, &["server_hint", "serverHint", "server"]),
-                fallback_transcript: json_string_for_keys(
-                    item,
-                    &["fallback_transcript", "fallbackTranscript"],
-                ),
-            })],
+    fn handle_item(&mut self, item: &serde_json::Value) -> Vec<VoiceDerivedUpdate> {
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        match item_type {
+            "handoff_request" => {
+                vec![VoiceDerivedUpdate::HandoffRequest(AppVoiceHandoffRequest {
+                    handoff_id: str_for_keys(item, &["handoff_id", "handoffId", "id"])
+                        .unwrap_or_else(|| self.next_virtual_item_id("handoff")),
+                    input_transcript: str_for_keys(
+                        item,
+                        &["input_transcript", "inputTranscript"],
+                    )
+                    .unwrap_or_default(),
+                    active_transcript: parse_active_transcript(item),
+                    server_hint: str_for_keys(item, &["server_hint", "serverHint", "server"]),
+                    fallback_transcript: str_for_keys(
+                        item,
+                        &["fallback_transcript", "fallbackTranscript"],
+                    ),
+                })]
+            }
             "message" => self.handle_message_item(item),
             "input_transcript_delta" => self.handle_transcript_delta(item, AppVoiceSpeaker::User),
             "output_transcript_delta" => {
@@ -112,8 +117,11 @@ impl VoiceRealtimeThreadState {
         }
     }
 
-    fn handle_message_item(&mut self, item: &JsonValue) -> Vec<VoiceDerivedUpdate> {
-        let role = json_string_for_keys(item, &["role"]).unwrap_or_else(|| "assistant".to_string());
+    fn handle_message_item(&mut self, item: &serde_json::Value) -> Vec<VoiceDerivedUpdate> {
+        let role = item
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("assistant");
         let speaker = if role == "user" {
             AppVoiceSpeaker::User
         } else {
@@ -123,7 +131,7 @@ impl VoiceRealtimeThreadState {
             AppVoiceSpeaker::User => AppVoiceSpeaker::Assistant,
             AppVoiceSpeaker::Assistant => AppVoiceSpeaker::User,
         };
-        let upstream_item_id = json_string_for_keys(item, &["id"]);
+        let upstream_item_id = item.get("id").and_then(|v| v.as_str()).map(String::from);
         let text = parse_message_text(item);
         let mut updates = Vec::new();
 
@@ -157,11 +165,14 @@ impl VoiceRealtimeThreadState {
 
     fn handle_transcript_delta(
         &mut self,
-        item: &JsonValue,
+        item: &serde_json::Value,
         speaker: AppVoiceSpeaker,
     ) -> Vec<VoiceDerivedUpdate> {
-        let delta = json_string_for_keys(item, &["delta"]).unwrap_or_default();
-        self.handle_transcript_delta_str(&delta, speaker)
+        let delta = item
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        self.handle_transcript_delta_str(delta, speaker)
     }
 
     fn handle_transcript_delta_str(
@@ -174,7 +185,7 @@ impl VoiceRealtimeThreadState {
         }
 
         let display_item_id = self.resolve_display_item_id(speaker, None, false);
-        let merged = merge_text(self.live_text(speaker), &delta);
+        let merged = merge_text(self.live_text(speaker), delta);
         self.set_live_text(speaker, merged.clone());
         self.set_pending_item_id(speaker, Some(display_item_id.clone()));
 
@@ -204,48 +215,14 @@ impl VoiceRealtimeThreadState {
         false
     }
 
-    fn resolve_display_item_id(
-        &mut self,
-        speaker: AppVoiceSpeaker,
-        upstream_item_id: Option<&str>,
-        prefer_upstream_id: bool,
-    ) -> String {
-        let upstream_item_id = upstream_item_id.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then_some(trimmed.to_string())
-        });
-        let pending_item_id = self.pending_item_id(speaker);
-
-        (prefer_upstream_id
-            .then_some(upstream_item_id.clone())
-            .flatten())
-        .or(pending_item_id)
-        .or(upstream_item_id)
-        .unwrap_or_else(|| {
-            self.next_virtual_item_id(match speaker {
-                AppVoiceSpeaker::User => "user",
-                AppVoiceSpeaker::Assistant => "assistant",
-            })
-        })
-    }
-
     fn flush_live_transcript(&mut self, speaker: AppVoiceSpeaker) -> Option<VoiceDerivedUpdate> {
-        let text = self.live_text(speaker).trim().to_string();
+        let text = self.live_text(speaker).to_string();
         if text.is_empty() {
-            self.set_live_text(speaker, String::new());
             return None;
         }
-
-        let item_id = self.pending_item_id(speaker).unwrap_or_else(|| {
-            self.next_virtual_item_id(match speaker {
-                AppVoiceSpeaker::User => "user",
-                AppVoiceSpeaker::Assistant => "assistant",
-            })
-        });
-
+        let item_id = self.pending_item_id(speaker)?.clone();
         self.set_live_text(speaker, String::new());
         self.set_pending_item_id(speaker, None);
-
         Some(VoiceDerivedUpdate::Transcript(AppVoiceTranscriptUpdate {
             item_id,
             speaker,
@@ -254,38 +231,62 @@ impl VoiceRealtimeThreadState {
         }))
     }
 
-    fn pending_item_id(&self, speaker: AppVoiceSpeaker) -> Option<String> {
+    fn next_virtual_item_id(&mut self, prefix: &str) -> String {
+        let id = self.next_virtual_id;
+        self.next_virtual_id += 1;
+        format!("voice-{prefix}-{id}")
+    }
+
+    fn resolve_display_item_id(
+        &mut self,
+        speaker: AppVoiceSpeaker,
+        upstream_item_id: Option<&str>,
+        force_new: bool,
+    ) -> String {
+        if let Some(id) = upstream_item_id {
+            self.set_pending_item_id(speaker, Some(id.to_string()));
+            return id.to_string();
+        }
+        if !force_new {
+            if let Some(id) = self.pending_item_id(speaker) {
+                return id.clone();
+            }
+        }
+        let label = match speaker {
+            AppVoiceSpeaker::User => "user",
+            AppVoiceSpeaker::Assistant => "assistant",
+        };
+        let new_id = self.next_virtual_item_id(label);
+        self.set_pending_item_id(speaker, Some(new_id.clone()));
+        new_id
+    }
+
+    fn pending_item_id(&self, speaker: AppVoiceSpeaker) -> Option<&String> {
         match speaker {
-            AppVoiceSpeaker::User => self.pending_user_item_id.clone(),
-            AppVoiceSpeaker::Assistant => self.pending_assistant_item_id.clone(),
+            AppVoiceSpeaker::User => self.pending_user_item_id.as_ref(),
+            AppVoiceSpeaker::Assistant => self.pending_assistant_item_id.as_ref(),
         }
     }
 
-    fn set_pending_item_id(&mut self, speaker: AppVoiceSpeaker, item_id: Option<String>) {
+    fn set_pending_item_id(&mut self, speaker: AppVoiceSpeaker, id: Option<String>) {
         match speaker {
-            AppVoiceSpeaker::User => self.pending_user_item_id = item_id,
-            AppVoiceSpeaker::Assistant => self.pending_assistant_item_id = item_id,
+            AppVoiceSpeaker::User => self.pending_user_item_id = id,
+            AppVoiceSpeaker::Assistant => self.pending_assistant_item_id = id,
         }
     }
 
     fn live_text(&self, speaker: AppVoiceSpeaker) -> &str {
         match speaker {
-            AppVoiceSpeaker::User => self.live_user_text.as_str(),
-            AppVoiceSpeaker::Assistant => self.live_assistant_text.as_str(),
+            AppVoiceSpeaker::User => &self.live_user_text,
+            AppVoiceSpeaker::Assistant => &self.live_assistant_text,
         }
     }
 
-    fn set_live_text(&mut self, speaker: AppVoiceSpeaker, text: String) {
+    fn set_live_text(&mut self, speaker: AppVoiceSpeaker, value: String) {
         match speaker {
-            AppVoiceSpeaker::User => self.live_user_text = text,
-            AppVoiceSpeaker::Assistant => self.live_assistant_text = text,
+            AppVoiceSpeaker::User => self.live_user_text = value,
+            AppVoiceSpeaker::Assistant => self.live_assistant_text = value,
         }
-    }
-
-    fn next_virtual_item_id(&mut self, prefix: &str) -> String {
-        let value = format!("voice-{prefix}-{}", self.next_virtual_id);
-        self.next_virtual_id += 1;
-        value
     }
 }
 
@@ -305,13 +306,15 @@ fn merge_text(existing: &str, incoming: &str) -> String {
     format!("{existing}{incoming}")
 }
 
-fn parse_message_text(item: &JsonValue) -> String {
-    json_array_for_key(item, "content")
+fn parse_message_text(item: &serde_json::Value) -> String {
+    item.get("content")
+        .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
         .filter_map(|part| {
-            is_message_text_part(part)
-                .then(|| json_string_for_keys(part, &["text"]))
+            let t = part.get("type").and_then(|v| v.as_str())?;
+            matches!(t, "text" | "input_text" | "output_text")
+                .then(|| part.get("text").and_then(|v| v.as_str()).map(String::from))
                 .flatten()
         })
         .collect::<Vec<_>>()
@@ -320,89 +323,55 @@ fn parse_message_text(item: &JsonValue) -> String {
         .to_string()
 }
 
-fn is_message_text_part(part: &JsonValue) -> bool {
-    matches!(
-        json_string_for_keys(part, &["type"]).as_deref(),
-        Some("text" | "input_text" | "output_text")
-    )
+fn parse_active_transcript(item: &serde_json::Value) -> String {
+    let key = if item.get("active_transcript").is_some() {
+        "active_transcript"
+    } else {
+        "activeTranscript"
+    };
+
+    let value = match item.get(key) {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    if let Some(arr) = value.as_array() {
+        let from_array: String = arr
+            .iter()
+            .filter_map(|entry| {
+                let role = entry.get("role").and_then(|v| v.as_str())?;
+                let text = entry.get("text").and_then(|v| v.as_str())?;
+                Some(format!("{role}: {text}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !from_array.is_empty() {
+            return from_array;
+        }
+    }
+
+    value.as_str().unwrap_or_default().to_string()
 }
 
-fn parse_active_transcript(item: &JsonValue) -> String {
-    let from_array = json_array_for_keys(item, &["active_transcript", "activeTranscript"])
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let role = json_string_for_keys(entry, &["role"])?;
-            let text = json_string_for_keys(entry, &["text"])?;
-            Some(format!("{role}: {text}"))
+fn str_for_keys(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                .or_else(|| v.as_f64().map(|n| n.to_string()))
+                .or_else(|| v.as_bool().map(|b| b.to_string()))
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if from_array.is_empty() {
-        json_string_for_keys(item, &["active_transcript", "activeTranscript"]).unwrap_or_default()
-    } else {
-        from_array
-    }
-}
-
-fn json_string_for_keys(value: &JsonValue, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| json_value_for_key(value, key))
-        .and_then(json_string)
-}
-
-fn json_array_for_keys<'a>(value: &'a JsonValue, keys: &[&str]) -> Option<&'a [JsonValue]> {
-    keys.iter()
-        .find_map(|key| json_value_for_key(value, key))
-        .and_then(json_array)
-}
-
-fn json_array_for_key<'a>(value: &'a JsonValue, key: &str) -> Option<&'a [JsonValue]> {
-    json_value_for_key(value, key).and_then(json_array)
-}
-
-fn json_value_for_key<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
-    if value.kind != JsonValueKind::Object {
-        return None;
-    }
-    value
-        .object_entries
-        .as_ref()?
-        .iter()
-        .find(|entry: &&JsonObjectEntry| entry.key == key)
-        .map(|entry| &entry.value)
-}
-
-fn json_string(value: &JsonValue) -> Option<String> {
-    match value.kind {
-        JsonValueKind::String => value.string_value.clone(),
-        JsonValueKind::I64 => value.i64_value.map(|value| value.to_string()),
-        JsonValueKind::U64 => value.u64_value.map(|value| value.to_string()),
-        JsonValueKind::F64 => value.f64_value.map(|value| value.to_string()),
-        JsonValueKind::Bool => value.bool_value.map(|value| value.to_string()),
-        _ => None,
-    }
-}
-
-fn json_array(value: &JsonValue) -> Option<&[JsonValue]> {
-    if value.kind == JsonValueKind::Array {
-        value.array_items.as_deref()
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{VoiceDerivedUpdate, VoiceRealtimeState};
     use crate::types::ThreadKey;
-    use crate::types::generated::JsonValue;
     use serde_json::json;
-
-    fn json_value(value: serde_json::Value) -> JsonValue {
-        serde_json::from_value(value).expect("json value should convert")
-    }
 
     #[test]
     fn transcript_deltas_are_merged_and_deduped() {
@@ -414,7 +383,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "input_transcript_delta", "delta": "Hel"})),
+            &json!({"type": "input_transcript_delta", "delta": "Hel"}),
         );
         let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
             panic!("expected transcript update");
@@ -424,7 +393,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "input_transcript_delta", "delta": "Hello"})),
+            &json!({"type": "input_transcript_delta", "delta": "Hello"}),
         );
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected merged transcript update");
@@ -433,7 +402,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "input_transcript_delta", "delta": "Hello"})),
+            &json!({"type": "input_transcript_delta", "delta": "Hello"}),
         );
         assert!(updates.is_empty());
     }
@@ -448,7 +417,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "output_transcript_delta", "delta": "Tool"})),
+            &json!({"type": "output_transcript_delta", "delta": "Tool"}),
         );
         let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
             panic!("expected transcript update");
@@ -456,12 +425,12 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({
+            &json!({
                 "type": "message",
                 "role": "assistant",
                 "id": "item_123",
                 "content": [{"type": "text", "text": "Tool result"}]
-            })),
+            }),
         );
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final message update");
@@ -482,7 +451,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "input_transcript_delta", "delta": "Hello"})),
+            &json!({"type": "input_transcript_delta", "delta": "Hello"}),
         );
         let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
             panic!("expected transcript update");
@@ -490,19 +459,19 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({
+            &json!({
                 "type": "message",
                 "role": "user",
                 "id": "item_user_123",
                 "content": [{"type": "input_text", "text": "Hello there"}]
-            })),
+            }),
         );
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final user message update");
         };
         assert_eq!(first.item_id, "voice-user-0");
         assert_eq!(second.item_id, "item_user_123");
-        assert_eq!(second.speaker, crate::uniffi_shared::AppVoiceSpeaker::User);
+        assert_eq!(second.speaker, crate::types::AppVoiceSpeaker::User);
         assert_eq!(second.text, "Hello there");
         assert!(second.is_final);
     }
@@ -517,7 +486,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "output_transcript_delta", "delta": "Hi"})),
+            &json!({"type": "output_transcript_delta", "delta": "Hi"}),
         );
         let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
             panic!("expected transcript update");
@@ -525,12 +494,12 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({
+            &json!({
                 "type": "message",
                 "role": "assistant",
                 "id": "item_assistant_123",
                 "content": [{"type": "output_text", "text": "Hi there"}]
-            })),
+            }),
         );
         let [VoiceDerivedUpdate::Transcript(second)] = updates.as_slice() else {
             panic!("expected final assistant message update");
@@ -539,7 +508,7 @@ mod tests {
         assert_eq!(second.item_id, "item_assistant_123");
         assert_eq!(
             second.speaker,
-            crate::uniffi_shared::AppVoiceSpeaker::Assistant
+            crate::types::AppVoiceSpeaker::Assistant
         );
         assert_eq!(second.text, "Hi there");
         assert!(second.is_final);
@@ -555,7 +524,7 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({"type": "input_transcript_delta", "delta": "Search docs"})),
+            &json!({"type": "input_transcript_delta", "delta": "Search docs"}),
         );
         let [VoiceDerivedUpdate::Transcript(first)] = updates.as_slice() else {
             panic!("expected live user transcript");
@@ -564,12 +533,12 @@ mod tests {
 
         let updates = state.handle_item(
             &key,
-            &json_value(json!({
+            &json!({
                 "type": "message",
                 "role": "assistant",
                 "id": "item_assistant_456",
                 "content": [{"type": "output_text", "text": "Looking now"}]
-            })),
+            }),
         );
         assert_eq!(updates.len(), 2);
         let VoiceDerivedUpdate::Transcript(flushed_user) = &updates[0] else {
@@ -580,13 +549,13 @@ mod tests {
         };
         assert_eq!(
             flushed_user.speaker,
-            crate::uniffi_shared::AppVoiceSpeaker::User
+            crate::types::AppVoiceSpeaker::User
         );
         assert_eq!(flushed_user.text, "Search docs");
         assert!(flushed_user.is_final);
         assert_eq!(
             assistant_final.speaker,
-            crate::uniffi_shared::AppVoiceSpeaker::Assistant
+            crate::types::AppVoiceSpeaker::Assistant
         );
         assert_eq!(assistant_final.text, "Looking now");
         assert!(assistant_final.is_final);
@@ -601,13 +570,13 @@ mod tests {
         };
         let updates = state.handle_item(
             &key,
-            &json_value(json!({
+            &json!({
                 "type": "handoff_request",
                 "handoff_id": "handoff-1",
                 "input_transcript": "Search docs",
                 "active_transcript": [{"role": "user", "text": "Search docs"}],
                 "server_hint": "remote"
-            })),
+            }),
         );
         let [VoiceDerivedUpdate::HandoffRequest(request)] = updates.as_slice() else {
             panic!("expected handoff request");
@@ -626,7 +595,7 @@ mod tests {
         };
 
         let legacy_state = VoiceRealtimeState::default();
-        let legacy = legacy_state.handle_item(&key, &json_value(json!({"type": "speech_started"})));
+        let legacy = legacy_state.handle_item(&key, &json!({"type": "speech_started"}));
         assert!(matches!(
             legacy.as_slice(),
             [VoiceDerivedUpdate::SpeechStarted]
@@ -635,7 +604,7 @@ mod tests {
         let upstream_state = VoiceRealtimeState::default();
         let upstream = upstream_state.handle_item(
             &key,
-            &json_value(json!({"type": "input_audio_buffer.speech_started"})),
+            &json!({"type": "input_audio_buffer.speech_started"}),
         );
         assert!(matches!(
             upstream.as_slice(),
