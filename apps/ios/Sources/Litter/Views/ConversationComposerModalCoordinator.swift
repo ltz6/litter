@@ -60,27 +60,55 @@ struct ConversationComposerModalCoordinator<Content: View>: View {
         )
     }
 
-    private var selectedPermissionLabel: String {
-        ComposerPermissionPreset.allCases.first {
-            $0.approvalPolicy == appState.approvalPolicy(for: snapshot.threadKey)
-                && $0.sandboxMode == appState.sandboxMode(for: snapshot.threadKey)
-        }?.title ?? "Custom"
+    private var selectedApprovalValue: String {
+        appState.approvalPolicy(for: snapshot.threadKey)
     }
 
-    private var currentThreadPermissionLabel: String {
-        guard let thread = appModel.snapshot?.threads.first(where: { $0.key == snapshot.threadKey }) else {
-            return "Checking..."
-        }
-        guard threadPermissionsAreAuthoritative(
+    private var selectedSandboxValue: String {
+        appState.sandboxMode(for: snapshot.threadKey)
+    }
+
+    private var selectedApprovalLabel: String {
+        ComposerApprovalOption.allCases.first { $0.wireValue == selectedApprovalValue }?.title ?? "Custom"
+    }
+
+    private var selectedApprovalDescription: String {
+        ComposerApprovalOption.allCases.first { $0.wireValue == selectedApprovalValue }?.description ?? "This approval policy is managed by the server."
+    }
+
+    private var selectedSandboxLabel: String {
+        ComposerSandboxOption.allCases.first { $0.wireValue == selectedSandboxValue }?.title ?? "Custom"
+    }
+
+    private var selectedSandboxDescription: String {
+        ComposerSandboxOption.allCases.first { $0.wireValue == selectedSandboxValue }?.description ?? "This sandbox setting is managed by the server."
+    }
+
+    private var currentThread: AppThreadSnapshot? {
+        appModel.snapshot?.threads.first(where: { $0.key == snapshot.threadKey })
+    }
+
+    private var hasAuthoritativeThreadPermissions: Bool {
+        guard let thread = currentThread else { return false }
+        return threadPermissionsAreAuthoritative(
             approvalPolicy: thread.effectiveApprovalPolicy,
             sandboxPolicy: thread.effectiveSandboxPolicy
-        ) else {
-            return "Checking..."
-        }
-        return threadPermissionPreset(
-            approvalPolicy: thread.effectiveApprovalPolicy,
-            sandboxPolicy: thread.effectiveSandboxPolicy
-        ).title
+        )
+    }
+
+    private var currentApprovalLabel: String {
+        guard hasAuthoritativeThreadPermissions else { return "Syncing..." }
+        return currentThread?.effectiveApprovalPolicy?.displayTitle ?? "Syncing..."
+    }
+
+    private var currentSandboxLabel: String {
+        guard hasAuthoritativeThreadPermissions else { return "Syncing..." }
+        return currentThread?.effectiveSandboxPolicy?.displayTitle ?? "Syncing..."
+    }
+
+    private var usesThreadDefaults: Bool {
+        selectedApprovalValue == ComposerApprovalOption.default.wireValue
+            && selectedSandboxValue == ComposerSandboxOption.default.wireValue
     }
 
     var body: some View {
@@ -170,53 +198,106 @@ struct ConversationComposerModalCoordinator<Content: View>: View {
     @ViewBuilder
     private var permissionsSheetContent: some View {
         NavigationStack {
-            List {
-                Section(
-                    content: {
-                        LabeledContent("Next turn policy", value: selectedPermissionLabel)
-                            .foregroundStyle(LitterTheme.textPrimary)
-                        LabeledContent("Current thread policy", value: currentThreadPermissionLabel)
-                            .foregroundStyle(LitterTheme.textSecondary)
-                    },
-                    header: {
-                        Text("Current")
-                    },
-                    footer: {
-                        Text("Changes apply on your next turn and later turns.")
-                            .foregroundStyle(LitterTheme.textMuted)
-                            .litterFont(.caption)
-                    })
-                .listRowBackground(LitterTheme.surface.opacity(0.6))
-                ForEach(ComposerPermissionPreset.allCases) { preset in
-                    Button {
-                        appState.setPermissions(
-                            approvalPolicy: preset.approvalPolicy,
-                            sandboxMode: preset.sandboxMode,
-                            for: snapshot.threadKey
-                        )
-                        showPermissionsSheet = false
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(preset.title)
-                                    .foregroundColor(LitterTheme.textPrimary)
-                                    .litterFont(.subheadline)
-                                Spacer()
-                                if preset.approvalPolicy == appState.approvalPolicy(for: snapshot.threadKey)
-                                    && preset.sandboxMode == appState.sandboxMode(for: snapshot.threadKey) {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(LitterTheme.accent)
-                                }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Thread permissions")
+                                    .foregroundStyle(LitterTheme.textPrimary)
+                                    .litterFont(.headline)
+                                Text("Changes apply on your next turn and later turns.")
+                                    .foregroundStyle(LitterTheme.textMuted)
+                                    .litterFont(.caption)
                             }
-                            Text(preset.description)
-                                .foregroundColor(LitterTheme.textSecondary)
-                                .litterFont(.caption)
+                            Spacer(minLength: 12)
+                            Text(usesThreadDefaults ? "Using defaults" : "Custom override")
+                                .foregroundStyle(usesThreadDefaults ? LitterTheme.textSecondary : LitterTheme.accentStrong)
+                                .litterFont(size: 11, weight: .semibold)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    Capsule()
+                                        .fill((usesThreadDefaults ? LitterTheme.surfaceLight : LitterTheme.accentStrong).opacity(0.16))
+                                )
+                        }
+
+                        HStack(spacing: 10) {
+                            permissionSummaryTile(
+                                title: "Next turn",
+                                approval: selectedApprovalLabel,
+                                sandbox: selectedSandboxLabel,
+                                accent: LitterTheme.accentStrong
+                            )
+                            permissionSummaryTile(
+                                title: "Current thread",
+                                approval: currentApprovalLabel,
+                                sandbox: currentSandboxLabel,
+                                accent: hasAuthoritativeThreadPermissions ? LitterTheme.textSecondary : LitterTheme.warning
+                            )
                         }
                     }
-                    .listRowBackground(LitterTheme.surface.opacity(0.6))
+                    .padding(14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .fill(LitterTheme.surface.opacity(0.82))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(LitterTheme.border.opacity(0.55), lineWidth: 1)
+                    )
+
+                    permissionSection(
+                        title: "Approval policy",
+                        subtitle: "Choose when Codex asks for approval"
+                    ) {
+                        permissionDropdown(
+                            title: selectedApprovalLabel,
+                            detail: selectedApprovalDescription
+                        ) {
+                            ForEach(ComposerApprovalOption.allCases) { option in
+                                permissionMenuItem(
+                                    title: option.title,
+                                    description: option.description,
+                                    isSelected: selectedApprovalValue == option.wireValue
+                                ) {
+                                    appState.setPermissions(
+                                        approvalPolicy: option.wireValue,
+                                        sandboxMode: selectedSandboxValue,
+                                        for: snapshot.threadKey
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    permissionSection(
+                        title: "Sandbox settings",
+                        subtitle: "Choose how much Codex can do when running commands"
+                    ) {
+                        permissionDropdown(
+                            title: selectedSandboxLabel,
+                            detail: selectedSandboxDescription
+                        ) {
+                            ForEach(ComposerSandboxOption.allCases) { option in
+                                permissionMenuItem(
+                                    title: option.title,
+                                    description: option.description,
+                                    isSelected: selectedSandboxValue == option.wireValue
+                                ) {
+                                    appState.setPermissions(
+                                        approvalPolicy: selectedApprovalValue,
+                                        sandboxMode: option.wireValue,
+                                        for: snapshot.threadKey
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
+                .padding(16)
+                .padding(.bottom, 28)
             }
-            .scrollContentBackground(.hidden)
             .background(LitterTheme.backgroundGradient.ignoresSafeArea())
             .navigationTitle("Permissions")
             .navigationBarTitleDisplayMode(.inline)
@@ -225,6 +306,141 @@ struct ConversationComposerModalCoordinator<Content: View>: View {
                     Button("Done") { showPermissionsSheet = false }
                         .foregroundColor(LitterTheme.accent)
                 }
+            }
+        }
+    }
+
+    private func permissionSummaryTile(
+        title: String,
+        approval: String,
+        sandbox: String,
+        accent: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .foregroundStyle(LitterTheme.textSecondary)
+                .litterFont(size: 11, weight: .semibold)
+            VStack(alignment: .leading, spacing: 8) {
+                permissionSummaryRow(label: "Approval", value: approval, accent: accent)
+                permissionSummaryRow(label: "Sandbox", value: sandbox, accent: accent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(LitterTheme.surfaceLight.opacity(0.78))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(LitterTheme.border.opacity(0.45), lineWidth: 1)
+        )
+    }
+
+    private func permissionSummaryRow(label: String, value: String, accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .foregroundStyle(LitterTheme.textMuted)
+                .litterFont(size: 10, weight: .medium)
+            Text(value)
+                .foregroundStyle(accent)
+                .litterFont(.subheadline, weight: .semibold)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func permissionSection<SectionContent: View>(
+        title: String,
+        subtitle: String,
+        @ViewBuilder content: () -> SectionContent
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .foregroundStyle(LitterTheme.textPrimary)
+                    .litterFont(.headline)
+                Text(subtitle)
+                    .foregroundStyle(LitterTheme.textSecondary)
+                    .litterFont(.caption)
+            }
+            content()
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(LitterTheme.surface.opacity(0.74))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(LitterTheme.border.opacity(0.5), lineWidth: 1)
+        )
+    }
+
+    private func permissionDropdown<MenuContent: View>(
+        title: String,
+        detail: String,
+        @ViewBuilder content: () -> MenuContent
+    ) -> some View {
+        Menu {
+            content()
+        } label: {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .foregroundStyle(LitterTheme.textPrimary)
+                        .litterFont(size: 14, weight: .semibold)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                    Text(detail)
+                        .foregroundStyle(LitterTheme.textMuted)
+                        .litterFont(size: 11)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.up.chevron.down")
+                    .foregroundStyle(LitterTheme.textMuted)
+                    .imageScale(.small)
+            }
+            .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(LitterTheme.surfaceLight.opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(LitterTheme.border.opacity(0.45), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func permissionMenuItem(
+        title: String,
+        description: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(title)
+                        .foregroundStyle(LitterTheme.textPrimary)
+                        .litterFont(size: 14, weight: .semibold)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(LitterTheme.accentStrong)
+                            .imageScale(.small)
+                    }
+                }
+                Text(description)
+                    .foregroundStyle(LitterTheme.textMuted)
+                    .litterFont(size: 11)
+                    .multilineTextAlignment(.leading)
             }
         }
     }

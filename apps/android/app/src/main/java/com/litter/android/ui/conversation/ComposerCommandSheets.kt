@@ -1,6 +1,7 @@
 package com.litter.android.ui.conversation
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,12 +15,17 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -44,56 +50,95 @@ import com.litter.android.ui.LocalAppModel
 import com.litter.android.ui.LitterTheme
 import kotlinx.coroutines.launch
 import uniffi.codex_mobile_client.AbsolutePath
+import uniffi.codex_mobile_client.AppAskForApproval
 import uniffi.codex_mobile_client.AppListExperimentalFeaturesRequest
 import uniffi.codex_mobile_client.AppListSkillsRequest
 import uniffi.codex_mobile_client.AppWriteConfigValueRequest
 import uniffi.codex_mobile_client.ExperimentalFeature
 import uniffi.codex_mobile_client.AppMergeStrategy
-import uniffi.codex_mobile_client.AppThreadPermissionPreset
+import uniffi.codex_mobile_client.AppSandboxPolicy
 import uniffi.codex_mobile_client.SkillMetadata
 import uniffi.codex_mobile_client.ThreadKey
-import uniffi.codex_mobile_client.threadPermissionPreset
 import uniffi.codex_mobile_client.threadPermissionsAreAuthoritative
 
-private data class ComposerPermissionPreset(
+private data class ComposerSelectionOption(
     val title: String,
     val description: String,
-    val approvalPolicy: String,
-    val sandboxMode: String,
+    val wireValue: String,
 )
 
-private val composerPermissionPresets = listOf(
-    ComposerPermissionPreset(
-        title = "Inherit Server Config",
-        description = "Use the server's configured approval and sandbox settings",
-        approvalPolicy = "inherit",
-        sandboxMode = "inherit",
+private val composerApprovalOptions = listOf(
+    ComposerSelectionOption(
+        title = "Default",
+        description = "Use the thread or server default",
+        wireValue = "inherit",
     ),
-    ComposerPermissionPreset(
-        title = "Supervised",
-        description = "Ask before commands and run in a workspace-write sandbox",
-        approvalPolicy = "on-request",
-        sandboxMode = "workspace-write",
+    ComposerSelectionOption(
+        title = "Untrusted",
+        description = "Always ask before taking action",
+        wireValue = "untrusted",
     ),
-    ComposerPermissionPreset(
-        title = "Full Access",
-        description = "No prompts and danger-full-access sandbox",
-        approvalPolicy = "never",
-        sandboxMode = "danger-full-access",
+    ComposerSelectionOption(
+        title = "On failure",
+        description = "Ask only when a command fails",
+        wireValue = "on-failure",
+    ),
+    ComposerSelectionOption(
+        title = "On request",
+        description = "Ask when escalation is requested",
+        wireValue = "on-request",
+    ),
+    ComposerSelectionOption(
+        title = "Never",
+        description = "Run without asking for approval",
+        wireValue = "never",
     ),
 )
 
-private fun selectedPermissionLabel(approvalPolicy: String, sandboxMode: String): String =
-    composerPermissionPresets.firstOrNull {
-        it.approvalPolicy == approvalPolicy && it.sandboxMode == sandboxMode
-    }?.title ?: "Custom"
+private val composerSandboxOptions = listOf(
+    ComposerSelectionOption(
+        title = "Default",
+        description = "Use the thread or server default",
+        wireValue = "inherit",
+    ),
+    ComposerSelectionOption(
+        title = "Read only",
+        description = "Can read files, but cannot edit them",
+        wireValue = "read-only",
+    ),
+    ComposerSelectionOption(
+        title = "Workspace write",
+        description = "Can edit files, but only in this workspace",
+        wireValue = "workspace-write",
+    ),
+    ComposerSelectionOption(
+        title = "Full access",
+        description = "Can edit files outside this workspace",
+        wireValue = "danger-full-access",
+    ),
+)
 
-private fun AppThreadPermissionPreset.title(): String =
+private fun selectedApprovalLabel(approvalPolicy: String): String =
+    composerApprovalOptions.firstOrNull { it.wireValue == approvalPolicy }?.title ?: "Custom"
+
+private fun selectedSandboxLabel(sandboxMode: String): String =
+    composerSandboxOptions.firstOrNull { it.wireValue == sandboxMode }?.title ?: "Custom"
+
+private fun AppAskForApproval.displayTitle(): String =
     when (this) {
-        AppThreadPermissionPreset.SUPERVISED -> "Supervised"
-        AppThreadPermissionPreset.FULL_ACCESS -> "Full Access"
-        AppThreadPermissionPreset.CUSTOM -> "Custom"
-        AppThreadPermissionPreset.UNKNOWN -> "Unknown"
+        AppAskForApproval.UnlessTrusted -> "Untrusted"
+        AppAskForApproval.OnFailure -> "On failure"
+        AppAskForApproval.OnRequest -> "On request"
+        is AppAskForApproval.Granular -> "Granular"
+        AppAskForApproval.Never -> "Never"
+    }
+
+private fun AppSandboxPolicy.displayTitle(): String =
+    when (this) {
+        AppSandboxPolicy.DangerFullAccess -> "Full access"
+        is AppSandboxPolicy.ReadOnly -> "Read only"
+        is AppSandboxPolicy.WorkspaceWrite -> "Workspace write"
+        is AppSandboxPolicy.ExternalSandbox -> "External sandbox"
     }
 
 @Composable
@@ -103,19 +148,20 @@ fun ComposerPermissionsSheet(threadKey: ThreadKey? = null, onDismiss: () -> Unit
     val selectedApproval = appModel.launchState.selectedApprovalPolicy(threadKey)
     val selectedSandbox = appModel.launchState.selectedSandboxMode(threadKey)
     val effectiveThread = appModel.snapshot.value?.threads?.firstOrNull { it.key == threadKey }
-    val currentThreadPermissionLabel = if (
+    val hasAuthoritativeThreadPermissions = if (
         threadPermissionsAreAuthoritative(
             approvalPolicy = effectiveThread?.effectiveApprovalPolicy,
             sandboxPolicy = effectiveThread?.effectiveSandboxPolicy,
         )
-    ) {
-        threadPermissionPreset(
-            approvalPolicy = effectiveThread?.effectiveApprovalPolicy,
-            sandboxPolicy = effectiveThread?.effectiveSandboxPolicy,
-        ).title()
-    } else {
-        "Checking..."
-    }
+    ) true else false
+    val currentApprovalLabel =
+        if (hasAuthoritativeThreadPermissions) effectiveThread?.effectiveApprovalPolicy?.displayTitle() ?: "Syncing..."
+        else "Syncing..."
+    val currentSandboxLabel =
+        if (hasAuthoritativeThreadPermissions) effectiveThread?.effectiveSandboxPolicy?.displayTitle() ?: "Syncing..."
+        else "Syncing..."
+    val usesThreadDefaults = selectedApproval == "inherit" && selectedSandbox == "inherit"
+    val scrollState = rememberScrollState()
 
     LaunchedEffect(threadKey) {
         threadKey ?: return@LaunchedEffect
@@ -125,67 +171,265 @@ fun ComposerPermissionsSheet(threadKey: ThreadKey? = null, onDismiss: () -> Unit
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .fillMaxSize(fraction = 0.92f)
+            .verticalScroll(scrollState)
             .imePadding()
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         SheetHeader(title = "Permissions", onDismiss = onDismiss)
-        if (threadKey != null) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(LitterTheme.surface.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text(
-                    text = "Next turn policy: ${selectedPermissionLabel(selectedApproval, selectedSandbox)}",
-                    color = LitterTheme.textPrimary,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-                Text(
-                    text = "Current thread policy: $currentThreadPermissionLabel",
-                    color = LitterTheme.textSecondary,
-                    fontSize = 12.sp,
-                )
-                Text(
-                    text = "Changes apply on your next turn and later turns.",
-                    color = LitterTheme.textMuted,
-                    fontSize = 11.sp,
-                )
-            }
-        }
-        composerPermissionPresets.forEachIndexed { index, preset ->
-            val isSelected =
-                preset.approvalPolicy == selectedApproval &&
-                    preset.sandboxMode == selectedSandbox
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(LitterTheme.surface.copy(alpha = 0.82f), RoundedCornerShape(20.dp))
+                .border(1.dp, LitterTheme.border.copy(alpha = 0.55f), RoundedCornerShape(20.dp))
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(LitterTheme.surface.copy(alpha = 0.72f), RoundedCornerShape(12.dp))
-                    .clickable {
-                        appModel.launchState.updateThreadPermissions(threadKey, preset.approvalPolicy, preset.sandboxMode)
-                        onDismiss()
-                    }
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.Top,
             ) {
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(preset.title, color = LitterTheme.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                    Text(preset.description, color = LitterTheme.textSecondary, fontSize = 12.sp)
+                    Text(
+                        text = "Thread permissions",
+                        color = LitterTheme.textPrimary,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "Changes apply on your next turn and later turns.",
+                        color = LitterTheme.textMuted,
+                        fontSize = 11.sp,
+                    )
                 }
-                if (isSelected) {
-                    Icon(
-                        Icons.Default.Check,
-                        contentDescription = null,
-                        tint = LitterTheme.accent,
-                        modifier = Modifier.size(18.dp),
+                Text(
+                    text = if (usesThreadDefaults) "Using defaults" else "Custom override",
+                    color = if (usesThreadDefaults) LitterTheme.textSecondary else LitterTheme.accentStrong,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .background(
+                            color = (if (usesThreadDefaults) LitterTheme.surfaceLight else LitterTheme.accentStrong).copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(999.dp),
+                        )
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PermissionSummaryTile(
+                    title = "Next turn",
+                    approval = selectedApprovalLabel(selectedApproval),
+                    sandbox = selectedSandboxLabel(selectedSandbox),
+                    accent = LitterTheme.accentStrong,
+                    modifier = Modifier.weight(1f),
+                )
+                if (threadKey != null) {
+                    PermissionSummaryTile(
+                        title = "Current thread",
+                        approval = currentApprovalLabel,
+                        sandbox = currentSandboxLabel,
+                        accent = if (hasAuthoritativeThreadPermissions) LitterTheme.textSecondary else LitterTheme.warning,
+                        modifier = Modifier.weight(1f),
                     )
                 }
             }
-            if (index < composerPermissionPresets.lastIndex) {
-                Spacer(Modifier.height(2.dp))
+        }
+
+        PermissionSettingsSection(
+            title = "Approval policy",
+            subtitle = "Choose when Codex asks for approval",
+        ) {
+            PermissionDropdownField(
+                options = composerApprovalOptions,
+                selectedValue = selectedApproval,
+                onSelect = { value ->
+                    appModel.launchState.updateThreadPermissions(threadKey, value, selectedSandbox)
+                },
+            )
+        }
+
+        PermissionSettingsSection(
+            title = "Sandbox settings",
+            subtitle = "Choose how much Codex can do when running commands",
+        ) {
+            PermissionDropdownField(
+                options = composerSandboxOptions,
+                selectedValue = selectedSandbox,
+                onSelect = { value ->
+                    appModel.launchState.updateThreadPermissions(threadKey, selectedApproval, value)
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun PermissionSummaryTile(
+    title: String,
+    approval: String,
+    sandbox: String,
+    accent: androidx.compose.ui.graphics.Color,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .background(LitterTheme.surfaceLight.copy(alpha = 0.78f), RoundedCornerShape(16.dp))
+            .border(1.dp, LitterTheme.border.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = title,
+            color = LitterTheme.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        PermissionSummaryRow(label = "Approval", value = approval, accent = accent)
+        PermissionSummaryRow(label = "Sandbox", value = sandbox, accent = accent)
+    }
+}
+
+@Composable
+private fun PermissionSummaryRow(
+    label: String,
+    value: String,
+    accent: androidx.compose.ui.graphics.Color,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(
+            text = label,
+            color = LitterTheme.textMuted,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Text(
+            text = value,
+            color = accent,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun PermissionSettingsSection(
+    title: String,
+    subtitle: String,
+    content: @Composable () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(LitterTheme.surface.copy(alpha = 0.74f), RoundedCornerShape(20.dp))
+            .border(1.dp, LitterTheme.border.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                text = title,
+                color = LitterTheme.textPrimary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = subtitle,
+                color = LitterTheme.textSecondary,
+                fontSize = 12.sp,
+            )
+        }
+        content()
+    }
+}
+
+@Composable
+private fun PermissionDropdownField(
+    options: List<ComposerSelectionOption>,
+    selectedValue: String,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedOption = options.firstOrNull { it.wireValue == selectedValue }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(LitterTheme.surfaceLight.copy(alpha = 0.9f), RoundedCornerShape(14.dp))
+                .border(1.dp, LitterTheme.border.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                .clickable { expanded = true }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = selectedOption?.title ?: "Custom",
+                    color = LitterTheme.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+                Text(
+                    text = selectedOption?.description ?: "This setting is managed by the server.",
+                    color = LitterTheme.textMuted,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                )
+            }
+            Icon(
+                imageVector = Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                tint = LitterTheme.textMuted,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = option.title,
+                                color = LitterTheme.textPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = option.description,
+                                color = LitterTheme.textMuted,
+                                fontSize = 11.sp,
+                            )
+                        }
+                    },
+                    trailingIcon = {
+                        if (selectedValue == option.wireValue) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                tint = LitterTheme.accentStrong,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    },
+                    onClick = {
+                        expanded = false
+                        onSelect(option.wireValue)
+                    },
+                )
             }
         }
     }

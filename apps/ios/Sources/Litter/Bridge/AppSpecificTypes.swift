@@ -159,6 +159,21 @@ extension AppAskForApproval {
             return nil
         }
     }
+
+    var displayTitle: String {
+        switch self {
+        case .unlessTrusted:
+            return "Untrusted"
+        case .onFailure:
+            return "On failure"
+        case .onRequest:
+            return "On request"
+        case .granular:
+            return "Granular"
+        case .never:
+            return "Never"
+        }
+    }
 }
 
 extension AppSandboxMode {
@@ -172,6 +187,17 @@ extension AppSandboxMode {
             self = .dangerFullAccess
         default:
             return nil
+        }
+    }
+
+    var displayTitle: String {
+        switch self {
+        case .readOnly:
+            return "Read only"
+        case .workspaceWrite:
+            return "Workspace write"
+        case .dangerFullAccess:
+            return "Full access"
         }
     }
 }
@@ -192,6 +218,19 @@ extension AppSandboxPolicy {
 
     var launchOverrideMode: AppSandboxMode? {
         launchOverrideModeWireValue.flatMap(AppSandboxMode.init(wireValue:))
+    }
+
+    var displayTitle: String {
+        switch self {
+        case .dangerFullAccess:
+            return "Full access"
+        case .readOnly:
+            return "Read only"
+        case .workspaceWrite:
+            return "Workspace write"
+        case .externalSandbox:
+            return "External sandbox"
+        }
     }
 }
 
