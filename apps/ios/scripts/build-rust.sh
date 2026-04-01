@@ -20,6 +20,7 @@ PATCH_FILES=(
   "$REPO_DIR/patches/codex/ios-exec-hook.patch"
   "$REPO_DIR/patches/codex/client-controlled-handoff.patch"
   "$REPO_DIR/patches/codex/mobile-code-mode-stub.patch"
+  "$REPO_DIR/patches/codex/thread-read-permissions.patch"
 )
 
 SYNC_MODE="--preserve-current"

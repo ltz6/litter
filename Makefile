@@ -82,7 +82,8 @@ DEV_CARGO_ENV := env -u CARGO_INCREMENTAL
 PATCH_FILES := \
 	$(PATCHES_DIR)/ios-exec-hook.patch \
 	$(PATCHES_DIR)/client-controlled-handoff.patch \
-	$(PATCHES_DIR)/mobile-code-mode-stub.patch
+	$(PATCHES_DIR)/mobile-code-mode-stub.patch \
+	$(PATCHES_DIR)/thread-read-permissions.patch
 
 BOUNDARY_SOURCES := \
 	$(RUST_DIR)/codex-mobile-client/Cargo.toml \
@@ -259,17 +260,7 @@ $(STAMP_SYNC):
 
 patch: $(STAMP_SYNC)
 	@echo "==> Verifying codex patch set..."
-	@for pf in $(PATCH_FILES); do \
-		name=$$(basename "$$pf"); \
-		if git -C $(SUBMODULE_DIR) apply --reverse --check "$$pf" >/dev/null 2>&1; then \
-			echo "    $$name already applied"; \
-		elif git -C $(SUBMODULE_DIR) apply --check "$$pf" >/dev/null 2>&1; then \
-			echo "    Applying $$name..."; \
-			git -C $(SUBMODULE_DIR) apply "$$pf"; \
-		else \
-			echo "ERROR: $$name does not apply cleanly" >&2; exit 1; \
-		fi; \
-	done
+	@$(IOS_SCRIPTS)/sync-codex.sh --preserve-current
 
 unpatch:
 	@echo "==> Reverting codex patches..."
