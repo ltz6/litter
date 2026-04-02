@@ -637,7 +637,7 @@ jobs:
           SCHEME="Litter"
           APP_BUNDLE_ID="com.sigkitten.litter"
           BETA_GROUP_NAMES="Internal Testers,External Testers"
-          WAIT_FOR_PROCESSING="1"
+          WAIT_FOR_PROCESSING="0"
 
           echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
           echo "APP_BUNDLE_ID=$APP_BUNDLE_ID" >> "$GITHUB_ENV"
