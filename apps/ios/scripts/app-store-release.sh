@@ -13,6 +13,9 @@ APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.sigkitten.litter}"
 APP_STORE_APP_ID="${APP_STORE_APP_ID:-}"
 TEAM_ID="${TEAM_ID:-}"
 PROVISIONING_PROFILE_SPECIFIER="${PROVISIONING_PROFILE_SPECIFIER:-Litter App Store}"
+APP_PROVISIONING_PROFILE_SPECIFIER="${APP_PROVISIONING_PROFILE_SPECIFIER:-$PROVISIONING_PROFILE_SPECIFIER}"
+LIVE_ACTIVITY_BUNDLE_ID="${LIVE_ACTIVITY_BUNDLE_ID:-com.sigkitten.litter.liveactivity}"
+LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER="${LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER:-}"
 EXPORT_SIGNING_STYLE="${EXPORT_SIGNING_STYLE:-automatic}"
 BUILD_NUMBER="${BUILD_NUMBER:-}"
 FASTLANE_METADATA_DIR="${FASTLANE_METADATA_DIR:-$FASTLANE_DIR}"
@@ -42,7 +45,7 @@ ensure_semver "$MARKETING_VERSION"
 validate_fastlane_metadata "$FASTLANE_METADATA_DIR"
 
 APP_STORE_APP_ID="$(resolve_app_store_app_id "$APP_STORE_APP_ID" "$APP_BUNDLE_ID")"
-TEAM_ID="$(resolve_team_id "$TEAM_ID" "$PROJECT_PATH" "$SCHEME" "$CONFIGURATION" "$EXPORT_SIGNING_STYLE" "$PROVISIONING_PROFILE_SPECIFIER")"
+TEAM_ID="$(resolve_team_id "$TEAM_ID" "$PROJECT_PATH" "$SCHEME" "$CONFIGURATION" "$EXPORT_SIGNING_STYLE" "$APP_PROVISIONING_PROFILE_SPECIFIER")"
 
 if [[ "$EXPORT_SIGNING_STYLE" != "automatic" && "$EXPORT_SIGNING_STYLE" != "manual" ]]; then
     echo "Unsupported EXPORT_SIGNING_STYLE: $EXPORT_SIGNING_STYLE" >&2
@@ -50,8 +53,13 @@ if [[ "$EXPORT_SIGNING_STYLE" != "automatic" && "$EXPORT_SIGNING_STYLE" != "manu
     exit 1
 fi
 
-if [[ "$EXPORT_SIGNING_STYLE" == "manual" && -z "$PROVISIONING_PROFILE_SPECIFIER" ]]; then
-    echo "Manual export signing requires PROVISIONING_PROFILE_SPECIFIER." >&2
+if [[ "$EXPORT_SIGNING_STYLE" == "manual" && -z "$APP_PROVISIONING_PROFILE_SPECIFIER" ]]; then
+    echo "Manual export signing requires APP_PROVISIONING_PROFILE_SPECIFIER." >&2
+    exit 1
+fi
+
+if [[ "$EXPORT_SIGNING_STYLE" == "manual" && -z "$LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER" ]]; then
+    echo "Manual export signing requires LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER." >&2
     exit 1
 fi
 
@@ -79,7 +87,6 @@ archive_cmd=(
     -configuration "$CONFIGURATION"
     -destination "generic/platform=iOS"
     -archivePath "$ARCHIVE_PATH"
-    -allowProvisioningUpdates
     clean archive
     MARKETING_VERSION="$MARKETING_VERSION"
     CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
@@ -89,7 +96,18 @@ if [[ -n "$TEAM_ID" ]]; then
     archive_cmd+=(DEVELOPMENT_TEAM="$TEAM_ID")
 fi
 
-if [[ "${#auth_args[@]}" -gt 0 ]]; then
+if [[ "$EXPORT_SIGNING_STYLE" == "manual" ]]; then
+    archive_cmd+=(
+        APP_CODE_SIGN_STYLE=Manual
+        LIVE_ACTIVITY_CODE_SIGN_STYLE=Manual
+        APP_PROVISIONING_PROFILE_SPECIFIER="$APP_PROVISIONING_PROFILE_SPECIFIER"
+        LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER="$LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER"
+    )
+else
+    archive_cmd+=(-allowProvisioningUpdates)
+fi
+
+if [[ "$EXPORT_SIGNING_STYLE" == "automatic" && "${#auth_args[@]}" -gt 0 ]]; then
     archive_cmd+=("${auth_args[@]}")
 fi
 
@@ -119,7 +137,8 @@ if [[ -n "$TEAM_ID" ]]; then
 fi
 if [[ "$EXPORT_SIGNING_STYLE" == "manual" ]]; then
     /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" "$EXPORT_OPTIONS_PLIST"
-    /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$APP_BUNDLE_ID string $PROVISIONING_PROFILE_SPECIFIER" "$EXPORT_OPTIONS_PLIST"
+    /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$APP_BUNDLE_ID string $APP_PROVISIONING_PROFILE_SPECIFIER" "$EXPORT_OPTIONS_PLIST"
+    /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$LIVE_ACTIVITY_BUNDLE_ID string $LIVE_ACTIVITY_PROVISIONING_PROFILE_SPECIFIER" "$EXPORT_OPTIONS_PLIST"
 fi
 
 echo "==> Exporting IPA (signing: $EXPORT_SIGNING_STYLE)"
@@ -129,10 +148,13 @@ export_cmd=(
     -archivePath "$ARCHIVE_PATH"
     -exportPath "$BUILD_DIR"
     -exportOptionsPlist "$EXPORT_OPTIONS_PLIST"
-    -allowProvisioningUpdates
 )
 
-if [[ "${#auth_args[@]}" -gt 0 ]]; then
+if [[ "$EXPORT_SIGNING_STYLE" == "automatic" ]]; then
+    export_cmd+=(-allowProvisioningUpdates)
+fi
+
+if [[ "$EXPORT_SIGNING_STYLE" == "automatic" && "${#auth_args[@]}" -gt 0 ]]; then
     export_cmd+=("${auth_args[@]}")
 fi
 
