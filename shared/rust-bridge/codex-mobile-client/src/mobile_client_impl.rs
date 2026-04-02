@@ -14,7 +14,7 @@ use url::Url;
 use crate::discovery::{DiscoveredServer, DiscoveryConfig, DiscoveryService, MdnsSeed};
 use crate::session::connection::InProcessConfig;
 use crate::session::connection::{
-    RemoteSessionResources, ServerConfig, ServerEvent, ServerSession,
+    RemoteSessionResources, ServerConfig, ServerEvent, ServerSession, SshReconnectTransport,
 };
 use crate::session::events::{EventProcessor, UiEvent};
 use crate::ssh::{SshBootstrapResult, SshClient, SshCredentials};
@@ -516,6 +516,7 @@ impl MobileClient {
                 accept_unknown_host,
                 ssh_client,
                 bootstrap,
+                working_dir,
                 ipc_socket_path_override,
             )
             .await;
@@ -538,9 +539,10 @@ impl MobileClient {
         &self,
         mut config: ServerConfig,
         ssh_credentials: SshCredentials,
-        accept_unknown_host: bool,
+        _accept_unknown_host: bool,
         ssh_client: Arc<SshClient>,
         bootstrap: SshBootstrapResult,
+        working_dir: Option<String>,
         ipc_socket_path_override: Option<String>,
     ) -> Result<String, TransportError> {
         let server_id = config.server_id.clone();
@@ -558,67 +560,27 @@ impl MobileClient {
         config.websocket_url = Some(format!("ws://127.0.0.1:{}", bootstrap.tunnel_local_port));
         config.is_local = false;
         config.tls = false;
-
-        let ipc_ssh_client = match SshClient::connect(
-            ssh_credentials.clone(),
-            make_accept_unknown_host_callback(accept_unknown_host),
-        )
-        .await
-        {
-            Ok(client) => {
-                info!(
-                    "MobileClient: dedicated IPC SSH transport established server_id={} host={} ssh_port={}",
-                    server_id,
-                    ssh_credentials.host.as_str(),
-                    ssh_credentials.port
-                );
-                Some(Arc::new(client))
-            }
-            Err(error) => {
-                warn!(
-                    "MobileClient: failed to establish dedicated IPC SSH transport server_id={} host={} error={}; falling back to shared SSH handle",
-                    server_id,
-                    ssh_credentials.host.as_str(),
-                    error
-                );
-                None
-            }
+        let ssh_pid = Arc::new(StdMutex::new(bootstrap.pid));
+        let ssh_reconnect_transport = SshReconnectTransport {
+            ssh_client: Arc::clone(&ssh_client),
+            local_port: bootstrap.tunnel_local_port,
+            remote_port: Arc::new(StdMutex::new(bootstrap.server_port)),
+            prefer_ipv6: config.host.contains(':'),
+            working_dir,
+            ssh_pid: Some(Arc::clone(&ssh_pid)),
         };
-        let ipc_attach_ssh_client = ipc_ssh_client.as_ref().unwrap_or(&ssh_client);
+
         let ipc_enabled = ipc_socket_path_override
             .as_deref()
             .is_none_or(|path| !path.trim().is_empty());
         let ipc_bridge_pid = ipc_enabled.then(|| Arc::new(StdMutex::new(None)));
-        let (initial_ipc_client, initial_ipc_bridge_pid) = if ipc_enabled {
-            trace!(
-                "MobileClient: finish_connect_remote_over_ssh attaching IPC over SSH server_id={}",
-                server_id
-            );
-            attach_ipc_client_for_remote_session(
-                ipc_attach_ssh_client,
-                config.server_id.as_str(),
-                ipc_socket_path_override.as_deref(),
-            )
-            .await
-        } else {
-            (None, None)
-        };
-        if let Some(bridge_pid_slot) = ipc_bridge_pid.as_ref() {
-            match bridge_pid_slot.lock() {
-                Ok(mut guard) => *guard = initial_ipc_bridge_pid,
-                Err(error) => {
-                    warn!("MobileClient: recovering poisoned ipc_bridge_pid lock");
-                    *error.into_inner() = initial_ipc_bridge_pid;
-                }
-            }
-        }
         let ipc_client = if ipc_enabled {
-            let reconnect_ssh_client = Arc::clone(ipc_attach_ssh_client);
+            let reconnect_ssh_client = Arc::clone(&ssh_client);
             let reconnect_server_id = config.server_id.clone();
             let reconnect_ipc_socket_path_override = ipc_socket_path_override.clone();
             let reconnect_bridge_pid = ipc_bridge_pid.as_ref().map(Arc::clone);
             Some(ReconnectingIpcClient::start_with_connector(
-                initial_ipc_client,
+                None,
                 move || {
                     let reconnect_ssh_client = Arc::clone(&reconnect_ssh_client);
                     let reconnect_server_id = reconnect_server_id.clone();
@@ -661,7 +623,7 @@ impl MobileClient {
                         client.ok_or(IpcError::NotConnected)
                     }
                 },
-                ReconnectPolicy::default(),
+                ipc_reconnect_policy(),
             ))
         } else {
             None
@@ -678,10 +640,11 @@ impl MobileClient {
             config,
             RemoteSessionResources {
                 ssh_client: Some(Arc::clone(&ssh_client)),
-                ssh_pid: bootstrap.pid,
+                ssh_pid: Some(Arc::clone(&ssh_pid)),
                 ipc_client,
-                ipc_ssh_client,
+                ipc_ssh_client: None,
                 ipc_bridge_pid,
+                ssh_reconnect_transport: Some(ssh_reconnect_transport),
             },
         )
         .await
@@ -1387,9 +1350,7 @@ impl MobileClient {
                 Ok(true) => {
                     debug!(
                         "MobileClient: user input response sent over IPC for server={} request_id={} submission_id={}",
-                        request.server_id,
-                        request_id,
-                        submission_id
+                        request.server_id, request_id, submission_id
                     );
                     self.app_store
                         .resolve_pending_user_input_with_response(request_id, answered_inputs);
@@ -2068,11 +2029,18 @@ fn shell_quote_remote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-async fn attach_ipc_client_via_ssh(
+fn ipc_reconnect_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        initial_delay: std::time::Duration::ZERO,
+        ..ReconnectPolicy::default()
+    }
+}
+
+async fn resolve_remote_ipc_socket_path_for_session(
     ssh_client: &Arc<SshClient>,
     server_id: &str,
     ipc_socket_path_override: Option<&str>,
-) -> Option<IpcClient> {
+) -> Option<String> {
     match ssh_client
         .remote_ipc_socket_if_present(ipc_socket_path_override)
         .await
@@ -2082,33 +2050,7 @@ async fn attach_ipc_client_via_ssh(
                 "IPC socket detected server={} path={}",
                 server_id, socket_path
             );
-            let ipc_config = IpcClientConfig {
-                socket_path: std::path::PathBuf::from(&socket_path),
-                client_type: "mobile".to_string(),
-                ..IpcClientConfig::default()
-            };
-            match ssh_client.open_streamlocal(&socket_path).await {
-                Ok(stream) => match IpcClient::connect_with_stream(&ipc_config, stream).await {
-                    Ok(client) => {
-                        info!("IPC attached server={} path={}", server_id, socket_path);
-                        Some(client)
-                    }
-                    Err(error) => {
-                        warn!(
-                            "MobileClient: failed to attach IPC for {} at {}: {}",
-                            server_id, socket_path, error
-                        );
-                        None
-                    }
-                },
-                Err(error) => {
-                    warn!(
-                        "MobileClient: failed to open IPC streamlocal for {} at {}: {}",
-                        server_id, socket_path, error
-                    );
-                    None
-                }
-            }
+            Some(socket_path)
         }
         Ok(None) => None,
         Err(error) => {
@@ -2121,26 +2063,48 @@ async fn attach_ipc_client_via_ssh(
     }
 }
 
+async fn attach_ipc_client_via_ssh(
+    ssh_client: &Arc<SshClient>,
+    server_id: &str,
+    socket_path: &str,
+) -> Option<IpcClient> {
+    let ipc_config = IpcClientConfig {
+        socket_path: std::path::PathBuf::from(socket_path),
+        client_type: "mobile".to_string(),
+        ..IpcClientConfig::default()
+    };
+    match ssh_client.open_streamlocal(socket_path).await {
+        Ok(stream) => match IpcClient::connect_with_stream(&ipc_config, stream).await {
+            Ok(client) => {
+                info!(
+                    "IPC attached server={} transport=direct-streamlocal path={}",
+                    server_id, socket_path
+                );
+                Some(client)
+            }
+            Err(error) => {
+                warn!(
+                    "MobileClient: failed to attach IPC for {} at {}: {}",
+                    server_id, socket_path, error
+                );
+                None
+            }
+        },
+        Err(error) => {
+            warn!(
+                "MobileClient: failed to open IPC streamlocal for {} at {}: {}",
+                server_id, socket_path, error
+            );
+            None
+        }
+    }
+}
+
 async fn attach_ipc_client_via_tcp_bridge(
     ssh_client: &Arc<SshClient>,
     server_id: &str,
-    ipc_socket_path_override: Option<&str>,
+    socket_path: &str,
 ) -> Option<(IpcClient, Option<u32>)> {
-    let socket_path = match ssh_client
-        .remote_ipc_socket_if_present(ipc_socket_path_override)
-        .await
-    {
-        Ok(Some(path)) => path,
-        Ok(None) => return None,
-        Err(error) => {
-            warn!(
-                "MobileClient: failed to probe IPC socket for {}: {}",
-                server_id, error
-            );
-            return None;
-        }
-    };
-
     let mut selected_port = None;
     for port in 39400..39420 {
         let check = format!(
@@ -2297,8 +2261,19 @@ async fn attach_ipc_client_for_remote_session(
     server_id: &str,
     ipc_socket_path_override: Option<&str>,
 ) -> (Option<IpcClient>, Option<u32>) {
+    let Some(socket_path) =
+        resolve_remote_ipc_socket_path_for_session(ssh_client, server_id, ipc_socket_path_override)
+            .await
+    else {
+        return (None, None);
+    };
+
+    if let Some(client) = attach_ipc_client_via_ssh(ssh_client, server_id, &socket_path).await {
+        return (Some(client), None);
+    }
+
     if let Some((client, bridge_pid)) =
-        attach_ipc_client_via_tcp_bridge(ssh_client, server_id, ipc_socket_path_override).await
+        attach_ipc_client_via_tcp_bridge(ssh_client, server_id, &socket_path).await
     {
         info!(
             "IPC attached server={} transport=tcp-bridge bridge_pid={:?}",
@@ -2307,14 +2282,7 @@ async fn attach_ipc_client_for_remote_session(
         return (Some(client), bridge_pid);
     }
 
-    let client = attach_ipc_client_via_ssh(ssh_client, server_id, ipc_socket_path_override).await;
-    if client.is_some() {
-        info!(
-            "IPC attached server={} transport=direct-streamlocal",
-            server_id
-        );
-    }
-    (client, None)
+    (None, None)
 }
 
 impl Default for MobileClient {

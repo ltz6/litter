@@ -478,7 +478,11 @@ impl SshBridge {
 }
 
 async fn read_wake_mac(session: Arc<SshClient>) -> Option<String> {
-    let result = session.exec(WAKE_MAC_SCRIPT).await.map_err(map_ssh_error).ok()?;
+    let result = session
+        .exec(WAKE_MAC_SCRIPT)
+        .await
+        .map_err(map_ssh_error)
+        .ok()?;
     if result.exit_code != 0 {
         return None;
     }
@@ -731,6 +735,7 @@ async fn run_guided_ssh_connect(
                 server_version: bootstrap.server_version,
                 pid: bootstrap.pid,
             },
+            working_dir,
             ipc_socket_path_override,
         )
         .await

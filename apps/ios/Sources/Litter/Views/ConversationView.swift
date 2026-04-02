@@ -1046,10 +1046,16 @@ private struct ConversationTurnRow: View {
     private var collapsedCard: some View {
         Button(action: onToggleExpansion) {
             previewTextBlock
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .modifier(GlassRectModifier(cornerRadius: 16, tint: LitterTheme.surface.opacity(0.34)))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+                .padding(.bottom, collapsedFooterReservedInset)
+                .modifier(GlassRectModifier(cornerRadius: 16, tint: LitterTheme.surface.opacity(0.34)))
+                .overlay(alignment: .bottomLeading) {
+                    footerRow
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 10)
+                }
         }
         .buttonStyle(.plain)
         .contentShape(RoundedRectangle(cornerRadius: 16))
@@ -1069,23 +1075,19 @@ private struct ConversationTurnRow: View {
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            ZStack(alignment: .bottomLeading) {
-                Text(verbatim: responsePreviewText)
-                    .litterFont(.body)
-                    .foregroundColor(LitterTheme.textSecondary.opacity(0.82))
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .multilineTextAlignment(.leading)
-                    .frame(
-                        maxWidth: .infinity,
-                        minHeight: collapsedResponseHeight,
-                        maxHeight: collapsedResponseHeight,
-                        alignment: .topLeading
-                    )
-                    .mask(responsePreviewMask)
-
-                footerRow
-            }
+            Text(verbatim: responsePreviewText)
+                .litterFont(.body)
+                .foregroundColor(LitterTheme.textSecondary.opacity(0.82))
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: collapsedResponseHeight,
+                    maxHeight: collapsedResponseHeight,
+                    alignment: .topLeading
+                )
+                .mask(responsePreviewMask)
         }
         .frame(maxWidth: .infinity, minHeight: collapsedPreviewHeight, maxHeight: collapsedPreviewHeight, alignment: .topLeading)
     }
@@ -1114,6 +1116,14 @@ private struct ConversationTurnRow: View {
 
     private var collapsedPreviewHeight: CGFloat {
         collapsedPrimaryLineHeight + collapsedResponseHeight + 4
+    }
+
+    private var collapsedFooterReservedInset: CGFloat {
+        collapsedFooterHeight + 10
+    }
+
+    private var collapsedFooterHeight: CGFloat {
+        max(UIFont.preferredFont(forTextStyle: .caption1).lineHeight * textScale, 14)
     }
 
     private var responsePreviewMask: some View {

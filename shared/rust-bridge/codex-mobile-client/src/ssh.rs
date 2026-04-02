@@ -774,20 +774,17 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
                 info!("port {port} already listening, probing existing candidate");
                 append_bridge_info_log(&format!("ssh_bootstrap_reuse_probe_start port={}", port));
 
-                let (probe_port, probe_task) =
-                    self.spawn_forward_port(0, remote_loopback, port).await?;
+                let local_port = self.forward_port_to(0, remote_loopback, port).await?;
                 let null_path = match shell {
                     RemoteShell::Posix => "/dev/null",
                     RemoteShell::PowerShell => "NUL",
                 };
                 let websocket_ready = self
-                    .wait_for_forwarded_websocket_ready(probe_port, None, shell, null_path, None)
+                    .wait_for_forwarded_websocket_ready(local_port, None, shell, null_path, None)
                     .await;
-                probe_task.abort();
 
                 match websocket_ready {
                     Ok(()) => {
-                        let local_port = self.forward_port_to(0, remote_loopback, port).await?;
                         let version = self
                             .read_server_version_shell(codex_binary.path(), shell)
                             .await;
@@ -805,6 +802,7 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
                         });
                     }
                     Err(error) => {
+                        let _ = self.abort_forward_port(local_port).await;
                         warn!(
                             "occupied port {port} did not respond like a healthy app-server: {error}"
                         );
@@ -955,20 +953,19 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
             }
 
             // --- 4. Prove the websocket endpoint is actually ready -------
-            let (probe_port, probe_task) =
-                self.spawn_forward_port(0, remote_loopback, port).await?;
+            let local_port = self.forward_port_to(0, remote_loopback, port).await?;
             let websocket_ready = self
                 .wait_for_forwarded_websocket_ready(
-                    probe_port,
+                    local_port,
                     pid,
                     shell,
                     &log_path,
                     stderr_log_path.as_deref(),
                 )
                 .await;
-            probe_task.abort();
 
             if let Err(error) = websocket_ready {
+                let _ = self.abort_forward_port(local_port).await;
                 warn!("remote websocket readiness probe failed on port {port}: {error}");
                 append_bridge_info_log(&format!(
                     "ssh_bootstrap_probe_failed port={} error={}",
@@ -991,9 +988,6 @@ printf '%s/codex-ipc/ipc-%s.sock' "$tmp" "$uid""#;
                 }
                 continue;
             }
-
-            // --- 5. Set up local port forwarding -------------------------
-            let local_port = self.forward_port_to(0, remote_loopback, port).await?;
 
             // --- 6. Optionally read server version -----------------------
             let version = self

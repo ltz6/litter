@@ -741,47 +741,37 @@ pub fn extract_message_segments(text: &str) -> Vec<MessageSegment> {
 
 pub fn extract_message_render_blocks(text: &str) -> Vec<MessageRenderBlock> {
     let mut blocks = Vec::new();
+    let mut markdown_buffer = String::new();
 
     for segment in extract_message_segments(text) {
         match segment {
             MessageSegment::Text(text) => {
-                for markdown in crate::markdown_blocks::render_markdown_blocks(&text) {
-                    match markdown {
-                        crate::markdown_blocks::MarkdownBlock::Markdown(markdown) => {
-                            if !markdown.is_empty() {
-                                blocks.push(MessageRenderBlock::Markdown { markdown });
-                            }
-                        }
-                        crate::markdown_blocks::MarkdownBlock::CodeBlock { language, code } => {
-                            blocks.push(MessageRenderBlock::CodeBlock { language, code });
-                        }
-                        crate::markdown_blocks::MarkdownBlock::ThematicBreak => {
-                            blocks.push(MessageRenderBlock::Markdown {
-                                markdown: "---".to_owned(),
-                            });
-                        }
-                    }
-                }
+                markdown_buffer.push_str(&text);
             }
             MessageSegment::InlineMath { latex } => {
-                blocks.push(MessageRenderBlock::Markdown {
-                    markdown: format!("${latex}$"),
-                });
+                markdown_buffer.push('$');
+                markdown_buffer.push_str(&latex);
+                markdown_buffer.push('$');
             }
             MessageSegment::DisplayMath { latex } => {
+                flush_markdown_buffer(&mut blocks, &mut markdown_buffer);
                 blocks.push(MessageRenderBlock::CodeBlock {
                     language: Some("math".to_owned()),
                     code: latex.trim_matches('\n').to_owned(),
                 });
             }
             MessageSegment::CodeBlock { language, code } => {
+                flush_markdown_buffer(&mut blocks, &mut markdown_buffer);
                 blocks.push(MessageRenderBlock::CodeBlock { language, code });
             }
             MessageSegment::InlineImage { data, mime_type } => {
+                flush_markdown_buffer(&mut blocks, &mut markdown_buffer);
                 blocks.push(MessageRenderBlock::InlineImage { data, mime_type });
             }
         }
     }
+
+    flush_markdown_buffer(&mut blocks, &mut markdown_buffer);
 
     if blocks.is_empty() && !text.is_empty() {
         blocks.push(MessageRenderBlock::Markdown {
@@ -790,6 +780,32 @@ pub fn extract_message_render_blocks(text: &str) -> Vec<MessageRenderBlock> {
     }
 
     blocks
+}
+
+fn flush_markdown_buffer(blocks: &mut Vec<MessageRenderBlock>, markdown_buffer: &mut String) {
+    if markdown_buffer.is_empty() {
+        return;
+    }
+
+    for markdown in crate::markdown_blocks::render_markdown_blocks(markdown_buffer) {
+        match markdown {
+            crate::markdown_blocks::MarkdownBlock::Markdown(markdown) => {
+                if !markdown.is_empty() {
+                    blocks.push(MessageRenderBlock::Markdown { markdown });
+                }
+            }
+            crate::markdown_blocks::MarkdownBlock::CodeBlock { language, code } => {
+                blocks.push(MessageRenderBlock::CodeBlock { language, code });
+            }
+            crate::markdown_blocks::MarkdownBlock::ThematicBreak => {
+                blocks.push(MessageRenderBlock::Markdown {
+                    markdown: "---".to_owned(),
+                });
+            }
+        }
+    }
+
+    markdown_buffer.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1427,28 @@ mod tests {
                     markdown: "After".to_owned(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_render_blocks_keep_inline_math_inside_markdown_paragraph() {
+        let blocks = extract_message_render_blocks("Euler: $e^{i\\pi}+1=0$ wow");
+        assert_eq!(
+            blocks,
+            vec![MessageRenderBlock::Markdown {
+                markdown: "Euler: $e^{i\\pi}+1=0$ wow".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_render_blocks_keep_inline_math_with_surrounding_markdown() {
+        let blocks = extract_message_render_blocks("Before **$x$** after");
+        assert_eq!(
+            blocks,
+            vec![MessageRenderBlock::Markdown {
+                markdown: "Before **$x$** after".to_owned(),
+            }]
         );
     }
 

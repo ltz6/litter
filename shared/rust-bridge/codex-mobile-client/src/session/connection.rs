@@ -24,11 +24,21 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::logging::{LogLevelName, log_rust};
-use crate::ssh::SshClient;
+use crate::ssh::{SshBootstrapResult, SshClient};
 use crate::transport::{RpcError, TransportError};
 
 const REMOTE_RECONNECT_MAX_ATTEMPTS: u32 = 5;
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+pub(crate) struct SshReconnectTransport {
+    ssh_client: Arc<SshClient>,
+    local_port: u16,
+    remote_port: Arc<StdMutex<u16>>,
+    prefer_ipv6: bool,
+    working_dir: Option<String>,
+    ssh_pid: Option<Arc<StdMutex<Option<u32>>>>,
+}
 
 fn append_android_debug_log(line: &str) {
     log_rust(
@@ -317,10 +327,11 @@ pub struct ServerConfig {
 #[derive(Default)]
 pub struct RemoteSessionResources {
     pub ssh_client: Option<Arc<SshClient>>,
-    pub ssh_pid: Option<u32>,
+    pub ssh_pid: Option<Arc<StdMutex<Option<u32>>>>,
     pub ipc_client: Option<ReconnectingIpcClient>,
     pub ipc_ssh_client: Option<Arc<SshClient>>,
     pub ipc_bridge_pid: Option<Arc<StdMutex<Option<u32>>>>,
+    pub ssh_reconnect_transport: Option<SshReconnectTransport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +420,7 @@ pub struct ServerSession {
     event_tx: broadcast::Sender<ServerEvent>,
     ipc_client: Option<ReconnectingIpcClient>,
     ssh_client: Option<Arc<SshClient>>,
-    ssh_pid: Option<u32>,
+    ssh_pid: Option<Arc<StdMutex<Option<u32>>>>,
     ipc_ssh_client: Option<Arc<SshClient>>,
     ipc_bridge_pid: Option<Arc<StdMutex<Option<u32>>>>,
     worker_handle: tokio::task::JoinHandle<()>,
@@ -651,6 +662,7 @@ impl ServerSession {
         });
 
         let (url, args) = remote_connect_args(&config);
+        let ssh_reconnect_transport = resources.ssh_reconnect_transport.clone();
         let mut client = connect_remote_client(&args).await?;
 
         let (event_tx, _) = broadcast::channel::<ServerEvent>(256);
@@ -660,6 +672,7 @@ impl ServerSession {
         let health_tx_clone = health_tx.clone();
         let reconnect_args = args.clone();
         let reconnect_url = url.clone();
+        let reconnect_transport = ssh_reconnect_transport.clone();
 
         let worker_handle = tokio::spawn(async move {
             loop {
@@ -708,6 +721,7 @@ impl ServerSession {
                                                         &reconnect_args,
                                                         &reconnect_url,
                                                         &health_tx_clone,
+                                                        reconnect_transport.as_ref(),
                                                     )
                                                     .await
                                                 {
@@ -792,6 +806,7 @@ impl ServerSession {
                                                 &reconnect_args,
                                                 &reconnect_url,
                                                 &health_tx_clone,
+                                                reconnect_transport.as_ref(),
                                             )
                                             .await {
                                                 continue;
@@ -809,6 +824,7 @@ impl ServerSession {
                                                 &reconnect_args,
                                                 &reconnect_url,
                                                 &health_tx_clone,
+                                                reconnect_transport.as_ref(),
                                             )
                                             .await {
                                                 continue;
@@ -998,7 +1014,16 @@ impl ServerSession {
                 }
             }
             if let Some(pid) = self.ssh_pid {
-                let _ = ssh_client.exec(&format!("kill {pid} 2>/dev/null")).await;
+                let pid = match pid.lock() {
+                    Ok(mut guard) => guard.take(),
+                    Err(error) => {
+                        warn!("ServerSession: recovering poisoned ssh_pid lock");
+                        error.into_inner().take()
+                    }
+                };
+                if let Some(pid) = pid {
+                    let _ = ssh_client.exec(&format!("kill {pid} 2>/dev/null")).await;
+                }
             }
             ssh_client.disconnect().await;
         }
@@ -1052,6 +1077,7 @@ async fn reconnect_remote_client(
     args: &RemoteAppServerConnectArgs,
     websocket_url: &str,
     health_tx: &watch::Sender<ConnectionHealth>,
+    ssh_transport: Option<&SshReconnectTransport>,
 ) -> bool {
     for attempt in 1..=REMOTE_RECONNECT_MAX_ATTEMPTS {
         append_android_debug_log(&format!(
@@ -1066,6 +1092,26 @@ async fn reconnect_remote_client(
             attempt,
             max_attempts: REMOTE_RECONNECT_MAX_ATTEMPTS,
         });
+        if let Some(ssh_transport) = ssh_transport {
+            if let Err(error) = ssh_transport
+                .ssh_client
+                .ensure_forward_port_to(
+                    ssh_transport.local_port,
+                    &ssh_transport.remote_host,
+                    ssh_transport.remote_port,
+                )
+                .await
+            {
+                warn!(
+                    "remote reconnect forward restore failed: {} local_port={} remote={}:{} error={}",
+                    websocket_url,
+                    ssh_transport.local_port,
+                    ssh_transport.remote_host,
+                    ssh_transport.remote_port,
+                    error
+                );
+            }
+        }
         match connect_remote_client(args).await {
             Ok(next_client) => {
                 *client = next_client;
@@ -1081,6 +1127,31 @@ async fn reconnect_remote_client(
                 return true;
             }
             Err(error) => {
+                if let Some(ssh_transport) = ssh_transport {
+                    if rebootstrap_remote_client_over_ssh(ssh_transport, websocket_url).await {
+                        match connect_remote_client(args).await {
+                            Ok(next_client) => {
+                                *client = next_client;
+                                let _ = health_tx.send(ConnectionHealth::Connected);
+                                info!(
+                                    "remote server session reconnected after ssh rebootstrap: {} (attempt {attempt}/{})",
+                                    websocket_url, REMOTE_RECONNECT_MAX_ATTEMPTS
+                                );
+                                append_android_debug_log(&format!(
+                                    "reconnect_success url={} attempt={}/{} mode=ssh_rebootstrap",
+                                    websocket_url, attempt, REMOTE_RECONNECT_MAX_ATTEMPTS
+                                ));
+                                return true;
+                            }
+                            Err(retry_error) => {
+                                warn!(
+                                    "remote reconnect after ssh rebootstrap still failed: {} (attempt {attempt}/{}) - {}",
+                                    websocket_url, REMOTE_RECONNECT_MAX_ATTEMPTS, retry_error
+                                );
+                            }
+                        }
+                    }
+                }
                 warn!(
                     "remote server reconnect failed: {} (attempt {attempt}/{}) - {}",
                     websocket_url, REMOTE_RECONNECT_MAX_ATTEMPTS, error
@@ -1098,6 +1169,108 @@ async fn reconnect_remote_client(
 
     let _ = health_tx.send(ConnectionHealth::Disconnected);
     false
+}
+
+fn ssh_reconnect_remote_host(transport: &SshReconnectTransport) -> &'static str {
+    if transport.prefer_ipv6 {
+        "::1"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+fn ssh_reconnect_remote_port(transport: &SshReconnectTransport) -> u16 {
+    match transport.remote_port.lock() {
+        Ok(guard) => *guard,
+        Err(error) => {
+            warn!("remote reconnect: recovering poisoned remote_port lock");
+            *error.into_inner()
+        }
+    }
+}
+
+fn update_ssh_reconnect_remote_port(transport: &SshReconnectTransport, port: u16) {
+    match transport.remote_port.lock() {
+        Ok(mut guard) => *guard = port,
+        Err(error) => {
+            warn!("remote reconnect: recovering poisoned remote_port lock");
+            *error.into_inner() = port;
+        }
+    }
+}
+
+fn update_ssh_reconnect_pid(transport: &SshReconnectTransport, pid: Option<u32>) {
+    let Some(pid_slot) = transport.ssh_pid.as_ref() else {
+        return;
+    };
+    match pid_slot.lock() {
+        Ok(mut guard) => *guard = pid,
+        Err(error) => {
+            warn!("remote reconnect: recovering poisoned ssh_pid lock");
+            *error.into_inner() = pid;
+        }
+    }
+}
+
+async fn rebootstrap_remote_client_over_ssh(
+    transport: &SshReconnectTransport,
+    websocket_url: &str,
+) -> bool {
+    let bootstrap = match transport
+        .ssh_client
+        .bootstrap_codex_server(transport.working_dir.as_deref(), transport.prefer_ipv6)
+        .await
+    {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            warn!(
+                "remote reconnect ssh rebootstrap failed: {} error={}",
+                websocket_url, error
+            );
+            return false;
+        }
+    };
+
+    finalize_ssh_rebootstrap(transport, bootstrap, websocket_url).await
+}
+
+async fn finalize_ssh_rebootstrap(
+    transport: &SshReconnectTransport,
+    bootstrap: SshBootstrapResult,
+    websocket_url: &str,
+) -> bool {
+    let remote_host = ssh_reconnect_remote_host(transport);
+    let existing_local_port = transport.local_port;
+    let previous_remote_port = ssh_reconnect_remote_port(transport);
+
+    if bootstrap.tunnel_local_port != existing_local_port {
+        let _ = transport
+            .ssh_client
+            .abort_forward_port(bootstrap.tunnel_local_port)
+            .await;
+    }
+    if bootstrap.server_port != previous_remote_port {
+        let _ = transport
+            .ssh_client
+            .abort_forward_port(existing_local_port)
+            .await;
+    }
+
+    if let Err(error) = transport
+        .ssh_client
+        .ensure_forward_port_to(existing_local_port, remote_host, bootstrap.server_port)
+        .await
+    {
+        warn!(
+            "remote reconnect ssh rebootstrap forward failed: {} local_port={} remote={}:{} error={}",
+            websocket_url, existing_local_port, remote_host, bootstrap.server_port, error
+        );
+        return false;
+    }
+
+    update_ssh_reconnect_remote_port(transport, bootstrap.server_port);
+    update_ssh_reconnect_pid(transport, bootstrap.pid);
+    true
 }
 
 // ---------------------------------------------------------------------------
