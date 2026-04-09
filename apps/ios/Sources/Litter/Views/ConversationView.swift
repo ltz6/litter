@@ -22,7 +22,12 @@ enum ConversationStreamingViewportPolicy {
         return isNearBottom
     }
 
-
+    static func isStreaming(_ threadStatus: ConversationStatus) -> Bool {
+        if case .thinking = threadStatus {
+            return true
+        }
+        return false
+    }
 }
 
 struct ConversationView: View {
@@ -43,6 +48,7 @@ struct ConversationView: View {
     @AppStorage("fastMode") private var fastMode = false
     @State private var messageActionError: String?
     @State private var hasLoggedFirstRender = false
+    @State private var localSendScrollToken = 0
 
     private var items: [ConversationItem] {
         transcript.items
@@ -73,6 +79,7 @@ struct ConversationView: View {
             threadHasServerData: thread.hasPreviewOrTitle,
             transcriptRenderDigest: transcript.renderDigest,
             followScrollToken: followScrollToken,
+            sendScrollToken: localSendScrollToken,
             activeThreadKey: activeThreadKey,
             agentDirectoryVersion: agentDirectoryVersion,
             topInset: thread.isSubagent ? topInset + 32 : topInset,
@@ -136,6 +143,7 @@ struct ConversationView: View {
     }
 
     private func sendMessage(_ text: String, attachmentImage: UIImage?, skillMentions: [SkillMentionSelection]) {
+        localSendScrollToken &+= 1
         Task {
             do {
                 NSLog(
@@ -169,6 +177,7 @@ struct ConversationView: View {
 
     private func sendWidgetPrompt(_ text: String) {
         guard !text.isEmpty else { return }
+        localSendScrollToken &+= 1
         Task {
             do {
                 let payload = try makeComposerPayload(
@@ -442,7 +451,7 @@ struct RateLimitBadgeView: View, Equatable {
     var body: some View {
         HStack(spacing: 3) {
             Text(label)
-                .litterMonoFont(size: 9.5, weight: .semibold)
+                .font(LitterFont.monospaced(size: 9.5, weight: .semibold))
                 .foregroundColor(LitterTheme.textSecondary)
             ContextBadgeView(percent: percent, tint: tint)
         }
@@ -456,6 +465,7 @@ private struct ConversationMessageList: View {
     let threadHasServerData: Bool
     let transcriptRenderDigest: Int
     let followScrollToken: Int
+    let sendScrollToken: Int
     let activeThreadKey: ThreadKey
     let agentDirectoryVersion: UInt64
     var topInset: CGFloat = 0
@@ -465,14 +475,10 @@ private struct ConversationMessageList: View {
     let onEditUserItem: (ConversationItem) -> Void
     let onForkFromUserItem: (ConversationItem) -> Void
     var onOpenConversation: ((ThreadKey) -> Void)? = nil
-    @State private var pendingScrollWorkItem: DispatchWorkItem?
     @State private var isNearBottom = true
     @State private var autoFollowStreaming = true
     @State private var userIsDraggingScroll = false
     @State private var waitingForDataExpired = false
-    @State private var suppressStatusScroll = false
-    @State private var streamingRenderTick = 0
-    @State private var transcriptLayoutTick = 0
     @State private var pinchBaseStep: Int?
     @State private var pinchAppliedDelta = 0
     @State private var transcriptTurns: [TranscriptTurn] = []
@@ -508,11 +514,8 @@ private struct ConversationMessageList: View {
         return sourceTurns.last?.isLive == true
     }
 
-
     private var messageActionsDisabled: Bool {
-        if case .thinking = threadStatus {
-            return true
-        }
+        if case .thinking = threadStatus { return true }
         return false
     }
 
@@ -525,21 +528,9 @@ private struct ConversationMessageList: View {
     }
 
     private var isStreaming: Bool {
-        if case .thinking = threadStatus {
-            return true
-        }
+        if case .thinking = threadStatus { return true }
         return false
     }
-
-    private var shouldMaintainBottomAnchor: Bool {
-        ConversationStreamingViewportPolicy.shouldMaintainBottomAnchor(
-            isStreaming: isStreaming,
-            isNearBottom: isNearBottom,
-            autoFollowStreaming: autoFollowStreaming,
-            userIsDraggingScroll: userIsDraggingScroll
-        )
-    }
-
 
     private static let initialTurnWindow = 10
     private static let turnPageSize = 20
@@ -547,9 +538,7 @@ private struct ConversationMessageList: View {
 
     private var displayedTurns: [TranscriptTurn] {
         let all = sourceTurns
-        if all.count <= turnWindowSize {
-            return all
-        }
+        if all.count <= turnWindowSize { return all }
         return Array(all.suffix(turnWindowSize))
     }
 
@@ -568,9 +557,7 @@ private struct ConversationMessageList: View {
     private var mergedRenderableTurns: [TranscriptTurn] {
         let turns = displayedTurns
         let buildKey = makeRenderedTurnsBuildKey(for: turns)
-        if renderedTurnsBuildKey == buildKey {
-            return renderedTurns
-        }
+        if renderedTurnsBuildKey == buildKey { return renderedTurns }
         return TranscriptTurn.mergeConsecutiveExplorationTurnsForRendering(turns)
     }
 
@@ -613,7 +600,7 @@ private struct ConversationMessageList: View {
                                     onToggleExpansion: {
                                         toggleTurnExpansion(turn)
                                     },
-                                    onStreamingSnapshotRendered: turn.isLive ? handleStreamingSnapshotRendered : nil,
+                                    onStreamingSnapshotRendered: nil,
                                     resolveTargetLabel: resolveTargetLabel,
                                     onWidgetPrompt: onWidgetPrompt,
                                     onEditUserItem: onEditUserItem,
@@ -625,6 +612,7 @@ private struct ConversationMessageList: View {
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, topInset + 56)
+                        .animation(.spring(response: 0.22, dampingFraction: 0.9), value: textSizeStep)
 
                         if isWaitingForData {
                             ConversationLoadingIndicator(label: "Loading conversation...")
@@ -639,38 +627,27 @@ private struct ConversationMessageList: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: viewport.size.height, alignment: .top)
                 }
-                .onAppear {
-                    syncTranscriptTurns()
-
-                }
+                .scrollIndicators(.hidden)
                 .scrollDismissesKeyboard(.interactively)
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.bottom, for: .sizeChanges)
                 .simultaneousGesture(
                     MagnificationGesture(minimumScaleDelta: 0.03)
-                        .onChanged { scale in
-                            handlePinchChanged(scale: scale)
-                        }
-                        .onEnded { scale in
-                            finishPinch(scale: scale)
-                        }
+                        .onChanged { scale in handlePinchChanged(scale: scale) }
+                        .onEnded { scale in finishPinch(scale: scale) }
                 )
                 .onScrollGeometryChange(for: CGFloat.self) { geo in
-                    if isStreaming && autoFollowStreaming && !userIsDraggingScroll && isNearBottom {
-                        return 0
-                    }
-                    return geo.contentSize.height - geo.contentOffset.y - geo.containerSize.height
+                    geo.contentSize.height - geo.contentOffset.y - geo.containerSize.height
                 } action: { _, distance in
-                    guard pendingScrollWorkItem == nil, !suppressStatusScroll else { return }
-                    // Hysteresis: must exceed 150px to leave bottom, but only 60px to re-enter.
-                    // Prevents oscillation when the scroll indicator toggling shifts layout.
+                    // During streaming auto-follow, don't let intermediate layout values flip isNearBottom.
+                    if isStreaming && autoFollowStreaming && !userIsDraggingScroll { return }
                     let next: Bool
                     if isNearBottom {
                         next = distance <= 150
                     } else {
                         next = distance <= 60
                     }
-                    if next != isNearBottom {
-                        isNearBottom = next
-                    }
+                    if next != isNearBottom { isNearBottom = next }
                     if next {
                         autoFollowStreaming = true
                     } else if isStreaming && userIsDraggingScroll {
@@ -680,98 +657,64 @@ private struct ConversationMessageList: View {
                 .onScrollPhaseChange { _, newPhase in
                     switch newPhase {
                     case .tracking, .interacting:
-                        pendingScrollWorkItem?.cancel()
-                        pendingScrollWorkItem = nil
                         userIsDraggingScroll = true
-                        if isStreaming {
-                            autoFollowStreaming = false
-                        }
+                        if isStreaming { autoFollowStreaming = false }
                     case .decelerating:
                         userIsDraggingScroll = true
                     default:
                         userIsDraggingScroll = false
-                        if isNearBottom {
-                            autoFollowStreaming = true
-                        }
+                        if isNearBottom { autoFollowStreaming = true }
                     }
                 }
-                    .defaultScrollAnchor(.bottom)
-                    .onAppear {
-                        autoFollowStreaming = true
+                .onAppear {
+                    autoFollowStreaming = true
+                    syncTranscriptTurns()
+                }
+                .onChange(of: activeThreadKey) {
+                    autoFollowStreaming = true
+                    isNearBottom = true
+                    waitingForDataExpired = false
+                    resetTurnWindow()
+                    syncTranscriptTurns(resetExpansion: true)
+                }
+                .task(id: activeThreadKey) {
+                    try? await Task.sleep(for: .seconds(1))
+                    waitingForDataExpired = true
+                }
+                .onChange(of: items) { _, _ in
+                    syncTranscriptTurns()
+                }
+                .onChange(of: collapseTurns) {
+                    syncTranscriptTurns(resetExpansion: true)
+                }
+                .onChange(of: followScrollToken) {
+                    guard isStreaming, autoFollowStreaming, !userIsDraggingScroll else { return }
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
                     }
-                    .onChange(of: activeThreadKey) {
-                        autoFollowStreaming = true
-                        isNearBottom = true
-                        waitingForDataExpired = false
-                        suppressStatusScroll = true
-                        resetTurnWindow()
-                        syncTranscriptTurns(resetExpansion: true)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                            suppressStatusScroll = false
-                        }
+                }
+                .onChange(of: sendScrollToken) {
+                    autoFollowStreaming = true
+                    isNearBottom = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
                     }
-                    .task(id: activeThreadKey) {
-                        try? await Task.sleep(for: .seconds(1))
-                        waitingForDataExpired = true
+                }
+                .onChange(of: threadStatus) { oldStatus, _ in
+                    syncTranscriptTurns()
+                    // When streaming ends and we were following, finalize at bottom.
+                    let wasStreaming = { if case .thinking = oldStatus { return true }; return false }()
+                    if wasStreaming && !isStreaming && autoFollowStreaming {
+                        proxy.scrollTo("bottom", anchor: .bottom)
                     }
-                    .onChange(of: items) { _, _ in
-                        syncTranscriptTurns()
-                    }
-                    .onChange(of: collapseTurns) {
-                        syncTranscriptTurns(resetExpansion: true)
-    
-                    }
-                    .onChange(of: followScrollToken) {
-                        guard isStreaming, shouldMaintainBottomAnchor else { return }
-                        scheduleScrollToBottom(
-                            proxy,
-                            delay: 0.01,
-                            replacePending: true,
-                            animation: .easeOut(duration: 0.16)
-                        )
-                    }
-                    .onChange(of: threadStatus) { oldStatus, newStatus in
-                        syncTranscriptTurns()
-
-                        if isStreaming {
-                            autoFollowStreaming = isNearBottom
-                        } else if oldStatus != newStatus, !suppressStatusScroll {
-                            let shouldFinalizeAtBottom = autoFollowStreaming || isNearBottom
-                            userIsDraggingScroll = false
-                            scheduleScrollToBottom(
-                                proxy,
-                                delay: 0.2,
-                                force: shouldFinalizeAtBottom,
-                                animation: nil
-                            )
-                        }
-                    }
-                    .onChange(of: streamingRenderTick) {
-                        guard isStreaming else { return }
-                        scheduleScrollToBottom(
-                            proxy,
-                            delay: 0.02,
-                            replacePending: false,
-                            animation: .easeOut(duration: 0.16)
-                        )
-                    }
-                    .onDisappear {
-                        pendingScrollWorkItem?.cancel()
-                        pendingScrollWorkItem = nil
-
-                    }
-                .animation(.spring(response: 0.22, dampingFraction: 0.9), value: textSizeStep)
+                }
 
                 if shouldShowScrollToBottom {
                     ScrollToBottomIndicator {
-                        autoFollowStreaming = true
-                        isNearBottom = true
-                        suppressStatusScroll = true
                         withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.9)) {
+                            autoFollowStreaming = true
+                            isNearBottom = true
                             proxy.scrollTo("bottom", anchor: .bottom)
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            suppressStatusScroll = false
                         }
                     }
                     .padding(.trailing, 14)
@@ -801,9 +744,7 @@ private struct ConversationMessageList: View {
     private func syncTranscriptTurns(resetExpansion: Bool = false) {
         let nextBuildKey = makeTranscriptBuildKey()
         if transcriptBuildKey == nextBuildKey, !transcriptTurns.isEmpty {
-            if resetExpansion {
-                expandedTurnIDs.removeAll()
-            }
+            if resetExpansion { expandedTurnIDs.removeAll() }
             return
         }
 
@@ -863,17 +804,11 @@ private struct ConversationMessageList: View {
         }
 
         let candidateDelta: Int
-        if scale >= 1.18 {
-            candidateDelta = 2
-        } else if scale >= 1.03 {
-            candidateDelta = 1
-        } else if scale <= 0.86 {
-            candidateDelta = -2
-        } else if scale <= 0.97 {
-            candidateDelta = -1
-        } else {
-            candidateDelta = 0
-        }
+        if scale >= 1.18 { candidateDelta = 2 }
+        else if scale >= 1.03 { candidateDelta = 1 }
+        else if scale <= 0.86 { candidateDelta = -2 }
+        else if scale <= 0.97 { candidateDelta = -1 }
+        else { candidateDelta = 0 }
         guard candidateDelta != 0 else { return }
 
         if pinchAppliedDelta == 0 {
@@ -902,11 +837,6 @@ private struct ConversationMessageList: View {
         }
         pinchBaseStep = nil
         pinchAppliedDelta = 0
-    }
-
-    private func handleStreamingSnapshotRendered() {
-        guard shouldMaintainBottomAnchor else { return }
-        streamingRenderTick &+= 1
     }
 
     private func shouldAnimateNewTurnInsertion(
@@ -971,8 +901,6 @@ private struct ConversationMessageList: View {
         resetExpansion: Bool = false,
         removeExpandedTurnID: String? = nil
     ) {
-        let previousLayoutSignature = transcriptTurns.map(layoutSignature(for:))
-        let nextLayoutSignature = nextTurns.map(layoutSignature(for:))
         let nextTurnIDs = Set(nextTurns.map(\.id))
         let nextRenderedTurns = TranscriptTurn.mergeConsecutiveExplorationTurnsForRendering(nextTurns)
         transcriptTurns = nextTurns
@@ -985,47 +913,6 @@ private struct ConversationMessageList: View {
         }
         if let removeExpandedTurnID {
             expandedTurnIDs.remove(removeExpandedTurnID)
-        }
-        if !isStreaming && previousLayoutSignature != nextLayoutSignature {
-            transcriptLayoutTick &+= 1
-        }
-    }
-
-    private func scheduleScrollToBottom(
-        _ proxy: ScrollViewProxy,
-        delay: TimeInterval = 0.05,
-        force: Bool = false,
-        replacePending: Bool = false,
-        animation: Animation? = .interactiveSpring(response: 0.28, dampingFraction: 0.9)
-    ) {
-        guard force || shouldMaintainBottomAnchor else { return }
-        if force {
-            pendingScrollWorkItem?.cancel()
-            pendingScrollWorkItem = nil
-        } else if replacePending {
-            pendingScrollWorkItem?.cancel()
-            pendingScrollWorkItem = nil
-        } else if pendingScrollWorkItem != nil {
-            return
-        }
-        let work = DispatchWorkItem {
-            pendingScrollWorkItem = nil
-            guard force || shouldMaintainBottomAnchor else { return }
-            let effectiveAnimation = isStreaming ? nil : animation
-            if let effectiveAnimation {
-                withAnimation(effectiveAnimation) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-            } else {
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
-            isNearBottom = true
-        }
-        pendingScrollWorkItem = work
-        if delay == 0 {
-            DispatchQueue.main.async(execute: work)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
     }
 
@@ -1074,7 +961,6 @@ private struct ConversationTurnRow: View, Equatable {
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Render items with inline handoff views interleaved after each handoff note.
             ConversationTurnTimeline(
                 items: turn.items,
                 isLive: turn.isLive,
@@ -1089,9 +975,8 @@ private struct ConversationTurnRow: View, Equatable {
                 onOpenConversation: onOpenConversation
             )
 
-            if showTypingIndicator {
-                TypingIndicator()
-            }
+            TypingIndicator()
+                .opacity(showTypingIndicator ? 1 : 0)
 
             if canCollapse {
                 Button("Show Less", systemImage: "chevron.up", action: onToggleExpansion)
@@ -1157,10 +1042,7 @@ private struct ConversationTurnRow: View, Equatable {
             if !footerMetadataItems.isEmpty {
                 HStack(spacing: 10) {
                     ForEach(footerMetadataItems, id: \.id) { item in
-                        CollapsedTurnMetaItem(
-                            systemImage: item.systemImage,
-                            text: item.text
-                        )
+                        CollapsedTurnMetaItem(systemImage: item.systemImage, text: item.text)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1174,17 +1056,9 @@ private struct ConversationTurnRow: View, Equatable {
         .padding(.bottom, 2)
     }
 
-    private var collapsedPreviewHeight: CGFloat {
-        collapsedPrimaryLineHeight + collapsedResponseHeight + 4
-    }
-
-    private var collapsedFooterReservedInset: CGFloat {
-        collapsedFooterHeight + 10
-    }
-
-    private var collapsedFooterHeight: CGFloat {
-        max(UIFont.preferredFont(forTextStyle: .caption1).lineHeight * textScale, 14)
-    }
+    private var collapsedPreviewHeight: CGFloat { collapsedPrimaryLineHeight + collapsedResponseHeight + 4 }
+    private var collapsedFooterReservedInset: CGFloat { collapsedFooterHeight + 10 }
+    private var collapsedFooterHeight: CGFloat { max(UIFont.preferredFont(forTextStyle: .caption1).lineHeight * textScale, 14) }
 
     private var responsePreviewMask: some View {
         LinearGradient(
@@ -1199,17 +1073,9 @@ private struct ConversationTurnRow: View, Equatable {
         )
     }
 
-    private var collapsedPrimaryLineHeight: CGFloat {
-        collapsedPreviewLineHeight
-    }
-
-    private var collapsedResponseHeight: CGFloat {
-        (collapsedPreviewLineHeight * 2) + 2
-    }
-
-    private var collapsedPreviewLineHeight: CGFloat {
-        UIFont.preferredFont(forTextStyle: .body).lineHeight * textScale
-    }
+    private var collapsedPrimaryLineHeight: CGFloat { collapsedPreviewLineHeight }
+    private var collapsedResponseHeight: CGFloat { (collapsedPreviewLineHeight * 2) + 2 }
+    private var collapsedPreviewLineHeight: CGFloat { UIFont.preferredFont(forTextStyle: .body).lineHeight * textScale }
 
     private var footerMetadataItems: [CollapsedTurnMeta] {
         var items: [CollapsedTurnMeta] = []
@@ -1232,45 +1098,21 @@ private struct ConversationTurnRow: View, Equatable {
     }
 
     private var secondaryPreviewText: String? {
-        guard let secondaryText = turn.preview.secondaryText,
-              secondaryText != turn.preview.primaryText else {
-            return nil
-        }
+        guard let secondaryText = turn.preview.secondaryText, secondaryText != turn.preview.primaryText else { return nil }
         return secondaryText
     }
 
-    private var responsePreviewText: String {
-        secondaryPreviewText ?? turn.preview.primaryText
-    }
+    private var responsePreviewText: String { secondaryPreviewText ?? turn.preview.primaryText }
 
     private var accessibilitySummary: String {
         var parts = [turn.preview.primaryText]
-        if let secondaryPreviewText {
-            parts.append(secondaryPreviewText)
-        }
-        if let durationText = turn.preview.durationText {
-            parts.append("Duration \(durationText)")
-        }
-        if turn.preview.toolCallCount > 0 {
-            parts.append("\(turn.preview.toolCallCount) tool \(turn.preview.toolCallCount == 1 ? "call" : "calls")")
-        }
-        if turn.preview.widgetCount > 0 {
-            parts.append("\(turn.preview.widgetCount) \(turn.preview.widgetCount == 1 ? "widget" : "widgets")")
-        }
-        if turn.preview.eventCount > 0 {
-            parts.append("\(turn.preview.eventCount) \(turn.preview.eventCount == 1 ? "event" : "events")")
-        }
-        if turn.preview.imageCount > 0 {
-            parts.append("\(turn.preview.imageCount) \(turn.preview.imageCount == 1 ? "image" : "images")")
-        }
+        if let secondaryPreviewText { parts.append(secondaryPreviewText) }
+        if let durationText = turn.preview.durationText { parts.append("Duration \(durationText)") }
+        if turn.preview.toolCallCount > 0 { parts.append("\(turn.preview.toolCallCount) tool \(turn.preview.toolCallCount == 1 ? "call" : "calls")") }
+        if turn.preview.widgetCount > 0 { parts.append("\(turn.preview.widgetCount) \(turn.preview.widgetCount == 1 ? "widget" : "widgets")") }
+        if turn.preview.eventCount > 0 { parts.append("\(turn.preview.eventCount) \(turn.preview.eventCount == 1 ? "event" : "events")") }
+        if turn.preview.imageCount > 0 { parts.append("\(turn.preview.imageCount) \(turn.preview.imageCount == 1 ? "image" : "images")") }
         return parts.joined(separator: ". ")
-    }
-}
-
-private struct LastTurnHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
@@ -3002,7 +2844,7 @@ struct TypingIndicator: View {
     @State private var shimmerOffset: CGFloat = -1
 
     var body: some View {
-        Text("Thinking...")
+        Text("Thinking")
             .litterFont(.body, weight: .medium)
             .foregroundStyle(
                 LinearGradient(
@@ -3092,7 +2934,7 @@ private struct SubagentBreadcrumbBar: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
-        .padding(.top, topInset + 48)
+        .padding(.top, topInset + 8)
         .background(
             LitterTheme.surface.opacity(0.85)
                 .background(.ultraThinMaterial)
