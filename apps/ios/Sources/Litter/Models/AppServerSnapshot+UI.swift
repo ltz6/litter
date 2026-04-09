@@ -24,6 +24,7 @@ extension AppServerSnapshot {
 
     var connectionModeLabel: String {
         guard !isLocal else { return "local" }
+        guard ExperimentalFeatures.shared.isEnabled(.ipc) else { return "remote" }
         switch ipcState {
         case .ready:
             return "remote · ipc"
@@ -72,7 +73,8 @@ extension AppServerSnapshot {
         if transportState == .connected, !isLocal, account == nil {
             return "Sign in required"
         }
-        if transportState == .connected, ipcState == .disconnected {
+        if transportState == .connected, ipcState == .disconnected,
+           ExperimentalFeatures.shared.isEnabled(.ipc) {
             return "Connected, IPC unavailable"
         }
         return transportState.displayLabel
@@ -91,7 +93,8 @@ extension AppServerSnapshot {
         if transportState == .connected, !isLocal, account == nil {
             return .orange
         }
-        if transportState == .connected, ipcState == .disconnected {
+        if transportState == .connected, ipcState == .disconnected,
+           ExperimentalFeatures.shared.isEnabled(.ipc) {
             return .orange
         }
         return transportState.accentColor

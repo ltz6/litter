@@ -387,7 +387,7 @@ struct DiscoveryView: View {
                         .foregroundColor(LitterTheme.textSecondary)
                 }
                 Spacer()
-                if serverSnapshot?.isIpcConnected == true {
+                if serverSnapshot?.isIpcConnected == true, ExperimentalFeatures.shared.isEnabled(.ipc) {
                     statusTag(label: "ipc", color: LitterTheme.accentStrong)
                 }
                 if let progressTag = progressTag(for: serverSnapshot) {
@@ -451,7 +451,7 @@ struct DiscoveryView: View {
         if server.canConnectViaSSH {
             parts.append(" - ssh \(server.resolvedSSHPort)")
         }
-        if snapshot?.isIpcConnected == true {
+        if snapshot?.isIpcConnected == true, ExperimentalFeatures.shared.isEnabled(.ipc) {
             parts.append(" - ipc")
         }
         return parts.joined()
